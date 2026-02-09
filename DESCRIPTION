@@ -1,0 +1,51 @@
+Package: ggmlR
+Type: Package
+Title: 'GGML' Tensor Operations for Machine Learning
+Version: 0.5.1
+Authors@R: c(
+    person("Yuri", "Baramykov",
+        email = "lbsbmsu@mail.ru",
+        role = c("aut", "cre")),
+    person("Georgi", "Gerganov",
+        role = c("ctb", "cph"),
+        comment = "Author of the GGML library"),
+    person("Jeffrey", "Quesnelle",
+        role = c("ctb", "cph"),
+        comment = "Contributor to ops.cpp"),
+    person("Bowen", "Peng",
+        role = c("ctb", "cph"),
+        comment = "Contributor to ops.cpp"),
+    person("Mozilla Foundation",
+        role = c("ctb", "cph"),
+        comment = "Author of llamafile/sgemm.cpp")
+    )
+Description: Provides 'R' bindings to the 'GGML' tensor library for efficient
+    machine learning computation. Implements core tensor operations including
+    element-wise arithmetic, reshaping, and matrix multiplication. Supports
+    neural network layers (attention, convolutions, normalization), activation
+    functions, and quantization. Features optimization/training API with
+    'AdamW' (Adam with Weight decay) and 'SGD' (Stochastic Gradient Descent)
+    optimizers, 'MSE' (Mean Squared Error) and cross-entropy losses.
+    Multi-backend support with CPU and optional 'Vulkan' GPU (Graphics
+    Processing Unit) acceleration.
+    See <https://github.com/ggml-org/ggml> for more information about the
+    underlying library.
+License: MIT + file LICENSE
+URL: https://github.com/Zabis13/ggmlR
+BugReports: https://github.com/Zabis13/ggmlR/issues
+Encoding: UTF-8
+SystemRequirements: C++17, GNU make
+Suggests: testthat (>= 3.0.0), knitr, rmarkdown
+VignetteBuilder: knitr
+RoxygenNote: 7.3.3
+Config/testthat/edition: 3
+NeedsCompilation: yes
+Packaged: 2026-02-05 18:46:14 UTC; yuri
+Author: Yuri Baramykov [aut, cre],
+  Georgi Gerganov [ctb, cph] (Author of the GGML library),
+  Jeffrey Quesnelle [ctb, cph] (Contributor to ops.cpp),
+  Bowen Peng [ctb, cph] (Contributor to ops.cpp),
+  Mozilla Foundation [ctb, cph] (Author of llamafile/sgemm.cpp)
+Maintainer: Yuri Baramykov <lbsbmsu@mail.ru>
+Repository: CRAN
+Date/Publication: 2026-02-09 19:00:02 UTC

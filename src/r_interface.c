@@ -46,7 +46,7 @@ extern SEXP R_ggml_opt_dataset_labels(SEXP);
 extern SEXP R_ggml_opt_dataset_shuffle(SEXP, SEXP, SEXP);
 extern SEXP R_ggml_opt_dataset_get_batch(SEXP, SEXP, SEXP, SEXP);
 extern SEXP R_ggml_opt_default_params(SEXP, SEXP);
-extern SEXP R_ggml_opt_init(SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_opt_init(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
 extern SEXP R_ggml_opt_free(SEXP);
 extern SEXP R_ggml_opt_reset(SEXP, SEXP);
 extern SEXP R_ggml_opt_static_graphs(SEXP);
@@ -71,6 +71,9 @@ extern SEXP R_ggml_opt_grad_acc(SEXP, SEXP);
 extern SEXP R_ggml_opt_result_pred(SEXP);
 extern SEXP R_ggml_opt_prepare_alloc(SEXP, SEXP, SEXP, SEXP, SEXP);
 extern SEXP R_ggml_opt_epoch(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_opt_init_for_fit(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_opt_set_lr(SEXP, SEXP, SEXP);
+extern SEXP R_ggml_opt_get_lr(SEXP);
 
 // Extended backend functions (defined in r_interface_backend.c)
 // Device type constants
@@ -224,6 +227,24 @@ extern SEXP R_ggml_get_op_params_i32(SEXP, SEXP);
 extern SEXP R_ggml_set_op_params_i32(SEXP, SEXP, SEXP);
 extern SEXP R_ggml_get_op_params_f32(SEXP, SEXP);
 extern SEXP R_ggml_set_op_params_f32(SEXP, SEXP, SEXP);
+
+// Timestep embedding (defined in r_interface_graph.c)
+extern SEXP R_ggml_timestep_embedding(SEXP, SEXP, SEXP, SEXP);
+
+// CPU-side tensor data access (defined in r_interface_graph.c)
+extern SEXP R_ggml_set_f32_nd(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_get_f32_nd(SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_get_i32_nd(SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_set_i32_nd(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_tensor_nb(SEXP);
+extern SEXP R_ggml_backend_tensor_get_and_sync(SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_backend_tensor_get_f32(SEXP);
+extern SEXP R_ggml_tensor_num(SEXP);
+extern SEXP R_ggml_tensor_data_ptr(SEXP);
+extern SEXP R_ggml_tensor_copy(SEXP, SEXP);
+extern SEXP R_ggml_tensor_set_f32_scalar(SEXP, SEXP);
+extern SEXP R_ggml_get_first_tensor(SEXP);
+extern SEXP R_ggml_get_next_tensor(SEXP, SEXP);
 
 // Low-level quantization functions (defined in r_interface_quants.c)
 // Dequantize row functions
@@ -910,6 +931,9 @@ SEXP R_ggml_element_size(SEXP tensor_ptr);
 SEXP R_ggml_nrows(SEXP tensor_ptr);
 SEXP R_ggml_are_same_shape(SEXP a_ptr, SEXP b_ptr);
 SEXP R_ggml_set_name(SEXP tensor_ptr, SEXP name);
+SEXP R_ggml_set_param(SEXP tensor_ptr);
+SEXP R_ggml_set_input(SEXP tensor_ptr);
+SEXP R_ggml_set_output(SEXP tensor_ptr);
 SEXP R_ggml_get_name(SEXP tensor_ptr);
 
 // Type system functions
@@ -1413,6 +1437,9 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_ggml_nrows",              (DL_FUNC) &R_ggml_nrows,              1},
     {"R_ggml_are_same_shape",     (DL_FUNC) &R_ggml_are_same_shape,     2},
     {"R_ggml_set_name",           (DL_FUNC) &R_ggml_set_name,           2},
+    {"R_ggml_set_param",          (DL_FUNC) &R_ggml_set_param,          1},
+    {"R_ggml_set_input",          (DL_FUNC) &R_ggml_set_input,          1},
+    {"R_ggml_set_output",         (DL_FUNC) &R_ggml_set_output,         1},
     {"R_ggml_get_name",           (DL_FUNC) &R_ggml_get_name,           1},
 
     // Type system functions
@@ -1492,7 +1519,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_ggml_opt_dataset_shuffle",              (DL_FUNC) &R_ggml_opt_dataset_shuffle,              3},
     {"R_ggml_opt_dataset_get_batch",            (DL_FUNC) &R_ggml_opt_dataset_get_batch,            4},
     {"R_ggml_opt_default_params",               (DL_FUNC) &R_ggml_opt_default_params,               2},
-    {"R_ggml_opt_init",                         (DL_FUNC) &R_ggml_opt_init,                         4},
+    {"R_ggml_opt_init",                         (DL_FUNC) &R_ggml_opt_init,                         7},
     {"R_ggml_opt_free",                         (DL_FUNC) &R_ggml_opt_free,                         1},
     {"R_ggml_opt_reset",                        (DL_FUNC) &R_ggml_opt_reset,                        2},
     {"R_ggml_opt_static_graphs",                (DL_FUNC) &R_ggml_opt_static_graphs,                1},
@@ -1517,6 +1544,9 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_ggml_opt_result_pred",                   (DL_FUNC) &R_ggml_opt_result_pred,                   1},
     {"R_ggml_opt_prepare_alloc",                 (DL_FUNC) &R_ggml_opt_prepare_alloc,                 5},
     {"R_ggml_opt_epoch",                         (DL_FUNC) &R_ggml_opt_epoch,                         7},
+    {"R_ggml_opt_init_for_fit",                  (DL_FUNC) &R_ggml_opt_init_for_fit,                  7},
+    {"R_ggml_opt_set_lr",                        (DL_FUNC) &R_ggml_opt_set_lr,                        3},
+    {"R_ggml_opt_get_lr",                        (DL_FUNC) &R_ggml_opt_get_lr,                        1},
 
     // Extended backend functions
     {"R_ggml_backend_device_type_cpu",          (DL_FUNC) &R_ggml_backend_device_type_cpu,           0},
@@ -1738,6 +1768,24 @@ static const R_CallMethodDef CallEntries[] = {
 
     // Quantization info
     {"R_ggml_quant_block_info",                 (DL_FUNC) &R_ggml_quant_block_info,                  1},
+
+    // Timestep embedding
+    {"R_ggml_timestep_embedding",               (DL_FUNC) &R_ggml_timestep_embedding,                4},
+
+    // CPU-side tensor data access
+    {"R_ggml_set_f32_nd",                       (DL_FUNC) &R_ggml_set_f32_nd,                        6},
+    {"R_ggml_get_f32_nd",                       (DL_FUNC) &R_ggml_get_f32_nd,                        5},
+    {"R_ggml_get_i32_nd",                       (DL_FUNC) &R_ggml_get_i32_nd,                        5},
+    {"R_ggml_set_i32_nd",                       (DL_FUNC) &R_ggml_set_i32_nd,                        6},
+    {"R_ggml_tensor_nb",                        (DL_FUNC) &R_ggml_tensor_nb,                         1},
+    {"R_ggml_backend_tensor_get_and_sync",      (DL_FUNC) &R_ggml_backend_tensor_get_and_sync,       4},
+    {"R_ggml_backend_tensor_get_f32",           (DL_FUNC) &R_ggml_backend_tensor_get_f32,            1},
+    {"R_ggml_tensor_num",                       (DL_FUNC) &R_ggml_tensor_num,                        1},
+    {"R_ggml_tensor_data_ptr",                  (DL_FUNC) &R_ggml_tensor_data_ptr,                   1},
+    {"R_ggml_tensor_copy",                      (DL_FUNC) &R_ggml_tensor_copy,                       2},
+    {"R_ggml_tensor_set_f32_scalar",            (DL_FUNC) &R_ggml_tensor_set_f32_scalar,             2},
+    {"R_ggml_get_first_tensor",                 (DL_FUNC) &R_ggml_get_first_tensor,                  1},
+    {"R_ggml_get_next_tensor",                  (DL_FUNC) &R_ggml_get_next_tensor,                   2},
 
     {NULL, NULL, 0}
 };

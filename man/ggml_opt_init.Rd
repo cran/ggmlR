@@ -8,7 +8,10 @@ ggml_opt_init(
   sched,
   loss_type,
   optimizer = ggml_opt_optimizer_type_adamw(),
-  opt_period = 1L
+  opt_period = 1L,
+  ctx_compute = NULL,
+  inputs = NULL,
+  outputs = NULL
 )
 }
 \arguments{
@@ -19,6 +22,12 @@ ggml_opt_init(
 \item{optimizer}{Optimizer type (use ggml_opt_optimizer_type_* functions)}
 
 \item{opt_period}{Gradient accumulation steps before optimizer step}
+
+\item{ctx_compute}{Compute context for static graph mode (or NULL)}
+
+\item{inputs}{Input tensor for static graph mode (or NULL)}
+
+\item{outputs}{Output tensor for static graph mode (or NULL)}
 }
 \value{
 External pointer to optimizer context
@@ -28,6 +37,7 @@ Creates a new optimizer context for training.
 }
 \seealso{
 Other optimization: 
+\code{\link{ggml_fit_opt}()},
 \code{\link{ggml_opt_alloc}()},
 \code{\link{ggml_opt_context_optimizer_type}()},
 \code{\link{ggml_opt_dataset_data}()},
@@ -42,7 +52,9 @@ Other optimization:
 \code{\link{ggml_opt_eval}()},
 \code{\link{ggml_opt_fit}()},
 \code{\link{ggml_opt_free}()},
+\code{\link{ggml_opt_get_lr}()},
 \code{\link{ggml_opt_grad_acc}()},
+\code{\link{ggml_opt_init_for_fit}()},
 \code{\link{ggml_opt_inputs}()},
 \code{\link{ggml_opt_labels}()},
 \code{\link{ggml_opt_loss}()},
@@ -65,6 +77,7 @@ Other optimization:
 \code{\link{ggml_opt_result_ndata}()},
 \code{\link{ggml_opt_result_pred}()},
 \code{\link{ggml_opt_result_reset}()},
+\code{\link{ggml_opt_set_lr}()},
 \code{\link{ggml_opt_static_graphs}()}
 }
 \concept{optimization}

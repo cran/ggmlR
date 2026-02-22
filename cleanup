@@ -8,6 +8,7 @@ rm -f src/*.o src/*.so src/*.dll src/*.dylib src/*.a
 rm -f inst/lib/*.a
 rm -f src/ggml-cpu/*.o
 rm -f src/ggml-cpu/arch/x86/*.o
+rm -f src/ggml-cpu/arch/arm/*.o
 rm -f src/ggml-cpu/llamafile/*.o
 rm -f src/ggml-cpu/amx/*.o
 
@@ -17,6 +18,7 @@ rm -f src/ggml-vulkan/generated/*.o
 
 # Remove generated files created by configure
 rm -f src/Makevars
+rm -f src/Makevars.win
 
 # Remove Vulkan generated files
 rm -rf src/ggml-vulkan/generated

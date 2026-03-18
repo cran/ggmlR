@@ -13,7 +13,7 @@ Two complementary APIs:
 | Sequential / Functional | Keras-like, static graph | Production models, CRAN-standard workflow |
 | Dynamic autograd (`ag_*`) | PyTorch-like, eager | Research, custom architectures, Transformers |
 
-Also serves as the backend engine for [llamaR](https://github.com/Zabis13/llamaR) (LLM inference) and [sdR](https://github.com/Zabis13/sdR) (Stable Diffusion).
+Also serves as the backend engine for [llamaR](https://github.com/Zabis13/llamaR) (LLM inference) and [sd2R](https://github.com/Zabis13/sd2R) (Stable Diffusion).
 
 ## Installation
 
@@ -337,12 +337,217 @@ result$model          # trained replica 0
 | Schedulers | `lr_scheduler_step`, `lr_scheduler_cosine` |
 | Utilities | `clip_grad_norm`, `ag_gradcheck`, `dp_train` |
 
+## ONNX Model Import
+
+Load pre-trained ONNX models from PyTorch, TensorFlow, or other frameworks and run inference on Vulkan GPU or CPU. No Python or external libraries required — ggmlR includes a built-in zero-dependency protobuf parser.
+
+### Quick start
+
+```r
+library(ggmlR)
+
+# 1. Load the model
+model <- onnx_load("squeezenet.onnx")
+model
+#> ONNX Model: torch_jit
+#>   Producer: pytorch 2.0.1
+#>   IR version: 8 / Opset: 18
+#>   Nodes: 66 / Weights: 26
+
+# 2. Check expected inputs
+onnx_inputs(model)
+#> $x.1
+#> [1]   1   3 224 224
+
+# 3. Prepare input data (flat numeric vector, row-major NCHW order)
+img <- runif(1 * 3 * 224 * 224)
+
+# 4. Run inference — pass a named list matching input names
+result <- onnx_run(model, list(x.1 = img))
+
+# 5. Get predictions
+scores <- result[[1]]
+cat("Predicted class:", which.max(scores) - 1L, "\n")
+```
+
+### Loading models
+
+`onnx_load()` parses the .onnx file, builds a ggml computation graph, and allocates tensors on the specified device. Weights are loaded from the file via memory-mapping (zero-copy).
+
+```r
+# Auto-detect device (Vulkan GPU if available, else CPU)
+model <- onnx_load("model.onnx")
+
+# Force CPU
+model <- onnx_load("model.onnx", device = "cpu")
+
+# Force Vulkan GPU
+model <- onnx_load("model.onnx", device = "vulkan")
+```
+
+### Dynamic shapes
+
+Some models (BERT, RoBERTa, etc.) have dynamic dimensions for batch size or sequence length. Specify fixed shapes at load time:
+
+```r
+model <- onnx_load("bert.onnx",
+                    input_shapes = list(
+                      input_ids      = c(1L, 128L),
+                      attention_mask = c(1L, 128L)
+                    ))
+```
+
+If you forget, `onnx_load()` will tell you which inputs need shapes:
+
+```
+Error: Input 'input_ids' has dynamic shape [?x?].
+  Specify fixed shape via input_shapes parameter.
+```
+
+### Inspecting the model
+
+```r
+# Print overview
+model
+#> ONNX Model: torch_jit
+#>   Nodes: 533 / Weights: 199
+#>   Ops: MatMul, Add, LayerNormalization, Softmax, ...
+
+# Detailed metadata
+onnx_summary(model)
+
+# Input names and shapes (what to pass to onnx_run)
+onnx_inputs(model)
+
+# Backend placement: GPU vs CPU split, scheduler info
+onnx_device_info(model)
+```
+
+### Running inference
+
+```r
+# Single input model
+result <- onnx_run(model, list(x = my_data))
+
+# Multiple inputs
+result <- onnx_run(model, list(
+  input_ids      = as.numeric(token_ids),
+  attention_mask = rep(1, 128)
+))
+
+# Result is a named list of output tensors
+str(result)
+#> List of 1
+#>  $ output: num [1:1000] 0.00123 0.00045 ...
+```
+
+### Preparing input data
+
+ONNX models expect inputs in **row-major** order (batch, channels, height, width for images). R matrices are column-major, so you may need to transpose:
+
+```r
+# Image classification: model expects [1, 3, 224, 224]
+# If you have a 224x224x3 R array:
+img_array <- array(runif(224 * 224 * 3), dim = c(224, 224, 3))
+
+# Rearrange to NCHW: [1, 3, 224, 224] — channel first
+img_chw <- aperm(img_array, c(3, 1, 2))  # [3, 224, 224]
+input <- as.numeric(img_chw)              # flat vector, row-major
+
+result <- onnx_run(model, list(x = input))
+```
+
+For NLP models, inputs are typically 1D integer sequences:
+
+```r
+# BERT-style: token IDs as numeric vector
+tokens <- c(101, 2023, 2003, 1037, 3231, 102, rep(0, 122))  # pad to 128
+result <- onnx_run(model, list(input_ids = as.numeric(tokens)))
+```
+
+### Interpreting outputs
+
+```r
+# Classification: get top-5 predictions
+scores <- result[[1]]
+top5 <- order(scores, decreasing = TRUE)[1:5]
+cat("Top-5 classes:", top5 - 1L, "\n")  # 0-based class indices
+cat("Top-5 scores:", scores[top5], "\n")
+
+# Apply softmax if model outputs logits (not probabilities)
+probs <- exp(scores) / sum(exp(scores))
+```
+
+### Repeated inference
+
+Models can be run multiple times — weights are automatically reloaded between runs:
+
+```r
+model <- onnx_load("classifier.onnx")
+
+for (batch in data_batches) {
+  result <- onnx_run(model, list(x = batch))
+  # process result...
+}
+```
+
+### Tested models
+
+12 out of 15 ONNX Model Zoo models load successfully:
+
+| Model | Nodes | Key ops |
+|---|---|---|
+| mnist-8 | 12 | Conv, Relu, MaxPool, Reshape, MatMul |
+| squeezenet1.0-8 | 66 | Conv, Relu, MaxPool, Concat, GlobalAveragePool, Softmax |
+| adv_inception_v3 (Opset 17/18) | 215 | Conv, BatchNorm, Relu, Concat, AveragePool |
+| emotion-ferplus-8 | 52 | Conv, Relu, MaxPool, Gemm, Constant |
+| bat_resnext26ts (Opset 18) | 570 | Conv, BatchNorm, SiLU, Concat, Expand, Split |
+| bert (Opset 17) | 533 | MatMul, LayerNorm, GELU/Erf, Softmax, Shape, Gather, Where |
+| botnet26t_256 (Opset 16) | 377 | Conv, MatMul, Softmax, Reshape, Transpose |
+| MaskRCNN-12-int8 | 937 | QLinearConv, DequantizeLinear, Resize, Concat, Reshape |
+| roberta-9 | 1180 | MatMul, LayerNorm, Erf, Softmax, Shape, Gather, Cast |
+| sageconv (Opset 16) | 24 | MatMul, Add, Mul, Sigmoid, ReduceSum |
+| super-resolution-10 | 12 | Conv, Reshape, Transpose |
+
+### Supported ops (50+)
+
+Arithmetic: Add, Sub, Mul, Div, Pow, Sqrt, Exp, Log, Abs, Neg, Floor, Ceil, Clip, Erf, Equal.
+Linear: MatMul (batched), Gemm.
+Convolution: Conv (1D/2D, grouped, depthwise), ConvTranspose (1D/2D), with `auto_pad` (SAME_UPPER, SAME_LOWER).
+Pooling: MaxPool, AveragePool, GlobalAveragePool, Resize/Upsample (nearest, bilinear).
+Normalization: BatchNorm, LayerNorm, GroupNorm, RMSNorm.
+Activations: Relu, Sigmoid, Tanh, GELU, SiLU, Softmax, LeakyRelu, Elu.
+Shape: Reshape, Transpose, Concat, Flatten, Squeeze, Unsqueeze, Expand, Slice, Split, Gather, Pad, Shape, Cast, Identity, EyeLike.
+Constants: Constant (TensorProto + scalar), ConstantOfShape.
+Logic: Where, Equal.
+Reduction: ReduceMean, ReduceSum.
+Quantization: DequantizeLinear, QuantizeLinear, QLinearConv, QLinearAdd, QLinearMatMul, QLinearSigmoid, QLinearConcat.
+Pass-through: Dropout.
+
 ## Save / Load
 
 ```r
 ggml_save_model(model, "my_model.rds")
 model <- ggml_load_model("my_model.rds")
 ```
+
+## ONNX Benchmark: GPU (Vulkan) vs CPU
+
+Measured on AMD Ryzen 5 5600 + AMD RX 9070, single-image inference:
+
+| Model | CPU (ms) | GPU (ms) | Speedup | CPU FPS | GPU FPS |
+|---|---:|---:|---:|---:|---:|
+| Inception V3 | 1747.7 | 24.3 | 71.8x | 0.6 | 41.1 |
+| MNIST | 0.7 | 0.3 | 2.0x | 1500.0 | 3000.0 |
+| SqueezeNet 1.0 | 128.7 | 3.0 | 42.9x | 7.8 | 333.3 |
+| SuperResolution | 904.3 | 354.3 | 2.6x | 1.1 | 2.8 |
+| EmotionFerPlus | 259.0 | 4.7 | 55.5x | 3.9 | 214.3 |
+| Inception V3 Op18 | 1778.3 | 105.7 | 16.8x | 0.6 | 9.5 |
+| BAT-ResNeXt26ts | 847.7 | 14.3 | 59.1x | 1.2 | 69.8 |
+| BERT (Opset17) | 3250.3 | 99.7 | 32.6x | 0.3 | 10.0 |
+| GPT-NeoX | 10.0 | 3.3 | 3.0x | 100.0 | 300.0 |
+
+Benchmark script: `inst/examples/benchmark_onnx.R`
 
 ## GPU Acceleration
 
@@ -368,7 +573,7 @@ Supported GPUs: NVIDIA, AMD, Intel, ARM Mali, Qualcomm Adreno.
 ## See Also
 
 - [llamaR](https://github.com/Zabis13/llamaR) — LLM inference in R
-- [sdR](https://github.com/Zabis13/sdR) — Stable Diffusion in R
+- [sd2R](https://github.com/Zabis13/sd2R) — Stable Diffusion in R
 - [ggml](https://github.com/ggml-org/ggml) — underlying C library
 
 ## License

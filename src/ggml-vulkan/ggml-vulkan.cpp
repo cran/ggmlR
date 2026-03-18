@@ -714,6 +714,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_gelu_quick[2];
     vk_pipeline pipeline_silu[2];
     vk_pipeline pipeline_relu[2];
+    vk_pipeline pipeline_elu[2];
     vk_pipeline pipeline_xielu[2];
     vk_pipeline pipeline_neg[2];
     vk_pipeline pipeline_tanh[2];
@@ -4037,6 +4038,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     CREATE_UNARY(gelu_quick)
     CREATE_UNARY(silu)
     CREATE_UNARY(relu)
+    CREATE_UNARY(elu)
     CREATE_UNARY(xielu)
     CREATE_UNARY(neg)
     CREATE_UNARY(tanh)
@@ -8650,6 +8652,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 return ctx->device->pipeline_gelu_quick[dst->type == GGML_TYPE_F16];
             case GGML_UNARY_OP_RELU:
                 return ctx->device->pipeline_relu[dst->type == GGML_TYPE_F16];
+            case GGML_UNARY_OP_ELU:
+                return ctx->device->pipeline_elu[dst->type == GGML_TYPE_F16];
             case GGML_UNARY_OP_XIELU:
                 return ctx->device->pipeline_xielu[dst->type == GGML_TYPE_F16];
             case GGML_UNARY_OP_NEG:
@@ -12173,6 +12177,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         case GGML_UNARY_OP_GELU_ERF:
         case GGML_UNARY_OP_GELU_QUICK:
         case GGML_UNARY_OP_RELU:
+        case GGML_UNARY_OP_ELU:
         case GGML_UNARY_OP_NEG:
         case GGML_UNARY_OP_TANH:
         case GGML_UNARY_OP_SIGMOID:
@@ -14069,6 +14074,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_ELU:
                 case GGML_UNARY_OP_XIELU:
                 case GGML_UNARY_OP_NEG:
                 case GGML_UNARY_OP_TANH:
@@ -14578,12 +14584,9 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
 }
 
 static bool ggml_backend_vk_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    const int min_batch_size = 32;
-
-    return (op->ne[1] >= min_batch_size && op->op != GGML_OP_GET_ROWS) ||
-           (op->ne[2] >= min_batch_size && op->op == GGML_OP_MUL_MAT_ID);
-
     UNUSED(dev);
+    UNUSED(op);
+    return true;
 }
 
 static ggml_backend_event_t ggml_backend_vk_device_event_new(ggml_backend_dev_t dev) {
@@ -15108,6 +15111,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                 break;
             case GGML_UNARY_OP_RELU:
                 tensor_clone = ggml_relu(ggml_ctx, src_clone[0]);
+                break;
+            case GGML_UNARY_OP_ELU:
+                tensor_clone = ggml_elu(ggml_ctx, src_clone[0]);
                 break;
             case GGML_UNARY_OP_XIELU:
                 tensor_clone = ggml_xielu(ggml_ctx, src_clone[0], 0, 0, 0, 0);

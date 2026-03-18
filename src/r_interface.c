@@ -120,6 +120,14 @@ extern SEXP R_ggml_backend_event_wait(SEXP, SEXP);
 extern SEXP R_ggml_backend_graph_plan_create(SEXP, SEXP);
 extern SEXP R_ggml_backend_graph_plan_free(SEXP, SEXP);
 extern SEXP R_ggml_backend_graph_plan_compute(SEXP, SEXP);
+// ONNX loader
+extern SEXP R_onnx_load(SEXP);
+extern SEXP R_onnx_summary(SEXP);
+extern SEXP R_onnx_override_input_shapes(SEXP, SEXP, SEXP);
+extern SEXP R_onnx_build(SEXP, SEXP, SEXP);
+extern SEXP R_onnx_run(SEXP, SEXP, SEXP);
+extern SEXP R_onnx_inputs(SEXP);
+extern SEXP R_onnx_device_info(SEXP);
 // Async operations
 extern SEXP R_ggml_backend_tensor_set_async(SEXP, SEXP, SEXP, SEXP, SEXP);
 extern SEXP R_ggml_backend_tensor_get_async(SEXP, SEXP, SEXP, SEXP);
@@ -1163,8 +1171,19 @@ SEXP R_ggml_get_n_threads(void) {
     #else
     int threads = 1;
     #endif
-    
+
     return ScalarInteger(threads);
+}
+
+SEXP R_ggml_set_omp_threads(SEXP n_threads) {
+    int threads = asInteger(n_threads);
+    if (threads < 1) {
+        error("Number of threads must be at least 1");
+    }
+    #ifdef _OPENMP
+    omp_set_num_threads(threads);
+    #endif
+    return R_NilValue;
 }
 
 static const R_CallMethodDef CallEntries[] = {
@@ -1786,6 +1805,16 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_ggml_tensor_set_f32_scalar",            (DL_FUNC) &R_ggml_tensor_set_f32_scalar,             2},
     {"R_ggml_get_first_tensor",                 (DL_FUNC) &R_ggml_get_first_tensor,                  1},
     {"R_ggml_get_next_tensor",                  (DL_FUNC) &R_ggml_get_next_tensor,                   2},
+    // ONNX
+    {"R_onnx_load",                             (DL_FUNC) &R_onnx_load,                              1},
+    {"R_onnx_summary",                          (DL_FUNC) &R_onnx_summary,                           1},
+    {"R_onnx_override_input_shapes",            (DL_FUNC) &R_onnx_override_input_shapes,              3},
+    {"R_onnx_build",                            (DL_FUNC) &R_onnx_build,                             3},
+    {"R_onnx_run",                              (DL_FUNC) &R_onnx_run,                               3},
+    {"R_onnx_inputs",                           (DL_FUNC) &R_onnx_inputs,                            1},
+    {"R_onnx_device_info",                      (DL_FUNC) &R_onnx_device_info,                       1},
+
+    {"R_ggml_set_omp_threads",                  (DL_FUNC) &R_ggml_set_omp_threads,                   1},
 
     {NULL, NULL, 0}
 };

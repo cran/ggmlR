@@ -124,7 +124,7 @@ extern SEXP R_ggml_backend_graph_plan_compute(SEXP, SEXP);
 extern SEXP R_onnx_load(SEXP);
 extern SEXP R_onnx_summary(SEXP);
 extern SEXP R_onnx_override_input_shapes(SEXP, SEXP, SEXP);
-extern SEXP R_onnx_build(SEXP, SEXP, SEXP);
+extern SEXP R_onnx_build(SEXP, SEXP, SEXP, SEXP);
 extern SEXP R_onnx_run(SEXP, SEXP, SEXP);
 extern SEXP R_onnx_inputs(SEXP);
 extern SEXP R_onnx_device_info(SEXP);
@@ -1104,11 +1104,11 @@ SEXP R_ggml_new_tensor(SEXP ctx_ptr, SEXP type, SEXP n_dims_sexp, SEXP ne_sexp) 
     enum ggml_type dtype = (enum ggml_type) asInteger(type);
     int n_dims = asInteger(n_dims_sexp);
 
-    if (n_dims < 1 || n_dims > 4) {
-        error("n_dims must be between 1 and 4");
+    if (n_dims < 1 || n_dims > GGML_MAX_DIMS) {
+        error("n_dims must be between 1 and %d", GGML_MAX_DIMS);
     }
 
-    int64_t ne[4] = {1, 1, 1, 1};
+    int64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1, 1};
     double *ne_r = REAL(ne_sexp);
     for (int i = 0; i < n_dims; i++) {
         ne[i] = (int64_t) ne_r[i];
@@ -1809,7 +1809,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_onnx_load",                             (DL_FUNC) &R_onnx_load,                              1},
     {"R_onnx_summary",                          (DL_FUNC) &R_onnx_summary,                           1},
     {"R_onnx_override_input_shapes",            (DL_FUNC) &R_onnx_override_input_shapes,              3},
-    {"R_onnx_build",                            (DL_FUNC) &R_onnx_build,                             3},
+    {"R_onnx_build",                            (DL_FUNC) &R_onnx_build,                             4},
     {"R_onnx_run",                              (DL_FUNC) &R_onnx_run,                               3},
     {"R_onnx_inputs",                           (DL_FUNC) &R_onnx_inputs,                            1},
     {"R_onnx_device_info",                      (DL_FUNC) &R_onnx_device_info,                       1},

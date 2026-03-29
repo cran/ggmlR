@@ -1700,27 +1700,36 @@ static void ggml_compute_forward_repeat_f32(
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
+    const int64_t ne04 = src0->ne[4];
+    const size_t  nb04 = src0->nb[4];
+    const int64_t ne4  = dst->ne[4];
+    const size_t  nb4  = dst->nb[4];
+
     // guaranteed to be an integer due to the check in ggml_can_repeat
     const int nr0 = (int)(ne0/ne00);
     const int nr1 = (int)(ne1/ne01);
     const int nr2 = (int)(ne2/ne02);
     const int nr3 = (int)(ne3/ne03);
+    const int nr4 = (int)(ne4/ne04);
 
     // TODO: support for transposed / permuted tensors
     GGML_ASSERT(nb0  == sizeof(float));
     GGML_ASSERT(nb00 == sizeof(float));
 
-    // TODO: maybe this is not optimal?
-    for                         (int i3 = 0; i3 < nr3;  i3++) {
-        for                     (int k3 = 0; k3 < ne03; k3++) {
-            for                 (int i2 = 0; i2 < nr2;  i2++) {
-                for             (int k2 = 0; k2 < ne02; k2++) {
-                    for         (int i1 = 0; i1 < nr1;  i1++) {
-                        for     (int k1 = 0; k1 < ne01; k1++) {
-                            for (int i0 = 0; i0 < nr0;  i0++) {
-                                ggml_vec_cpy_f32(ne00,
-                                        (float *) ((char *)  dst->data + (i3*ne03 + k3)*nb3  + (i2*ne02 + k2)*nb2  + (i1*ne01 + k1)*nb1  + (i0*ne00)*nb0),
-                                        (float *) ((char *) src0->data + (          k3)*nb03 + (          k2)*nb02 + (          k1)*nb01));
+    for                             (int i4 = 0; i4 < nr4;  i4++) {
+        for                         (int k4 = 0; k4 < ne04; k4++) {
+            for                         (int i3 = 0; i3 < nr3;  i3++) {
+                for                     (int k3 = 0; k3 < ne03; k3++) {
+                    for                 (int i2 = 0; i2 < nr2;  i2++) {
+                        for             (int k2 = 0; k2 < ne02; k2++) {
+                            for         (int i1 = 0; i1 < nr1;  i1++) {
+                                for     (int k1 = 0; k1 < ne01; k1++) {
+                                    for (int i0 = 0; i0 < nr0;  i0++) {
+                                        ggml_vec_cpy_f32(ne00,
+                                                (float *) ((char *)  dst->data + (i4*ne04 + k4)*nb4  + (i3*ne03 + k3)*nb3  + (i2*ne02 + k2)*nb2  + (i1*ne01 + k1)*nb1  + (i0*ne00)*nb0),
+                                                (float *) ((char *) src0->data + (          k4)*nb04 + (          k3)*nb03 + (          k2)*nb02 + (          k1)*nb01));
+                                    }
+                                }
                             }
                         }
                     }
@@ -1744,29 +1753,37 @@ static void ggml_compute_forward_repeat_f16(
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
+    const int64_t ne04 = src0->ne[4];
+    const size_t  nb04 = src0->nb[4];
+    const int64_t ne4  = dst->ne[4];
+    const size_t  nb4  = dst->nb[4];
+
     // guaranteed to be an integer due to the check in ggml_can_repeat
     const int nr0 = (int)(ne0/ne00);
     const int nr1 = (int)(ne1/ne01);
     const int nr2 = (int)(ne2/ne02);
     const int nr3 = (int)(ne3/ne03);
+    const int nr4 = (int)(ne4/ne04);
 
     // TODO: support for transposed / permuted tensors
     GGML_ASSERT(nb0  == sizeof(ggml_fp16_t));
     GGML_ASSERT(nb00 == sizeof(ggml_fp16_t));
 
-    // TODO: maybe this is not optimal?
-    for                         (int i3 = 0; i3 < nr3;  i3++) {
-        for                     (int k3 = 0; k3 < ne03; k3++) {
-            for                 (int i2 = 0; i2 < nr2;  i2++) {
-                for             (int k2 = 0; k2 < ne02; k2++) {
-                    for         (int i1 = 0; i1 < nr1;  i1++) {
-                        for     (int k1 = 0; k1 < ne01; k1++) {
-                            for (int i0 = 0; i0 < nr0;  i0++) {
-                                ggml_fp16_t * y = (ggml_fp16_t *) ((char *)  dst->data + (i3*ne03 + k3)*nb3  + (i2*ne02 + k2)*nb2  + (i1*ne01 + k1)*nb1  + (i0*ne00)*nb0);
-                                ggml_fp16_t * x = (ggml_fp16_t *) ((char *) src0->data + (          k3)*nb03 + (          k2)*nb02 + (          k1)*nb01);
-                                // ggml_vec_cpy_f16(ne00, y, x)
-                                for (int i = 0; i < ne00; ++i) {
-                                    y[i]  = x[i];
+    for                             (int i4 = 0; i4 < nr4;  i4++) {
+        for                         (int k4 = 0; k4 < ne04; k4++) {
+            for                         (int i3 = 0; i3 < nr3;  i3++) {
+                for                     (int k3 = 0; k3 < ne03; k3++) {
+                    for                 (int i2 = 0; i2 < nr2;  i2++) {
+                        for             (int k2 = 0; k2 < ne02; k2++) {
+                            for         (int i1 = 0; i1 < nr1;  i1++) {
+                                for     (int k1 = 0; k1 < ne01; k1++) {
+                                    for (int i0 = 0; i0 < nr0;  i0++) {
+                                        ggml_fp16_t * y = (ggml_fp16_t *) ((char *)  dst->data + (i4*ne04 + k4)*nb4  + (i3*ne03 + k3)*nb3  + (i2*ne02 + k2)*nb2  + (i1*ne01 + k1)*nb1  + (i0*ne00)*nb0);
+                                        ggml_fp16_t * x = (ggml_fp16_t *) ((char *) src0->data + (          k4)*nb04 + (          k3)*nb03 + (          k2)*nb02 + (          k1)*nb01);
+                                        for (int i = 0; i < ne00; ++i) {
+                                            y[i]  = x[i];
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4897,6 +4914,87 @@ void ggml_compute_forward_set_rows(
             {
                 GGML_ABORT("src0->type = %d (%s) not supported", src0->type, ggml_type_name(src0->type));
             }
+    }
+}
+
+// ggml_compute_forward_scatter_elements
+
+void ggml_compute_forward_scatter_elements(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) return;
+
+    const ggml_tensor * data    = dst->src[0];  // base tensor to copy
+    const ggml_tensor * updates = dst->src[1];  // values to scatter
+    const ggml_tensor * indices = dst->src[2];  // indices (I32, same shape as updates)
+
+    GGML_ASSERT(data->type    == GGML_TYPE_F32);
+    GGML_ASSERT(updates->type == GGML_TYPE_F32);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    int32_t op_params[2];
+    memcpy(op_params, dst->op_params, sizeof(op_params));
+    const int reduction = op_params[0];
+    const int axis      = op_params[1];
+
+    /* Copy data → dst */
+    memcpy(dst->data, data->data, ggml_nbytes(data));
+
+    const int32_t * idx = (const int32_t *)indices->data;
+    const float   * upd = (const float *)updates->data;
+    float         * out = (float *)dst->data;
+
+    /* ONNX ScatterElements: for each element in updates/indices:
+     * dst_index = same as updates_index, except along 'axis' dim
+     * where it is replaced by indices[updates_index].
+     *
+     * updates and indices have the same shape. data/dst may differ
+     * from updates along the scatter axis but must match elsewhere.
+     *
+     * We iterate over all elements of updates linearly. For each,
+     * decompose into multi-index (i0,i1,i2,i3), look up the index
+     * value, compute the output flat offset. */
+    const int64_t n_upd = ggml_nelements(updates);
+    const int64_t dst_ne[4]  = { dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3] };
+    const int64_t upd_ne[4]  = { updates->ne[0], updates->ne[1], updates->ne[2], updates->ne[3] };
+
+    /* dst strides in elements (contiguous) */
+    const int64_t dst_stride[4] = {
+        1,
+        dst_ne[0],
+        dst_ne[0] * dst_ne[1],
+        dst_ne[0] * dst_ne[1] * dst_ne[2]
+    };
+    /* updates strides in elements (contiguous) */
+    const int64_t upd_stride[4] = {
+        1,
+        upd_ne[0],
+        upd_ne[0] * upd_ne[1],
+        upd_ne[0] * upd_ne[1] * upd_ne[2]
+    };
+
+    for (int64_t flat = 0; flat < n_upd; flat++) {
+        /* Decompose flat index into multi-index for updates */
+        int64_t rem = flat;
+        int64_t mi[4];
+        mi[3] = rem / upd_stride[3]; rem %= upd_stride[3];
+        mi[2] = rem / upd_stride[2]; rem %= upd_stride[2];
+        mi[1] = rem / upd_stride[1]; rem %= upd_stride[1];
+        mi[0] = rem;
+
+        /* Build dst multi-index: same as updates, except axis dim = indices[flat] */
+        int64_t di[4] = { mi[0], mi[1], mi[2], mi[3] };
+        di[axis] = (int64_t)idx[flat];
+
+        int64_t dst_flat = di[0] * dst_stride[0] + di[1] * dst_stride[1]
+                         + di[2] * dst_stride[2] + di[3] * dst_stride[3];
+
+        if (reduction == 1) {
+            out[dst_flat] += upd[flat];
+        } else {
+            out[dst_flat] = upd[flat];
+        }
     }
 }
 

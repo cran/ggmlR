@@ -656,6 +656,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_acc_f32;
+    vk_pipeline pipeline_scatter_elements_none;
+    vk_pipeline pipeline_scatter_elements_add;
 
     // [src0 0=fp32,1=fp16][src1 0=fp32,1=fp16][dst 0=fp32,1=fp16]
     vk_pipeline pipeline_add[2][2][2];
@@ -1076,7 +1078,7 @@ static vk_op_unary_push_constants vk_op_unary_push_constants_init(const ggml_ten
     p.ne00 = (uint32_t)src0->ne[0];
     p.ne01 = (uint32_t)src0->ne[1];
     p.ne02 = (uint32_t)src0->ne[2];
-    p.ne03 = (uint32_t)src0->ne[3];
+    p.ne03 = (uint32_t)(src0->ne[3] * src0->ne[4]); // collapse 5D → 4D
     p.nb00 = (uint32_t)(src0->nb[0] / src0_tsize);
     p.nb01 = (uint32_t)(src0->nb[1] / src0_tsize);
     p.nb02 = (uint32_t)(src0->nb[2] / src0_tsize);
@@ -1086,7 +1088,7 @@ static vk_op_unary_push_constants vk_op_unary_push_constants_init(const ggml_ten
     p.ne10 = (uint32_t)dst->ne[0];
     p.ne11 = (uint32_t)dst->ne[1];
     p.ne12 = (uint32_t)dst->ne[2];
-    p.ne13 = (uint32_t)dst->ne[3];
+    p.ne13 = (uint32_t)(dst->ne[3] * dst->ne[4]); // collapse 5D → 4D
     p.nb10 = (uint32_t)(dst->nb[0] / dst_tsize);
     p.nb11 = (uint32_t)(dst->nb[1] / dst_tsize);
     p.nb12 = (uint32_t)(dst->nb[2] / dst_tsize);
@@ -1119,7 +1121,7 @@ static vk_op_pad_push_constants vk_op_pad_push_constants_init(const ggml_tensor 
     p.ne00 = (uint32_t)src0->ne[0];
     p.ne01 = (uint32_t)src0->ne[1];
     p.ne02 = (uint32_t)src0->ne[2];
-    p.ne03 = (uint32_t)src0->ne[3];
+    p.ne03 = (uint32_t)(src0->ne[3] * src0->ne[4]); // collapse 5D → 4D
     p.nb00 = (uint32_t)(src0->nb[0] / src0_tsize);
     p.nb01 = (uint32_t)(src0->nb[1] / src0_tsize);
     p.nb02 = (uint32_t)(src0->nb[2] / src0_tsize);
@@ -1129,7 +1131,7 @@ static vk_op_pad_push_constants vk_op_pad_push_constants_init(const ggml_tensor 
     p.ne10 = (uint32_t)dst->ne[0];
     p.ne11 = (uint32_t)dst->ne[1];
     p.ne12 = (uint32_t)dst->ne[2];
-    p.ne13 = (uint32_t)dst->ne[3];
+    p.ne13 = (uint32_t)(dst->ne[3] * dst->ne[4]); // collapse 5D → 4D
     p.nb10 = (uint32_t)(dst->nb[0] / dst_tsize);
     p.nb11 = (uint32_t)(dst->nb[1] / dst_tsize);
     p.nb12 = (uint32_t)(dst->nb[2] / dst_tsize);
@@ -1187,6 +1189,12 @@ struct vk_op_binary_push_constants {
     uint32_t ne20; uint32_t ne21; uint32_t ne22; uint32_t ne23; uint32_t nb20; uint32_t nb21; uint32_t nb22; uint32_t nb23;
     uint32_t misalign_offsets;
     float param1; float param2; int32_t param3;
+};
+
+struct vk_op_scatter_elements_push_constants {
+    uint32_t ne;        // row_size
+    uint32_t n_idx;     // number of indices
+    uint32_t reduction; // 0=overwrite, 1=add
 };
 
 struct vk_op_multi_add_push_constants {
@@ -3987,6 +3995,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_acc_f32, "acc_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
 
+    ggml_vk_create_pipeline(device, device->pipeline_scatter_elements_none, "scatter_elements_none", scatter_elements_none_len, scatter_elements_none_data, "main", 3, sizeof(vk_op_scatter_elements_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_scatter_elements_add,  "scatter_elements_add",  scatter_elements_add_len,  scatter_elements_add_data,  "main", 3, sizeof(vk_op_scatter_elements_push_constants), {256, 1, 1}, {}, 1);
+
     ggml_vk_create_pipeline(device, device->pipeline_concat_f32, "concat_f32", concat_f32_len, concat_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_f16, "concat_f16", concat_f16_len, concat_f16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i32, "concat_i32", concat_i32_len, concat_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
@@ -6729,8 +6740,8 @@ static void ggml_vk_cpy_to_contiguous(ggml_backend_vk_context * ctx, vk_context&
 
     vk_op_unary_push_constants pc = {
         (uint32_t)ne,
-        (uint32_t)tensor->ne[0], (uint32_t)tensor->ne[1], (uint32_t)tensor->ne[2], (uint32_t)tensor->ne[3], (uint32_t)tensor->nb[0] / tensor_type_size, (uint32_t)tensor->nb[1] / tensor_type_size, (uint32_t)tensor->nb[2] / tensor_type_size, (uint32_t)tensor->nb[3] / tensor_type_size,
-        (uint32_t)tensor->ne[0], (uint32_t)tensor->ne[1], (uint32_t)tensor->ne[2], (uint32_t)tensor->ne[3],                       1                   , (uint32_t)tensor->ne[0]                   , (uint32_t)(tensor->ne[0] * tensor->ne[1]) , (uint32_t)(tensor->ne[0] * tensor->ne[1] * tensor->ne[2]),
+        (uint32_t)tensor->ne[0], (uint32_t)tensor->ne[1], (uint32_t)tensor->ne[2], (uint32_t)(tensor->ne[3] * tensor->ne[4]), (uint32_t)tensor->nb[0] / tensor_type_size, (uint32_t)tensor->nb[1] / tensor_type_size, (uint32_t)tensor->nb[2] / tensor_type_size, (uint32_t)tensor->nb[3] / tensor_type_size,
+        (uint32_t)tensor->ne[0], (uint32_t)tensor->ne[1], (uint32_t)tensor->ne[2], (uint32_t)(tensor->ne[3] * tensor->ne[4]),                       1                   , (uint32_t)tensor->ne[0]                   , (uint32_t)(tensor->ne[0] * tensor->ne[1]) , (uint32_t)(tensor->ne[0] * tensor->ne[1] * tensor->ne[2]),
         0,
         0.0f, 0.0f,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -8598,6 +8609,13 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         } else {
             return ctx->device->pipeline_set_rows_i32[dst->type];
         }
+    case GGML_OP_SCATTER_ELEMENTS:
+        {
+            int32_t reduction;
+            memcpy(&reduction, dst->op_params, sizeof(int32_t));
+            return reduction == 1 ? ctx->device->pipeline_scatter_elements_add
+                                  : ctx->device->pipeline_scatter_elements_none;
+        }
     case GGML_OP_SILU_BACK:
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_silu_back_f32;
@@ -9352,6 +9370,20 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             }
         }
         break;
+    case GGML_OP_SCATTER_ELEMENTS:
+        {
+            /* src0=updates, total threads = row_size * n_idx, workgroup = 256 */
+            uint32_t ne = (uint32_t)ggml_nelements(src0);
+            ne = CEIL_DIV(ne, 256);
+            if (ne > 262144) {
+                elements = { 256, 256, CEIL_DIV(ne, 65536) };
+            } else if (ne > 256) {
+                elements = { 256, CEIL_DIV(ne, 256), 1 };
+            } else {
+                elements = { ne, 1, 1 };
+            }
+        }
+        break;
     case GGML_OP_SSM_CONV:
         {
             const uint32_t nr  = src0->ne[1];
@@ -9474,7 +9506,7 @@ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx,
     pc.ne20 = (uint32_t)dst->ne[0];
     pc.ne21 = (uint32_t)dst->ne[1];
     pc.ne22 = (uint32_t)dst->ne[2];
-    pc.ne23 = (uint32_t)dst->ne[3];
+    pc.ne23 = (uint32_t)(dst->ne[3] * dst->ne[4]); // collapse 5D → 4D
 
     for (uint32_t i = 0; i < num_tensors; ++i) {
         const ggml_tensor *t = tensors[i];
@@ -10050,6 +10082,46 @@ static void ggml_vk_set_rows(ggml_backend_vk_context * ctx, vk_context& subctx, 
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
         0.0f, 0.0f, 0,
+    });
+}
+
+static void ggml_vk_scatter_elements(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * data    = dst->src[0];
+    const ggml_tensor * updates = dst->src[1];
+    const ggml_tensor * indices = dst->src[2];
+
+    const uint32_t upd_type_size = ggml_type_size(updates->type);
+    const uint32_t idx_type_size = ggml_type_size(indices->type);
+    const uint32_t dst_type_size = ggml_type_size(dst->type);
+
+    /* Step 1: copy data → dst buffer */
+    {
+        vk_subbuffer src_sb = ggml_vk_tensor_subbuffer(ctx, data, true);
+        vk_subbuffer dst_sb = ggml_vk_tensor_subbuffer(ctx, dst,  true);
+        ggml_vk_buffer_copy_async(subctx, dst_sb.buffer, dst_sb.offset,
+                                           src_sb.buffer, src_sb.offset,
+                                           ggml_nbytes(data));
+        /* Barrier: copy must finish before scatter shader reads/writes dst */
+        subctx->s->buffer.pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eComputeShader,
+            {},
+            { vk::MemoryBarrier(vk::AccessFlagBits::eTransferWrite,
+                                vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite) },
+            {}, {});
+    }
+
+    /* Step 2: run scatter shader — pass updates as src0, indices as src1 */
+    ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, updates, indices, nullptr, nullptr, dst, GGML_OP_SCATTER_ELEMENTS, {
+        (uint32_t)ggml_nelements(updates),
+        (uint32_t)updates->ne[0], (uint32_t)updates->ne[1], (uint32_t)updates->ne[2], (uint32_t)updates->ne[3],
+        (uint32_t)updates->nb[0] / upd_type_size, (uint32_t)updates->nb[1] / upd_type_size, (uint32_t)updates->nb[2] / upd_type_size, (uint32_t)updates->nb[3] / upd_type_size,
+        (uint32_t)indices->ne[0], (uint32_t)indices->ne[1], (uint32_t)indices->ne[2], (uint32_t)indices->ne[3],
+        (uint32_t)indices->nb[0] / idx_type_size, (uint32_t)indices->nb[1] / idx_type_size, (uint32_t)indices->nb[2] / idx_type_size, (uint32_t)indices->nb[3] / idx_type_size,
+        (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], (uint32_t)dst->ne[2], (uint32_t)dst->ne[3],
+        (uint32_t)dst->nb[0] / dst_type_size, (uint32_t)dst->nb[1] / dst_type_size, (uint32_t)dst->nb[2] / dst_type_size, (uint32_t)dst->nb[3] / dst_type_size,
+        0,
+        0.0f, 0.0f, ((int32_t *)dst->op_params)[1],  /* param3 = axis */
     });
 }
 
@@ -12144,6 +12216,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_SET_ROWS:
         ggml_vk_set_rows(ctx, compute_ctx, src0, src1, node);
+
+        break;
+    case GGML_OP_SCATTER_ELEMENTS:
+        ggml_vk_scatter_elements(ctx, compute_ctx, node);
 
         break;
     case GGML_OP_SILU_BACK:
@@ -14289,6 +14365,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         return false;
                 }
             }
+        case GGML_OP_SCATTER_ELEMENTS:
+            return op->type == GGML_TYPE_F32;
         case GGML_OP_CONT:
         case GGML_OP_CPY:
         case GGML_OP_DUP:

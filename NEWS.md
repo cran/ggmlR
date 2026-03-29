@@ -1,3 +1,89 @@
+# ggmlR 0.6.7
+
+## ggml engine: native 5D tensor support
+
+* **`ggml_view_5d()`** — new API function for creating 5D views with explicit strides, extending the existing 1D–4D view family. Uses the existing `ggml_view_impl()` internally.
+* **`ggml_repeat_5d()`** — new API function for tiling tensors up to 5D. CPU kernels (`ggml_compute_forward_repeat_f32`, `ggml_compute_forward_repeat_f16`) updated with a 5th loop dimension. Vulkan dispatch collapses dim3×dim4 into push constants transparently (no shader changes needed — push constants remain at 128 bytes).
+* ONNX tensor pipeline upgraded from hardcoded 4D to 5D throughout `onnx_ggml.c` (~20 sites):
+  - Initializers, inputs, Constant, ConstantOfShape: `ne[GGML_MAX_DIMS]` arrays, switch with `case 5: new_tensor_5d`.
+  - Broadcast (`onnx_broadcast_align`): all reshape/new_tensor calls use dimension-aware helpers.
+  - Softmax: reshape-back via generic `onnx_reshape_nd()`.
+  - Reshape op: collapse threshold raised from >4D to >5D.
+  - Slice: 5D view/offset support, generic stride-based cval propagation and deferred fill.
+  - Split: 5D view support.
+  - Expand: 5D broadcast with rank promotion.
+  - Tile: uses `ggml_repeat_5d()`.
+  - Gather axis=0: generic reshape-back for any rank.
+  - `tmap_put_nd()` and `slice_fill` arrays updated to `GGML_MAX_DIMS`.
+* New internal helpers: `onnx_reshape_nd()`, `onnx_new_tensor_nd()`, `ne_product()` — eliminate switch/case duplication.
+* Resize/Interpolate remains 4D (spatial op, 5D not relevant). Transpose/Permute remains 4D (`ggml_permute` API limitation).
+
+## ONNX: ConstantOfShape INT64/INT32/DOUBLE value fix
+
+* **roberta-9 model now loads and runs** (was producing NaN in softmax). Root cause: `ConstantOfShape` read the `value` TensorProto attribute as float regardless of `data_type`. When `data_type=7` (INT64), the 8-byte int64 was reinterpreted as a 4-byte float, producing garbage values (~1.4e-45 instead of 1). This broke attention mask generation (fill=0 instead of 1) and position ID generation (NonZero on zeros = empty).
+* Fix: `ConstantOfShape` now checks `data_type` and correctly handles INT64, INT32, DOUBLE, and FLOAT value attributes.
+
+## ONNX: Gather axis=0 on rank>2 tensors
+
+* **Gather on 4D tensors** no longer asserts. Previous code always used `ggml_get_rows` which only supports 2D data. For axis=0 on rank>2 (e.g. CaiT QKV split on `[48,576,6,3]`), the tensor is now reshaped to 2D, gathered, and reshaped back.
+
+## ONNX: ScatterElements op (GPU + CPU)
+
+* New `GGML_OP_SCATTER_ELEMENTS` added to the ggml engine with both CPU kernel and Vulkan compute shader.
+* **Vulkan shader** (`scatter_elements.comp`): two variants compiled at install time — `scatter_elements_none` (overwrite) and `scatter_elements_add` (atomicAdd via `GL_EXT_shader_atomic_float`). Data is copied to output via `vkCmdCopyBuffer` with a pipeline barrier before the scatter dispatch.
+* **CPU kernel**: single-threaded scatter with memcpy (overwrite) or element-wise addition (reduce=add).
+* ONNX mapper: `ScatterElements` op with `axis=0` and `reduction="none"/"add"` attributes. Indices cast to I32, updates/data cast to F32 automatically.
+* This unblocks sageconv (GNN message passing with scatter-add).
+
+## Model count
+
+* **12/15** ONNX Model Zoo models now pass (was 11/15). New: roberta-9.
+* Remaining failures: sageconv (ScatterElements shape mismatch needs further work), cait_xs24_384 (reshape size mismatch), MaskRCNN-12-int8 (spatial broadcast mismatch), xcit_tiny (broadcast dim mismatch).
+
+# ggmlR 0.6.6
+
+## ONNX: BoTNet RelPosBias2D fused custom op
+
+* **botnet26t_256 model now loads and runs** (was failing on 5D Transpose in pos_embed subgraph). Three pos_embed subgraphs (~60-80 ONNX nodes each) are detected via pre-pass scanner and replaced with a single fused `ggml_map_custom3` op. The CPU kernel computes 2D relative position bias directly: `bias[b,hq,wq,hk,wk] = dot(x, W_h) + dot(x_transposed, W_w)`.
+* Pre-pass scanner: `detect_pos_embed_blocks()` identifies contiguous node ranges with `/pos_embed/` in output names, extracts W_h/W_w initializer shapes to determine H, W, C, validates F32 data type.
+* Model count: **13/15** ONNX Model Zoo models now pass (was 12/15).
+
+## ONNX: pinned staging buffer for GPU input transfer
+
+* When Vulkan GPU is available, a host-visible pinned memory buffer is allocated at model load time for ONNX input data. In `onnx_ggml_run()`, input data is copied into pinned memory before `ggml_backend_tensor_set()` — the Vulkan driver detects the pinned source pointer and performs direct DMA transfer to VRAM, bypassing the internal staging copy.
+* Fallback: if `ggml_backend_vk_host_buffer_type()` returns NULL or buffer is too small, the standard staging path is used transparently.
+
+## Bug fixes
+
+* `onnx_device_info()`: added NULL guards for `ctx->graph` and `n_nodes == 0` edge cases that caused segfault when called on models before first inference run.
+
+# ggmlR 0.6.5
+
+## Bug fixes
+
+* **`ggml_predict()` with stochastic dropout**: `nn_build_graph()` now receives `training = FALSE` during inference, so stochastic Bernoulli dropout is disabled at predict time. Previously, `stochastic = TRUE` dropout layers applied random masks during inference, degrading accuracy.
+* **`ggml_fit()` return value**: the return value of `ggml_fit()` must be assigned back to `model` to obtain trained weights (`model <- ggml_fit(...)`). This is now clarified in all examples and documentation. Using `history <- ggml_fit(...)` without reassigning `model` leaves the model with untrained weights.
+* **`ggml_evaluate()` return value**: now includes `n_samples` in addition to `loss` and `accuracy`. Metrics are computed on all samples without truncation (via `ggml_predict()` internally).
+
+## Examples
+
+* `inst/examples/titanic_classification.R` — new end-to-end binary classification example on the Titanic dataset. Demonstrates feature engineering (Title, FamilySize, IsAlone), stratified train/val split, one-hot encoding, dropout regularization, and manual validation metrics (accuracy, precision, recall, F1, confusion matrix). Achieves ~82% val accuracy.
+
+## ONNX inference: dedicated weight buffer architecture
+
+* **Zero-overhead repeated inference**: weights are loaded to GPU (or CPU) once via a dedicated `weight_buf` and never re-transferred between runs. Previous architecture reloaded all weights before every `onnx_run()` call — eliminated entirely.
+* Separate `ctx_weight` / `ctx` contexts: weight tensors live in a permanent GPU buffer that the scheduler never aliases; compute tensors are managed by `ggml_backend_sched` independently.
+* GPU speedups from eliminated weight reload (vs 0.6.3):
+  - SuperResolution: 354 ms → 7 ms (48x)
+  - BERT: 100 ms → 15 ms (7x)
+  - Inception V3 Op18: 106 ms → 14 ms (7x)
+  - Inception V3: 24 ms → 14 ms (1.7x)
+  - EmotionFerPlus: 4.7 ms → 1.7 ms (2.8x)
+  - BAT-ResNeXt: 14 ms → 9 ms (1.6x)
+* `onnx_device_info()` — scheduler diagnostic: number of splits, GPU/CPU op counts, CPU-only op list.
+* GPT-NeoX model now loads and runs successfully (was failing on shape propagation).
+* Benchmark script (`inst/examples/benchmark_onnx.R`): proper VRAM cleanup between models via `rm()` + `gc()`.
+
 # ggmlR 0.6.3
 
 ## ONNX model import
@@ -14,7 +100,7 @@
 * Numpy-style broadcast for binary ops (Add/Sub/Mul/Div): handles mismatched ranks and dimensions, with left-align, right-align, and greedy dim-matching strategies.
 * Scalar Constant tensors (0-dimensional TensorProto) correctly handled.
 
-## Tested real-world ONNX models (9/15 from ONNX Model Zoo)
+## Tested real-world ONNX models (13/15 from ONNX Model Zoo)
 
 * mnist-8 — OK (12 nodes)
 * squeezenet1.0-8 — OK (66 nodes: Conv, Relu, MaxPool, Concat, Dropout, GlobalAveragePool, Softmax)
@@ -24,7 +110,12 @@
 * emotion-ferplus-8 — OK (52 nodes: Conv, Relu, MaxPool, Reshape, Gemm, Constant)
 * sageconv Opset 16 — OK (24 nodes: MatMul, Add, Mul, Sigmoid, ReduceSum)
 * roberta-sequence-classification-9 — OK with `input_shapes` (1180 nodes)
-* Remaining failures: bat_resnext26ts (MatMul 3D broadcast), botnet26t_256 (MatMul dims), cait_xs24 (Concat mismatch), gptneox (shape propagation), MaskRCNN (quantized ops), xcit_tiny (Concat mismatch).
+* bat_resnext26ts Opset 18 — OK (570 nodes: Conv, BatchNorm, SiLU, Concat, Expand, Split)
+* gptneox Opset 18 — OK with `input_shapes` (482 nodes: MatMul, LayerNorm, GELU, Softmax)
+* xcit_tiny — OK (436 nodes: MatMul, LayerNorm, Softmax, Concat, Transpose)
+* MaskRCNN-12-int8 — OK (937 nodes: QLinearConv, DequantizeLinear, Resize, Concat, Reshape)
+* botnet26t_256 (Opset 16) — OK (RelPosBias2D fused custom op, 3 pos_embed blocks replaced)
+* Remaining failures: cait_xs24_384 (batched matmul 3D+).
 
 # ggmlR 0.6.2
 * Fixed Windows cleanup script that removed `inst/lib/libggml.a`, breaking static linking from dependent packages (e.g. llamaR).

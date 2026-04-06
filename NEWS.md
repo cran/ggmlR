@@ -1,3 +1,47 @@
+# ggmlR 0.7.0
+
+## Vignettes: prebuilt HTML via Rcpp::asis
+
+* Seven vignettes (Autograd Engine, Data Parallel Training, Embedding ggmlR, GPU Vulkan Backend, Keras-like API, ONNX Import, Quantization) are now shipped as prebuilt HTML using the `Rcpp::asis` vignette engine. No rendering on CRAN runners.
+* Removed `rmarkdown` from Suggests (no longer needed).
+
+## Test suite
+
+* Suppressed spurious stdout/stderr output from tests: `ggml_graph_print()` output captured in `test-graph-utils.R`; C-level broadcast warnings captured in ONNX broadcast and resize-broadcast tests.
+
+# ggmlR 0.6.9
+
+## GGUF file reader
+
+* **`gguf_load(path)`** — opens a GGUF file (v2/v3) and reads all metadata and tensor descriptors. Returns an S3 object of class `"gguf"`.
+* **`gguf_metadata(x)`** — returns all key-value metadata pairs as a named list (architecture, tokenizer config, quantization info, etc.).
+* **`gguf_tensor_names(x)`** — lists all tensor names in the file.
+* **`gguf_tensor_info(x, name)`** — returns shape, type, and size in bytes for a single tensor.
+* **`gguf_tensor_data(x, name)`** — dequantizes (if needed) and returns tensor weights as an R numeric array with correct dimensions.
+* **`gguf_free(x)`** — explicitly frees GGUF context (also called by GC).
+* Supports all ggml quantization types (F32, F16, Q4_0, Q8_0, K-quants, etc.) with automatic dequantization to F32.
+* `print.gguf()` method shows file version, tensor count, and metadata count.
+
+## Vulkan backend: revert to Vulkan 1.2 + Push Descriptors
+
+* **Vulkan API version capped at 1.2** (was 1.3). Requesting a Vulkan 1.3 instance implicitly enables Synchronization2 (core in 1.3), which causes significant performance degradation on RADV (Mesa) drivers — particularly on newer AMD hardware (RX 9070 and similar). Capping at 1.2 avoids the implicit promotion while retaining all functionality.
+* **Push Descriptors** (`VK_KHR_push_descriptor`): unchanged — when the extension is available and `maxPushDescriptors >= 12`, descriptor sets are pushed directly into the command buffer via `pushDescriptorSetKHR()`, eliminating descriptor pool overhead. Falls back to the traditional descriptor pool path on hardware without the extension.
+
+## Keras-compatible API
+
+* **`fit()`** now accepts a `callbacks` parameter for sequential models (passed through to `ggml_fit_sequential()`).
+
+## Test suite
+
+* New test files: `test-gguf.R`, `test-graph-utils.R`, `test-inplace-ops.R`, `test-keras-api.R`, `test-misc-ops.R`, `test-model-ops.R`, `test-print-methods.R`, `test-tensor-utils.R`, `test-threading.R`, `test-autograd-missing.R`, `test-nn-functional-missing.R`, `test-quants-missing.R`.
+
+# ggmlR 0.6.8
+
+## Bug fixes
+
+* Fixed ABI mismatch between `src/` and `inst/include/` headers: `configure` and `configure.win` now automatically sync all public headers from `src/` to `inst/include/` at install time. Previously, changes to `GGML_MAX_DIMS` (4→5) and other structs in `src/ggml.h` were not propagated to the exported headers, causing segfaults in downstream packages (e.g. sd2R).
+* Added `tests/testthat/test-headers-sync.R` to verify that `inst/include/` headers remain in sync with `src/` headers and that `GGML_MAX_DIMS` is consistent.
+
 # ggmlR 0.6.7
 
 ## ggml engine: native 5D tensor support

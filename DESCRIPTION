@@ -1,7 +1,7 @@
 Package: ggmlR
 Type: Package
 Title: 'GGML' Tensor Operations for Machine Learning
-Version: 0.6.7
+Version: 0.7.0
 Authors@R: c(
     person("Yuri", "Baramykov",
         email = "lbsbmsu@mail.ru",
@@ -21,12 +21,16 @@ Authors@R: c(
     )
 Description: Provides 'R' bindings to the 'GGML' tensor library for machine
     learning, designed primarily for 'Vulkan' GPU acceleration with full CPU
-    fallback. 'Vulkan' support is auto-detected at build time on Linux (when
-    'libvulkan-dev' and 'glslc' are installed) and on Windows (when 'Vulkan'
-    'SDK' is installed and 'VULKAN_SDK' environment variable is set); all
-    operations fall back to CPU transparently when no GPU is available.
+    fallback. Requires 'Vulkan' 1.2+ with legacy pipeline barriers (avoids
+    'Synchronization2' due to 'RADV' performance issues); supports 'Push
+    Descriptors' ('VK_KHR_push_descriptor')
+    to eliminate descriptor pool overhead when available. 'Vulkan' support is
+    auto-detected at build time on Linux (when 'libvulkan-dev' and 'glslc'
+    are installed) and on Windows (when 'Vulkan' 'SDK' is installed and
+    'VULKAN_SDK' environment variable is set); all operations fall back to
+    CPU transparently when no GPU is available.
     Supports tensors up to 5D natively (GGML_MAX_DIMS=5).
-    Implements tensor operations, neural network layers, quantization, and a
+    Implements tensor operations, neural network layers, 'quantization', and a
     'Keras'-like sequential model API for building and training networks.
     Includes 'AdamW' (Adam with Weight decay) and 'SGD' (Stochastic Gradient
     Descent) optimizers with 'MSE' (Mean Squared Error) and cross-entropy
@@ -42,6 +46,9 @@ Description: Provides 'R' bindings to the 'GGML' tensor library for machine
     and fused custom ops (RelPosBias2D for 'BoTNet') — sufficient to run
     real-world models such as 'RoBERTa', 'BERT', 'GPT-NeoX', 'SqueezeNet',
     'Inception v3', 'BAT-ResNeXt', 'BoTNet', and 'MNIST' out of the box.
+    Reads 'GGUF' files natively: load 'pretrained' weights from any
+    'gguf'-compatible source ('llama.cpp', 'Hugging Face') with automatic
+    weight conversion and metadata access.
     Uses a dedicated weight buffer architecture for zero-overhead repeated
     inference — weights are loaded to GPU once and never re-transferred.
     Serves as backend for 'LLM' (Large Language Model)
@@ -56,11 +63,13 @@ Encoding: UTF-8
 SystemRequirements: C++17, GNU make, libvulkan-dev, glslc (optional,
         for GPU on Linux), 'Vulkan' 'SDK' (optional, for GPU on
         Windows)
-Suggests: testthat (>= 3.0.0)
+Suggests: Rcpp, testthat (>= 3.0.0)
+VignetteBuilder: Rcpp
 RoxygenNote: 7.3.3
 Config/testthat/edition: 3
+Config/build/clean-inst-doc: false
 NeedsCompilation: yes
-Packaged: 2026-03-29 17:30:03 UTC; yuri
+Packaged: 2026-04-05 19:10:17 UTC; yuri
 Author: Yuri Baramykov [aut, cre],
   Georgi Gerganov [ctb, cph] (Author of the GGML library),
   Jeffrey Quesnelle [ctb, cph] (Contributor to ops.cpp),
@@ -68,4 +77,4 @@ Author: Yuri Baramykov [aut, cre],
   Mozilla Foundation [ctb, cph] (Author of llamafile/sgemm.cpp)
 Maintainer: Yuri Baramykov <lbsbmsu@mail.ru>
 Repository: CRAN
-Date/Publication: 2026-03-29 17:50:02 UTC
+Date/Publication: 2026-04-06 05:20:02 UTC

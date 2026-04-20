@@ -1,7 +1,7 @@
 Package: ggmlR
 Type: Package
 Title: 'GGML' Tensor Operations for Machine Learning
-Version: 0.7.2
+Version: 0.7.5
 Authors@R: c(
     person("Yuri", "Baramykov",
         email = "lbsbmsu@mail.ru",
@@ -41,15 +41,14 @@ Encoding: UTF-8
 SystemRequirements: C++17, GNU make, libvulkan-dev, glslc (optional,
         for GPU on Linux), 'Vulkan' 'SDK' (optional, for GPU on
         Windows)
-Suggests: Rcpp, testthat (>= 3.0.0), mlr3 (>= 0.21.0), paradox, R6,
-        checkmate, digest, mlr3pipelines, parsnip, tibble, rlang,
-        dials, lgr, knitr, rmarkdown, rpart, future
-VignetteBuilder: knitr, rmarkdown, Rcpp
+Suggests: testthat (>= 3.0.0), mlr3 (>= 0.21.0), paradox, R6, digest,
+        parsnip, tibble, rlang, dials, lgr, knitr, rmarkdown
+VignetteBuilder: knitr, rmarkdown
 RoxygenNote: 7.3.3
 Config/testthat/edition: 3
 Config/build/clean-inst-doc: false
 NeedsCompilation: yes
-Packaged: 2026-04-14 18:52:25 UTC; yuri
+Packaged: 2026-04-20 08:16:00 UTC; yuri
 Author: Yuri Baramykov [aut, cre],
   Georgi Gerganov [ctb, cph] (Author of the GGML library),
   Jeffrey Quesnelle [ctb, cph] (Contributor to ops.cpp),
@@ -57,4 +56,4 @@ Author: Yuri Baramykov [aut, cre],
   Mozilla Foundation [ctb, cph] (Author of llamafile/sgemm.cpp)
 Maintainer: Yuri Baramykov <lbsbmsu@mail.ru>
 Repository: CRAN
-Date/Publication: 2026-04-15 06:30:24 UTC
+Date/Publication: 2026-04-20 11:10:02 UTC

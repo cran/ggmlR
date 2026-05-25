@@ -169,9 +169,16 @@ OPENMP_CFLAGS=""
 OPENMP_CXXFLAGS=""
 OPENMP_CPPFLAGS=""
 
+# Strip the static library on native builds to shrink it. Under Emscripten
+# the system `strip` corrupts the wasm/bitcode sections of the archive
+# members (wasm-ld then rejects libggml.a as "neither Wasm object file nor
+# LLVM bitcode"), so disable it there — emcc strips at link time anyway.
+STATICLIB_STRIP="strip --strip-debug ../inst/lib/\$(STATICLIB) 2>/dev/null || true"
+
 # Emscripten (WASM) does not provide omp.h - disable OpenMP
 if echo "$HOST" | grep -q "emscripten"; then
   echo "  Emscripten target detected, disabling OpenMP"
+  STATICLIB_STRIP=":"
 elif [ -f "$MAKECONF" ]; then
   OPENMP_CFLAGS=$(grep '^SHLIB_OPENMP_CFLAGS' "$MAKECONF" | sed 's/[^=]*= *//')
   OPENMP_CXXFLAGS=$(grep '^SHLIB_OPENMP_CXXFLAGS' "$MAKECONF" | sed 's/[^=]*= *//')
@@ -283,7 +290,13 @@ if [ "$USE_VULKAN" = "yes" ]; then
     exit 1
   fi
 
-  # Create output directories
+  # Wipe any stale generated/ from a previous configure run (possibly built
+  # with a different glslc). The shader set depends on glslc feature support
+  # (integer_dot, coopmat, bf16); a partial overwrite would leave orphan .cpp
+  # whose symbols are no longer declared in the regenerated header, breaking
+  # the final link with "undefined symbol: arr_dmmv_*". Always regenerate the
+  # full set from scratch so generated/ matches the current glslc exactly.
+  rm -rf ../generated
   mkdir -p ../generated/spv
 
   # Generate header file
@@ -342,10 +355,12 @@ sed \
   -e "s|@SIMD_CFLAGS@|$SIMD_CFLAGS|g" \
   -e "s|@GENERIC_CPPFLAGS@|$GENERIC_CPPFLAGS|g" \
   -e "s|@X86_OBJECTS@|$X86_OBJECTS|g" \
+  -e "s#@STATICLIB_STRIP@#$STATICLIB_STRIP#g" \
   src/Makevars.in > src/Makevars
 
 # Sync public headers from src/ to inst/include/
 echo "Syncing public headers to inst/include/..."
+mkdir -p inst/include
 for h in ggml.h ggml-alloc.h ggml-backend.h ggml-backend-impl.h ggml-common.h \
           ggml-cpp.h ggml-cpu.h ggml-impl.h ggml-opt.h ggml-quants.h \
           ggml-threading.h ggml-vulkan.h gguf.h r_ggml_compat.h; do

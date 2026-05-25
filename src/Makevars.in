@@ -55,9 +55,9 @@ GGML_OBJECTS = \
   r_ggml_io.o \
   ggml-private.o \
   ggml-alloc.o \
-  ggml-quants-legacy.o ggml-quants-iq.o ggml-quants-validate.o \
+  ggml-quants-legacy.o ggml-quants-iq.o ggml-quants-validate.o ggml-quants-new.o \
   ggml-opt.o gguf.o \
-  ggml-backend.o ggml-backend-reg.o ggml-threading.o \
+  ggml-backend.o ggml-backend-reg.o ggml-backend-meta.o ggml-threading.o \
   ggml-cpu/traits.o \
   ggml-cpu/ggml-cpu-backend.o ggml-cpu/ggml-cpu.o \
   ggml-cpu/ops-private.o \
@@ -95,7 +95,7 @@ staticlib: $(GGML_OBJECTS)
 	mkdir -p ../inst/lib
 	rm -f ../inst/lib/$(STATICLIB)
 	$(AR) rcs ../inst/lib/$(STATICLIB) $(GGML_OBJECTS)
-	strip --strip-debug ../inst/lib/$(STATICLIB) 2>/dev/null || true
+	@STATICLIB_STRIP@
 
 # R interface files and r_ggml_io.c include R headers (R.h, Rinternals.h)
 # which contain __attribute__((format(printf, ...))). Our macro

@@ -11,7 +11,10 @@ vignette: >
 knitr::opts_chunk$set(
   collapse = TRUE,
   comment  = "#>",
-  eval     = requireNamespace("mlr3", quietly = TRUE) &&
+  # Executed locally (NOT_CRAN=true); skipped on CRAN to avoid the
+  # "CPU time > elapsed" vignette NOTE from the CPU fallback.
+  eval     = identical(Sys.getenv("NOT_CRAN"), "true") &&
+             requireNamespace("mlr3", quietly = TRUE) &&
              requireNamespace("paradox", quietly = TRUE)
 )
 library(ggmlR)
@@ -92,7 +95,7 @@ learner$param_set$values$backend       <- "gpu"
 
 Set `backend = "gpu"` (or leave `"auto"` if a Vulkan GPU is available):
 
-```{r, eval=ggml_vulkan_available()}
+```{r, eval=identical(Sys.getenv("NOT_CRAN"), "true") && ggml_vulkan_available()}
 learner <- lrn("classif.ggml",
                backend = "gpu",
                epochs  = 100L)

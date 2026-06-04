@@ -359,37 +359,17 @@ recipes all work out of the box.</p>
 <span id="cb2-7"><a href="#cb2-7" tabindex="-1"></a>  <span class="fu">set_mode</span>(<span class="st">&quot;classification&quot;</span>)</span>
 <span id="cb2-8"><a href="#cb2-8" tabindex="-1"></a></span>
 <span id="cb2-9"><a href="#cb2-9" tabindex="-1"></a>fit_obj <span class="ot">&lt;-</span> <span class="fu">fit</span>(spec, Species <span class="sc">~</span> ., <span class="at">data =</span> iris)</span>
-<span id="cb2-10"><a href="#cb2-10" tabindex="-1"></a><span class="co">#&gt; Note: dropping last 22 sample(s) (150 -&gt; 128) because batch_size=32 must divide evenly. Training metrics are computed on 128 samples only.</span></span>
-<span id="cb2-11"><a href="#cb2-11" tabindex="-1"></a></span>
-<span id="cb2-12"><a href="#cb2-12" tabindex="-1"></a><span class="co"># Class predictions</span></span>
-<span id="cb2-13"><a href="#cb2-13" tabindex="-1"></a>preds <span class="ot">&lt;-</span> <span class="fu">predict</span>(fit_obj, <span class="at">new_data =</span> iris)</span>
-<span id="cb2-14"><a href="#cb2-14" tabindex="-1"></a><span class="fu">head</span>(preds)</span>
-<span id="cb2-15"><a href="#cb2-15" tabindex="-1"></a><span class="co">#&gt; # A tibble: 6 × 1</span></span>
-<span id="cb2-16"><a href="#cb2-16" tabindex="-1"></a><span class="co">#&gt;   .pred_class</span></span>
-<span id="cb2-17"><a href="#cb2-17" tabindex="-1"></a><span class="co">#&gt;   &lt;fct&gt;      </span></span>
-<span id="cb2-18"><a href="#cb2-18" tabindex="-1"></a><span class="co">#&gt; 1 setosa     </span></span>
-<span id="cb2-19"><a href="#cb2-19" tabindex="-1"></a><span class="co">#&gt; 2 setosa     </span></span>
-<span id="cb2-20"><a href="#cb2-20" tabindex="-1"></a><span class="co">#&gt; 3 setosa     </span></span>
-<span id="cb2-21"><a href="#cb2-21" tabindex="-1"></a><span class="co">#&gt; 4 setosa     </span></span>
-<span id="cb2-22"><a href="#cb2-22" tabindex="-1"></a><span class="co">#&gt; 5 setosa     </span></span>
-<span id="cb2-23"><a href="#cb2-23" tabindex="-1"></a><span class="co">#&gt; 6 setosa</span></span>
-<span id="cb2-24"><a href="#cb2-24" tabindex="-1"></a></span>
-<span id="cb2-25"><a href="#cb2-25" tabindex="-1"></a><span class="co"># Probability predictions</span></span>
-<span id="cb2-26"><a href="#cb2-26" tabindex="-1"></a>probs <span class="ot">&lt;-</span> <span class="fu">predict</span>(fit_obj, <span class="at">new_data =</span> iris, <span class="at">type =</span> <span class="st">&quot;prob&quot;</span>)</span>
-<span id="cb2-27"><a href="#cb2-27" tabindex="-1"></a><span class="fu">head</span>(probs)</span>
-<span id="cb2-28"><a href="#cb2-28" tabindex="-1"></a><span class="co">#&gt; # A tibble: 6 × 3</span></span>
-<span id="cb2-29"><a href="#cb2-29" tabindex="-1"></a><span class="co">#&gt;   .pred_setosa .pred_versicolor .pred_virginica</span></span>
-<span id="cb2-30"><a href="#cb2-30" tabindex="-1"></a><span class="co">#&gt;          &lt;dbl&gt;            &lt;dbl&gt;           &lt;dbl&gt;</span></span>
-<span id="cb2-31"><a href="#cb2-31" tabindex="-1"></a><span class="co">#&gt; 1        0.960           0.0272          0.0129</span></span>
-<span id="cb2-32"><a href="#cb2-32" tabindex="-1"></a><span class="co">#&gt; 2        0.938           0.0441          0.0179</span></span>
-<span id="cb2-33"><a href="#cb2-33" tabindex="-1"></a><span class="co">#&gt; 3        0.946           0.0366          0.0174</span></span>
-<span id="cb2-34"><a href="#cb2-34" tabindex="-1"></a><span class="co">#&gt; 4        0.919           0.0588          0.0217</span></span>
-<span id="cb2-35"><a href="#cb2-35" tabindex="-1"></a><span class="co">#&gt; 5        0.960           0.0271          0.0130</span></span>
-<span id="cb2-36"><a href="#cb2-36" tabindex="-1"></a><span class="co">#&gt; 6        0.957           0.0320          0.0112</span></span>
-<span id="cb2-37"><a href="#cb2-37" tabindex="-1"></a></span>
-<span id="cb2-38"><a href="#cb2-38" tabindex="-1"></a><span class="co"># Accuracy</span></span>
-<span id="cb2-39"><a href="#cb2-39" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;Accuracy: %.4f</span><span class="sc">\n</span><span class="st">&quot;</span>, <span class="fu">mean</span>(preds<span class="sc">$</span>.pred_class <span class="sc">==</span> iris<span class="sc">$</span>Species)))</span>
-<span id="cb2-40"><a href="#cb2-40" tabindex="-1"></a><span class="co">#&gt; Accuracy: 0.6667</span></span></code></pre></div>
+<span id="cb2-10"><a href="#cb2-10" tabindex="-1"></a></span>
+<span id="cb2-11"><a href="#cb2-11" tabindex="-1"></a><span class="co"># Class predictions</span></span>
+<span id="cb2-12"><a href="#cb2-12" tabindex="-1"></a>preds <span class="ot">&lt;-</span> <span class="fu">predict</span>(fit_obj, <span class="at">new_data =</span> iris)</span>
+<span id="cb2-13"><a href="#cb2-13" tabindex="-1"></a><span class="fu">head</span>(preds)</span>
+<span id="cb2-14"><a href="#cb2-14" tabindex="-1"></a></span>
+<span id="cb2-15"><a href="#cb2-15" tabindex="-1"></a><span class="co"># Probability predictions</span></span>
+<span id="cb2-16"><a href="#cb2-16" tabindex="-1"></a>probs <span class="ot">&lt;-</span> <span class="fu">predict</span>(fit_obj, <span class="at">new_data =</span> iris, <span class="at">type =</span> <span class="st">&quot;prob&quot;</span>)</span>
+<span id="cb2-17"><a href="#cb2-17" tabindex="-1"></a><span class="fu">head</span>(probs)</span>
+<span id="cb2-18"><a href="#cb2-18" tabindex="-1"></a></span>
+<span id="cb2-19"><a href="#cb2-19" tabindex="-1"></a><span class="co"># Accuracy</span></span>
+<span id="cb2-20"><a href="#cb2-20" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;Accuracy: %.4f</span><span class="sc">\n</span><span class="st">&quot;</span>, <span class="fu">mean</span>(preds<span class="sc">$</span>.pred_class <span class="sc">==</span> iris<span class="sc">$</span>Species)))</span></code></pre></div>
 <hr />
 </div>
 <div id="regression" class="section level2">
@@ -404,16 +384,7 @@ recipes all work out of the box.</p>
 <span id="cb3-8"><a href="#cb3-8" tabindex="-1"></a>fit_reg <span class="ot">&lt;-</span> <span class="fu">fit</span>(spec_reg, mpg <span class="sc">~</span> ., <span class="at">data =</span> mtcars)</span>
 <span id="cb3-9"><a href="#cb3-9" tabindex="-1"></a></span>
 <span id="cb3-10"><a href="#cb3-10" tabindex="-1"></a>preds_reg <span class="ot">&lt;-</span> <span class="fu">predict</span>(fit_reg, <span class="at">new_data =</span> mtcars)</span>
-<span id="cb3-11"><a href="#cb3-11" tabindex="-1"></a><span class="fu">head</span>(preds_reg)</span>
-<span id="cb3-12"><a href="#cb3-12" tabindex="-1"></a><span class="co">#&gt; # A tibble: 6 × 1</span></span>
-<span id="cb3-13"><a href="#cb3-13" tabindex="-1"></a><span class="co">#&gt;   .pred</span></span>
-<span id="cb3-14"><a href="#cb3-14" tabindex="-1"></a><span class="co">#&gt;   &lt;dbl&gt;</span></span>
-<span id="cb3-15"><a href="#cb3-15" tabindex="-1"></a><span class="co">#&gt; 1  19.2</span></span>
-<span id="cb3-16"><a href="#cb3-16" tabindex="-1"></a><span class="co">#&gt; 2  19.3</span></span>
-<span id="cb3-17"><a href="#cb3-17" tabindex="-1"></a><span class="co">#&gt; 3  17.1</span></span>
-<span id="cb3-18"><a href="#cb3-18" tabindex="-1"></a><span class="co">#&gt; 4  17.1</span></span>
-<span id="cb3-19"><a href="#cb3-19" tabindex="-1"></a><span class="co">#&gt; 5  23.2</span></span>
-<span id="cb3-20"><a href="#cb3-20" tabindex="-1"></a><span class="co">#&gt; 6  16.7</span></span></code></pre></div>
+<span id="cb3-11"><a href="#cb3-11" tabindex="-1"></a><span class="fu">head</span>(preds_reg)</span></code></pre></div>
 <hr />
 </div>
 <div id="engine-parameters" class="section level2">

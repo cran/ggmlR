@@ -9,9 +9,11 @@ knitr::opts_chunk$set(
              requireNamespace("paradox", quietly = TRUE)
 )
 library(ggmlR)
+# Loading ggmlR installs a load hook that registers the mlr3 learners
+# (classif.ggml / regr.ggml) automatically once mlr3 is loaded — no manual
+# registration call is needed.
 if (requireNamespace("mlr3", quietly = TRUE)) {
   library(mlr3)
-  ggmlR:::.register_mlr3()
 }
 
 ## -----------------------------------------------------------------------------

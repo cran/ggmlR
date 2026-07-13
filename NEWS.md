@@ -1,3 +1,28 @@
+# ggmlR 0.8.1
+
+* **Double-precision GPU matmul** — `ggml_matmul_f64()` computes `A %*% B` on Vulkan GPUs in full fp64, matching R's native precision (~1e-15). Falls back to the CPU when the hardware or the `shaderFloat64` feature is unavailable.
+* **GPU k-nearest-neighbours** — `knn_backend = "vulkan"` runs the kNN search on a dedicated Vulkan shader: exact f32 distances with a per-row top-k, keeping memory linear (`O(n)` instead of `O(n^2)`). Falls back to the CPU when `n_neighbors > 32` or VRAM is exceeded.
+* **GPU linear algebra** — `ggml_matmul()`, `ggml_crossprod()` and `ggml_tcrossprod()` GPU-accelerate ordinary R matrices. `as_gpu_matrix()` wraps a matrix so `%*%`, `crossprod()` and `tcrossprod()` dispatch to the GPU transparently. `device = "auto"` keeps small matrices on the CPU.
+* **Single-cell `op = "largest_gene"`** — computes Seurat's `percent.Largest.Gene` QC metric directly over sparse `dgCMatrix` objects on the CPU (no densify), matching `qlcMatrix::colMax`.
+* **Single-cell `op = "normalize"`** — sparse log-normalization now runs on the GPU via a Vulkan shader, avoiding densification of large datasets.
+* **UMAP CPU-SGD** — the single-threaded layout engine rewritten in C, much faster while bit-for-bit identical to the reference.
+
+# ggmlR 0.8.0
+
+* **Multi-GPU tensor parallelism (Vulkan)** — `ggml_vulkan_split_mul_mat()` row-splits a weight matrix across GPUs, computes each slice on its own device, and gathers the result (not in upstream ggml). Verified on 4× Tesla P100.
+* Supporting API: `ggml_vulkan_split_buffer_type()` (split buffer type, with an arbitrary `device_ids` subset), `ggml_vulkan_split_row_ranges()`, and `ggml_vulkan_p2p_selftest()` / `ggml_vulkan_device_groups()` transport probes.
+* **Cross-device transport** defaults to portable **host staging** (correct on every driver); `opaque-fd` and `device-group` are also selectable.
+* **TP × DP hybrid** — `ggml_tp_dp_forward(W, X, replicas)` runs data parallelism over the batch across replicas of tensor-parallel device groups (e.g. 2 replicas × TP=2 on 4 GPUs).
+* **Pipeline parallelism** — `ggml_pp_forward(stages, x, out_shape)` splits a model *by layers* across devices, handing activations between stages once per pass (a single cross-device copy).
+
+# ggmlR 0.7.9
+
+* **logging**: the Vulkan backend reports operating-mode changes through the standard `ggml` log — selected device and capabilities, CPU-fallback summary, live VRAM footprint, and the silent BF16→F16 downgrade.
+* **Single-cell GPU integration (Seurat)**: new adapter running GPU ops directly on `Seurat` objects, with no hard dependency (Seurat stays in `Suggests`).
+* `RunGGML()` — pipe-friendly entry point mirroring `RunPCA()`; operations `"embed"` (PCA), `"normalize"`, `"scale"`, and `"umap"` (2-D layout SGD on a new `umap_sgd.comp` Vulkan shader, verified bit-exact vs the CPU reference).
+* PCA eigendecomposition uses a truncated symmetric solver (`RSpectra::eigs_sym`) when available — `O(genes² · k)` instead of `O(genes³)`.
+* Layered `ggml_extract()` / `ggml_run()` / `ggml_inject()` architecture with run provenance in `Misc`; `Seurat`, `SeuratObject`, `Matrix`, `RSpectra`, `irlba` added to `Suggests`.
+
 # ggmlR 0.7.8
 
 * Re-enabled the `GGML_BACKEND_DEVICE_TYPE_META` device type (tensor-parallel meta backend).

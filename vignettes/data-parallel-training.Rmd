@@ -2,7 +2,7 @@
 title: "Data-Parallel Training"
 output: rmarkdown::html_vignette
 vignette: >
-  %\VignetteIndexEntry{Data-Parallel Training}
+  %\VignetteIndexEntry{08. Data-Parallel Training}
   %\VignetteEngine{knitr::rmarkdown}
   %\VignetteEncoding{UTF-8}
 ---

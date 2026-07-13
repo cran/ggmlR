@@ -2,7 +2,7 @@
 title: "Quantization"
 output: rmarkdown::html_vignette
 vignette: >
-  %\VignetteIndexEntry{Quantization}
+  %\VignetteIndexEntry{07. Quantization}
   %\VignetteEngine{knitr::rmarkdown}
   %\VignetteEncoding{UTF-8}
 ---

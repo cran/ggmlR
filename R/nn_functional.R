@@ -1366,6 +1366,13 @@ ggml_compile.ggml_functional_model <- function(model,
   model$compilation$optimizer <- optimizer
   model$compilation$loss      <- loss
   model$compilation$metrics   <- metrics
+  # Record requested vs actually-used backend so a silent "auto" -> CPU
+  # fallback is inspectable later (see ggml_model_backend()).
+  model$compilation$backend_requested <- backend
+  model$compilation$backend_used      <- if (use_vulkan) "vulkan" else "cpu"
+  model$compilation$device <- if (use_vulkan) {
+    ggml_vulkan_device_description(0L)
+  } else "cpu"
   model$compiled              <- TRUE
 
   invisible(model)
@@ -1496,8 +1503,10 @@ ggml_fit.ggml_functional_model <- function(model, x, y,
   # Truncate to batch boundary
   usable <- (n_samples %/% batch_size) * batch_size
   if (usable < n_samples) {
-    message("Truncating data from ", n_samples, " to ", usable,
-            " samples (batch_size=", batch_size, " must divide evenly)")
+    if (verbose > 0) {
+      message("Truncating data from ", n_samples, " to ", usable,
+              " samples (batch_size=", batch_size, " must divide evenly)")
+    }
     keep_idx <- seq_len(usable * ne_datapoint)
     x_ggml   <- x_ggml[keep_idx]
     y        <- y[seq_len(usable), , drop = FALSE]

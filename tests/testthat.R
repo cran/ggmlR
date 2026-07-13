@@ -66,10 +66,16 @@ heavy <- c(
   "onnx-boundary",
   "onnx-edge",
   "parsnip",
+  "parsnip-tidymodels",
+  "parsnip-broom",
+  "seed",
+  "upscale",
+  "rope-multi",
   "mlr3-learner",
   "keras-api",
   "quants-iq-degenerate",
-  "getrows-offload-vulkan"
+  "getrows-offload-vulkan",
+  "gpu-linalg"
 )
 
 # Under the valgrind memtest, running the full light suite (~67 files) blows
@@ -116,6 +122,13 @@ detect_valgrind <- function() {
 }
 under_valgrind <- isTRUE(detect_valgrind())
 message("valgrind detected: ", under_valgrind)
+
+# Disable OpenMP thread pool under valgrind: GOMP_parallel → pthread_create
+# allocates 352b TLS per worker thread which valgrind flags as "possibly lost".
+# Under valgrind we test correctness, not throughput — 1 thread is sufficient.
+if (under_valgrind) {
+  Sys.setenv(OMP_NUM_THREADS = "1")
+}
 
 on_cran <- !identical(Sys.getenv("NOT_CRAN"), "true")
 

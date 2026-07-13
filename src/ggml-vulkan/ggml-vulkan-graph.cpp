@@ -1,3 +1,8 @@
+#include "../r_dbg_filelog.h" /* opt-in trace via GGMLR_DBG_LOG env (no-op when unset) */
+#ifdef GGML_VK_HARD_EXIT
+#include <unistd.h>           /* _exit() for ggml_backend_vk_shutdown(hard=1, status) */
+#endif
+
 static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx) {
 
     if (subctx) {
@@ -57,6 +62,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     }
 
     VK_LOG_DEBUG("ggml_vk_build_graph(" << node << ", " << ggml_op_name(node->op) << ")");
+    r_dbg_logf("vk_node[%d] op=%s name='%s' ne=[%lld,%lld,%lld,%lld] type=%s",
+               node_idx, ggml_op_name(node->op),
+               node->name[0] ? node->name : "<unnamed>",
+               (long long)node->ne[0], (long long)node->ne[1],
+               (long long)node->ne[2], (long long)node->ne[3],
+               ggml_type_name(node->type));
     ctx->semaphore_idx = 0;
 
     ggml_tensor * src0 = node->src[0];
@@ -705,11 +716,36 @@ static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
     return buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name;
 }
 
+// Industrial telemetry: live Vulkan device-buffer VRAM footprint (defined with
+// the alloc path below; forward-declared here so free can decrement them).
+static uint64_t g_vk_live_buffer_bytes;
+static uint64_t g_vk_buffer_alloc_count;
+
+// Forward declaration: defined near supports_op (further down) but called from
+// graph_compute (above its definition) to summarize CPU-fallback ops.
+static void ggml_vk_log_unsupported_op_summary(const char * phase);
+
 static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_free_buffer()");
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
-    ggml_vk_destroy_buffer(ctx->dev_buffer);
+    size_t freed = buffer->size;
+    // dev_buffer is destroyed by ~ggml_backend_vk_buffer_context (called from
+    // delete ctx). Calling ggml_vk_destroy_buffer here as well was a redundant
+    // double-destroy of the same shared vk_buffer; matches upstream which only
+    // does `delete ctx`.
     delete ctx;
+    if (g_vk_live_buffer_bytes >= freed) {
+        g_vk_live_buffer_bytes -= freed;
+    } else {
+        g_vk_live_buffer_bytes = 0;
+    }
+    if (g_vk_buffer_alloc_count > 0) {
+        g_vk_buffer_alloc_count--;
+    }
+    GGML_LOG_DEBUG("ggml_vulkan: VRAM free %.2f MB | live=%.2f MB in %llu buffers\n",
+                   freed / (1024.0 * 1024.0),
+                   g_vk_live_buffer_bytes / (1024.0 * 1024.0),
+                   (unsigned long long)g_vk_buffer_alloc_count);
 }
 
 static void * ggml_backend_vk_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -735,8 +771,17 @@ static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, g
     ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
 }
 
+static unsigned long long g_vk_set_tensor_calls = 0;
+static unsigned long long g_vk_set_tensor_bytes = 0;
+
 static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_set_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")");
+    g_vk_set_tensor_calls++;
+    g_vk_set_tensor_bytes += size;
+    r_dbg_logf("vk_set_tensor: #%llu name='%s' type=%s size=%zu off=%zu cum=%llu",
+               g_vk_set_tensor_calls,
+               tensor->name[0] ? tensor->name : "<unnamed>",
+               ggml_type_name(tensor->type), size, offset, g_vk_set_tensor_bytes);
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
     vk_buffer buf = buf_ctx->dev_buffer;
 
@@ -820,6 +865,9 @@ static const char * ggml_backend_vk_buffer_type_name(ggml_backend_buffer_type_t 
     return ctx->name.c_str();
 }
 
+// g_vk_live_buffer_bytes / g_vk_buffer_alloc_count are forward-declared above
+// (near free_buffer). Updated on alloc/free to track live VRAM footprint.
+
 static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_buffer_type_alloc_buffer(" << size << ")");
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
@@ -828,26 +876,53 @@ static ggml_backend_buffer_t ggml_backend_vk_buffer_type_alloc_buffer(ggml_backe
     try {
         dev_buffer = ggml_vk_create_buffer_device(ctx->device, size);
     } catch (const vk::SystemError& e) {
+        GGML_LOG_WARN("ggml_vulkan: VRAM alloc FAILED for %.2f MB (live=%.2f MB in %llu buffers): %s\n",
+                      size / (1024.0 * 1024.0),
+                      g_vk_live_buffer_bytes / (1024.0 * 1024.0),
+                      (unsigned long long)g_vk_buffer_alloc_count,
+                      e.what());
+        return nullptr;
+    } catch (const std::exception& e) {
+        GGML_LOG_WARN("ggml_vulkan: VRAM alloc FAILED for %.2f MB (live=%.2f MB in %llu buffers): %s\n",
+                      size / (1024.0 * 1024.0),
+                      g_vk_live_buffer_bytes / (1024.0 * 1024.0),
+                      (unsigned long long)g_vk_buffer_alloc_count,
+                      e.what());
+        return nullptr;
+    }
+    g_vk_live_buffer_bytes += size;
+    g_vk_buffer_alloc_count++;
+    GGML_LOG_DEBUG("ggml_vulkan: VRAM alloc %.2f MB | live=%.2f MB in %llu buffers\n",
+                   size / (1024.0 * 1024.0),
+                   g_vk_live_buffer_bytes / (1024.0 * 1024.0),
+                   (unsigned long long)g_vk_buffer_alloc_count);
+
+    ggml_backend_vk_buffer_context * bufctx = nullptr;
+    try {
+        bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
+    } catch (const std::exception& e) {
         return nullptr;
     }
 
-    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
-
-    return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
+    ggml_backend_buffer_t buf = ggml_backend_buffer_init(buft, &ggml_backend_vk_buffer_interface, bufctx, size);
+    return buf;
 }
 
 static size_t ggml_backend_vk_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
-    return ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    size_t a = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    return a;
 }
 
 static size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
-    return ctx->device->suballocation_block_size;
+    size_t m = ctx->device->suballocation_block_size;
+    return m;
 }
 
 static size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    return ggml_nbytes(tensor);
+    size_t n = ggml_nbytes(tensor);
+    return n;
 
     UNUSED(buft);
 }
@@ -1567,6 +1642,8 @@ static uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const stru
 
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
+    r_dbg_logf("vk_graph_compute: ENTER n_nodes=%d (set_tensor so far=%llu, %.1f MB)",
+               cgraph->n_nodes, g_vk_set_tensor_calls, g_vk_set_tensor_bytes / (1024.0 * 1024.0));
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
     if (vk_instance.debug_utils_support) {
@@ -1939,11 +2016,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_synchronize(ctx);
     }
 
+    // Industrial telemetry: report any ops that the scheduler ran on CPU because
+    // the Vulkan backend rejected them (silent perf cost via GPU<->CPU copies).
+    ggml_vk_log_unsupported_op_summary("graph compute");
+
     if (getenv("GGML_VKG_SUBMITS")) {
         r_ggml_fprintf(stderr, "[VKG_SUBMITS] n_nodes=%d submit_count=%d support_async=%d\n",
                        cgraph->n_nodes, submit_count, (int) ctx->device->support_async);
     }
 
+    r_dbg_logf("vk_graph_compute: DONE n_nodes=%d", cgraph->n_nodes);
     return GGML_STATUS_SUCCESS;
 
     UNUSED(backend);
@@ -2294,6 +2376,106 @@ void ggml_backend_vk_get_device_description(int device, char * description, size
     ggml_vk_get_device_description(dev_idx, description, description_size);
 }
 
+// ggmlR Tensor Parallelism (P2P), not upstream ggml.
+// Enumerate Vulkan device groups (VK_KHR_device_group / LDA) and probe whether
+// the driver reports direct peer memory access between the physical devices in
+// each group. A group with >1 device AND peer Copy/Generic features is the
+// prerequisite for NVLink-routed (or PCIe-P2P) transfers via a device-group
+// logical device — as opposed to opaque-fd between independent VkDevices, which
+// the driver may route through host. Writes a human-readable report into
+// `report` (truncated to report_size) and returns the number of device groups.
+int ggml_backend_vk_get_device_groups(char * report, size_t report_size) {
+    // Ensure the Vulkan instance (and dynamic dispatcher) is initialized before
+    // touching vk_instance.instance — otherwise enumeratePhysicalDeviceGroups()
+    // dereferences a null handle. Mirrors the other entry points here.
+    ggml_vk_instance_init();
+
+    size_t off = 0;
+    auto emit = [&](const char * fmt, ...) {
+        if (!report || off + 1 >= report_size) return;
+        va_list ap;
+        va_start(ap, fmt);
+        int n = vsnprintf(report + off, report_size - off, fmt, ap);
+        va_end(ap);
+        if (n > 0) off += (size_t) n;
+    };
+
+    std::vector<vk::PhysicalDeviceGroupProperties> groups;
+    try {
+        groups = vk_instance.instance.enumeratePhysicalDeviceGroups();
+    } catch (const vk::SystemError& e) {
+        emit("device-group enumeration failed: %s\n", e.what());
+        return 0;
+    }
+
+    emit("Vulkan device groups: %zu\n", groups.size());
+    for (size_t g = 0; g < groups.size(); g++) {
+        const auto & grp = groups[g];
+        emit("  group %zu: %u device(s), subsetAllocation=%d\n",
+             g, grp.physicalDeviceCount, (int) grp.subsetAllocation);
+        for (uint32_t d = 0; d < grp.physicalDeviceCount; d++) {
+            vk::PhysicalDeviceProperties props = grp.physicalDevices[d].getProperties();
+            emit("    dev[%u]: %s\n", d, props.deviceName.data());
+        }
+
+        // A single-device group cannot do peer transfer; skip the probe.
+        if (grp.physicalDeviceCount < 2) {
+            emit("    peer: n/a (single-device group — no NVLink/P2P path)\n");
+            continue;
+        }
+
+        // Build a temporary logical device over the group to query peer memory
+        // features. Heap 0 is used as a representative device-local heap.
+        vk::DeviceGroupDeviceCreateInfo grp_ci;
+        grp_ci.physicalDeviceCount = grp.physicalDeviceCount;
+        grp_ci.pPhysicalDevices    = grp.physicalDevices.data();
+
+        // Minimal queue on device 0 of the group.
+        float prio = 1.0f;
+        vk::DeviceQueueCreateInfo qci({}, 0, 1, &prio);
+        vk::DeviceCreateInfo dci({}, 1, &qci);
+        dci.setPNext(&grp_ci);
+
+        vk::Device tmp_dev;
+        try {
+            tmp_dev = grp.physicalDevices[0].createDevice(dci);
+        } catch (const vk::SystemError& e) {
+            emit("    peer: device-group logical device creation failed: %s\n", e.what());
+            continue;
+        }
+
+        // With the dynamic dispatcher, resolve device-level function pointers
+        // (getGroupPeerMemoryFeatures) against this temporary device before use.
+        VULKAN_HPP_DEFAULT_DISPATCHER.init(tmp_dev);
+
+        bool any_peer = false;
+        for (uint32_t a = 0; a < grp.physicalDeviceCount; a++) {
+            for (uint32_t b = 0; b < grp.physicalDeviceCount; b++) {
+                if (a == b) continue;
+                vk::PeerMemoryFeatureFlags feat =
+                    tmp_dev.getGroupPeerMemoryFeatures(0 /*heap*/, a, b);
+                bool copy_src = (bool) (feat & vk::PeerMemoryFeatureFlagBits::eCopySrc);
+                bool copy_dst = (bool) (feat & vk::PeerMemoryFeatureFlagBits::eCopyDst);
+                bool gen_src  = (bool) (feat & vk::PeerMemoryFeatureFlagBits::eGenericSrc);
+                bool gen_dst  = (bool) (feat & vk::PeerMemoryFeatureFlagBits::eGenericDst);
+                if (copy_src || copy_dst || gen_src || gen_dst) any_peer = true;
+                emit("    peer %u->%u: CopySrc=%d CopyDst=%d GenericSrc=%d GenericDst=%d\n",
+                     a, b, copy_src, copy_dst, gen_src, gen_dst);
+            }
+        }
+        emit("    => direct peer access: %s\n",
+             any_peer ? "YES (device-group P2P path available)"
+                      : "NO (would fall back to host staging)");
+        tmp_dev.destroy();
+        // Re-point the dynamic dispatcher back to the instance level: the
+        // device-level pointers we just loaded belong to the now-destroyed
+        // temporary device and must not be used by later Vulkan calls.
+        VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance.instance);
+    }
+
+    return (int) groups.size();
+}
+
 void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
     GGML_ASSERT(device < (int) vk_instance.device_indices.size());
     GGML_ASSERT(device < (int) vk_instance.device_supports_membudget.size());
@@ -2333,7 +2515,8 @@ void ggml_backend_vk_get_device_caps(int device_idx, bool * coopmat_support, boo
                                       uint32_t * wavefronts_per_simd, bool * bf16, bool * integer_dot_product,
                                       const char ** arch_name,
                                       uint32_t * coopmat_m, uint32_t * coopmat_n, uint32_t * coopmat_k,
-                                      bool * supports_256_push_constants, uint32_t * max_push_constants_size) {
+                                      bool * supports_256_push_constants, uint32_t * max_push_constants_size,
+                                      bool * subgroup_shuffle, bool * subgroup_vote) {
     ggml_vk_instance_init();
     GGML_ASSERT(device_idx >= 0 && device_idx < (int) vk_instance.device_indices.size());
     vk_device dev = ggml_vk_get_device((size_t)device_idx);
@@ -2341,6 +2524,10 @@ void ggml_backend_vk_get_device_caps(int device_idx, bool * coopmat_support, boo
     if (coopmat1_fa_support)*coopmat1_fa_support = dev->coopmat1_fa_support;
     if (fp16)               *fp16               = dev->fp16;
     if (subgroup_size)      *subgroup_size       = dev->subgroup_size;
+    // Flash Attention scalar/coopmat1 path needs both of these (see FA gate in
+    // supports_op); exposed so callers can tell why FA falls back to CPU.
+    if (subgroup_shuffle)   *subgroup_shuffle   = dev->subgroup_shuffle;
+    if (subgroup_vote)      *subgroup_vote      = dev->subgroup_vote;
     // subgroup_no_shmem is active when subgroup_arithmetic is enabled and not AMD GCN
     if (subgroup_no_shmem)  *subgroup_no_shmem  = dev->subgroup_arithmetic &&
                                                    dev->architecture != vk_device_architecture::AMD_GCN;
@@ -2481,7 +2668,7 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
-static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+static bool ggml_backend_vk_device_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
@@ -2521,8 +2708,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
-                    return ggml_is_contiguous(op->src[0]) &&
-                           (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                    // Match upstream: no full-contiguity requirement (the shader
+                    // takes per-row strides). Requiring ggml_is_contiguous forced
+                    // GLU to CPU for permuted views, splitting the graph.
+                    return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                            (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
                            (op->src[0]->type == op->type);
                 default:
@@ -2794,8 +2983,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return true;
         case GGML_OP_NORM:
         case GGML_OP_GROUP_NORM:
-        case GGML_OP_L2_NORM:
             return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_L2_NORM:
+            // Match upstream: L2_NORM only needs contiguous *rows*, not a fully
+            // contiguous tensor. Requiring full contiguity (as this case used to,
+            // sharing the NORM/GROUP_NORM branch) rejected the per-head Q/K L2 norm
+            // in Qwen3.5-style models (src is a permuted view), forcing it to CPU
+            // and shattering the graph into ~1 split per layer on GPUs without
+            // Flash Attention (e.g. Tesla P100).
+            return ggml_is_contiguous_rows(op->src[0]) &&
+                   op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -3035,6 +3232,51 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
     UNUSED(dev);
 }
 
+// Industrial telemetry: ops the Vulkan backend cannot run fall back to CPU,
+// which forces GPU<->CPU copies around each such node and silently slows graphs.
+// supports_op is on a hot path (called per node at graph build), so we never log
+// per-call — instead we tally rejected op types and expose them on demand via
+// ggml_vk_log_unsupported_op_summary() (called after graph build / compute).
+static std::map<ggml_op, uint64_t> g_vk_unsupported_op_counts;
+static uint64_t                    g_vk_unsupported_op_total = 0;
+
+static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    bool ok = ggml_backend_vk_device_supports_op_impl(dev, op);
+    if (!ok) {
+        g_vk_unsupported_op_counts[op->op]++;
+        g_vk_unsupported_op_total++;
+    }
+    return ok;
+}
+
+// Emit a one-line summary of ops that were rejected by the Vulkan backend (and
+// therefore ran on CPU), then reset the tally. No-op when everything ran on GPU.
+static void ggml_vk_log_unsupported_op_summary(const char * phase) {
+    if (g_vk_unsupported_op_total == 0) {
+        return;
+    }
+    // Gated behind GGMLR_LOG_DEVICE (same switch as the device-caps line) so it
+    // stays available for production diagnostics but does not flood test output,
+    // where training graphs routinely fall back ops like OUT_PROD /
+    // CROSS_ENTROPY_LOSS_BACK to CPU. Still reset the tally either way.
+    const char * log_dev = getenv("GGMLR_LOG_DEVICE");
+    if (log_dev != nullptr && log_dev[0] != '\0' && log_dev[0] != '0') {
+        std::string detail;
+        for (const auto & kv : g_vk_unsupported_op_counts) {
+            if (!detail.empty()) {
+                detail += ", ";
+            }
+            detail += std::string(ggml_op_name(kv.first)) + "=" + std::to_string(kv.second);
+        }
+        GGML_LOG_INFO("ggml_vulkan: %llu op(s) not supported on GPU during %s, ran on CPU (per-type: %s)\n",
+                      (unsigned long long)g_vk_unsupported_op_total,
+                      phase ? phase : "graph",
+                      detail.c_str());
+    }
+    g_vk_unsupported_op_counts.clear();
+    g_vk_unsupported_op_total = 0;
+}
+
 static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
         return false;
@@ -3200,6 +3442,98 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
         VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: unknown exception during Vulkan init");
         return nullptr;
     }
+}
+
+// ggmlR, not upstream: explicit Vulkan teardown, called from R's .onUnload while
+// the package DLL — and crucially the Vulkan loader / Mesa ICD .so files — are
+// still mapped. The static `vk_instance` (instance + shared_ptr devices[]) is
+// otherwise destroyed at process exit in an order the C runtime does not
+// coordinate with the loader's own static destructors, so the loader can be
+// unmapped before our device destructors run their loader calls
+// (destroyFence/destroyDescriptorSetLayout/device.destroy), giving a flaky
+// segfault in unmapped memory after results are already returned. Draining and
+// releasing the instance's device refs here, while the loader is still mapped,
+// gases idle driver threads early and shrinks that race.
+//
+// We release the instance's DEVICE references but leave the instance handle
+// itself alive (see the note at the end): late R XPtr finalizers may still need
+// a valid instance to run vkFreeMemory against.
+//
+// Safe w.r.t. downstream (llamaR/sd2R): `vk_device` is a shared_ptr, so
+// resetting the instance's reference only actually destroys a device once every
+// live backend that copied it has been freed — never prematurely. waitIdle first
+// drains any in-flight driver work so the loader threads are quiescent.
+extern "C" void ggml_backend_vk_shutdown(int hard, int status) {
+    r_tp_tracef("vk_shutdown: enter (initialized=%d hard=%d status=%d)",
+                (int) vk_instance_initialized, hard, status);
+    if (!vk_instance_initialized) {
+        r_tp_tracef("vk_shutdown: already down, no-op");
+#ifdef GGML_VK_HARD_EXIT
+        if (hard) {
+            // Still honour the hard request: skip the process teardown that races
+            // the Vulkan loader's static destructors even when we own no devices.
+            r_tp_tracef("vk_shutdown: hard exit(%d) (nothing to tear down)", status);
+            fflush(NULL);
+            _exit(status);
+        }
+#endif
+        return;   // idempotent: guards double-shutdown and use-after-shutdown init
+    }
+    vk_instance_initialized = false;
+
+    int idx = 0;
+    for (auto & dev : vk_instance.devices) {
+        if (dev) {
+            // use_count > 1 means a live backend (e.g. from split_mul_mat/pp_forward,
+            // or held by llamaR/sd2R) still references this device — resetting the
+            // instance's ref will NOT destroy it now; ~vk_device_struct runs later,
+            // when that backend is freed, possibly after we destroy the instance.
+            r_tp_tracef("vk_shutdown: dev[%d] use_count=%ld", idx, (long) dev.use_count());
+        }
+        if (dev && dev->device) {
+            try { dev->device.waitIdle(); } catch (...) {}
+        }
+        try { dev.reset(); } catch (...) {}
+        idx++;
+    }
+    // Deliberately DO NOT destroy vk_instance.instance here.
+    //
+    // A backend created inside pp_forward/split_mul_mat is wrapped in an R XPtr
+    // whose finalizer (r_ggml_vk_backend_finalizer, onexit=TRUE) may not have run
+    // yet when this explicit shutdown fires. That finalizer -> ggml_backend_free ->
+    // last shared_ptr ref -> ~vk_device_struct -> device.destroy()/vkFreeMemory,
+    // which needs a LIVE instance. If we destroy the instance now, that late
+    // vkFreeMemory hits a dead instance => "[Vulkan Loader] vkFreeMemory: Invalid
+    // device" -> Aborted. So we drain+release the instance's own device refs (kills
+    // idle driver threads) but leave the instance handle valid; the OS reclaims it
+    // at process exit after every late device finalizer has run against it.
+    r_tp_tracef("vk_shutdown: devices reset, instance left LIVE for late finalizers");
+
+#ifdef GGML_VK_HARD_EXIT
+    if (hard) {
+        // The f1ba0 segfault is a flaky race between NVIDIA/Mesa driver worker
+        // threads still winding down and the dynamic loader unmapping the Vulkan
+        // ICD .so files during the C runtime's atexit/static-destruction phase.
+        // No R exit hook can win that race (R unmaps the loader before any hook).
+        // Since all results have already been produced and printed by this point,
+        // the only reliable fix is to leave via _exit(), which terminates the
+        // process immediately WITHOUT running atexit handlers, C++ static
+        // destructors, or unmapping shared objects — so there is no loader
+        // static-destruction phase for the driver threads to fault against.
+        // Callers opt in (hard=TRUE) as the last statement of a script/example.
+        // `status` is the process exit code — pass non-zero from an error path so
+        // a failed run does not masquerade as success.
+        r_tp_tracef("vk_shutdown: hard exit(%d) — skipping atexit/loader teardown", status);
+        fflush(NULL);
+        _exit(status);
+    }
+#else
+    // CRAN builds omit the _exit() path entirely (Repository Policy forbids a
+    // package terminating the R session). ggml_vulkan_shutdown() warns the caller
+    // that hard=TRUE degraded to the soft teardown above; see r_interface_vulkan.c.
+    (void) hard;
+    (void) status;
+#endif
 }
 
 // Extension availability

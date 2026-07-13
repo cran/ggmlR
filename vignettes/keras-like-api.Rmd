@@ -2,7 +2,7 @@
 title: "Keras-like API in ggmlR"
 output: rmarkdown::html_vignette
 vignette: >
-  %\VignetteIndexEntry{Keras-like API in ggmlR}
+  %\VignetteIndexEntry{02. Keras-like API in ggmlR}
   %\VignetteEngine{knitr::rmarkdown}
   %\VignetteEncoding{UTF-8}
 ---

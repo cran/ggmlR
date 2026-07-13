@@ -1,7 +1,7 @@
 Package: ggmlR
 Type: Package
 Title: 'GGML' Tensor Operations for Machine Learning
-Version: 0.7.8
+Version: 0.8.1
 Authors@R: c(
     person("Yuri", "Baramykov",
         email = "lbsbmsu@mail.ru",
@@ -34,7 +34,7 @@ Description: Provides 'R' bindings to the 'GGML' tensor library for machine
     See <https://github.com/ggml-org/ggml> for more information about the
     underlying library.
 Depends: R (>= 4.1.0)
-Imports: generics, R6
+Imports: generics, R6, methods, stats
 License: MIT + file LICENSE
 URL: https://github.com/Zabis13/ggmlR
 BugReports: https://github.com/Zabis13/ggmlR/issues
@@ -43,13 +43,16 @@ SystemRequirements: C++17, GNU make, libvulkan-dev, glslc (optional,
         for GPU on Linux), 'Vulkan' 'SDK' (optional, for GPU on
         Windows)
 Suggests: testthat (>= 3.0.0), mlr3 (>= 0.21.0), paradox, digest,
-        parsnip, tibble, rlang, dials, lgr, knitr, rmarkdown
+        parsnip, tibble, rlang, dials, lgr, knitr, rmarkdown, Matrix,
+        Seurat, SeuratObject, RSpectra, irlba, uwot, FNN,
+        SingleCellExperiment, SummarizedExperiment, S4Vectors, withr,
+        hardhat, rsample, tune, workflows
 VignetteBuilder: knitr, rmarkdown
 RoxygenNote: 7.3.3
 Config/testthat/edition: 3
 Config/build/clean-inst-doc: false
 NeedsCompilation: yes
-Packaged: 2026-06-03 08:47:05 UTC; yuri
+Packaged: 2026-07-13 18:34:12 UTC; yuri
 Author: Yuri Baramykov [aut, cre] (ORCID:
     <https://orcid.org/0009-0000-7627-4217>),
   Georgi Gerganov [ctb, cph] (Author of the GGML library),
@@ -58,4 +61,4 @@ Author: Yuri Baramykov [aut, cre] (ORCID:
   Mozilla Foundation [ctb, cph] (Author of llamafile/sgemm.cpp)
 Maintainer: Yuri Baramykov <lbsbmsu@mail.ru>
 Repository: CRAN
-Date/Publication: 2026-06-04 05:10:35 UTC
+Date/Publication: 2026-07-13 23:40:23 UTC

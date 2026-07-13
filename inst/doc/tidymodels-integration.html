@@ -534,6 +534,71 @@ handle factors, missing values, and scaling:</p>
 <span id="cb9-14"><a href="#cb9-14" tabindex="-1"></a><span class="fu">rank_results</span>(specs, <span class="at">rank_metric =</span> <span class="st">&quot;accuracy&quot;</span>)</span></code></pre></div>
 <hr />
 </div>
+<div id="extracting-the-fitted-engine-and-fit-time" class="section level2">
+<h2>8. Extracting the fitted engine and fit time</h2>
+<p>After fitting a workflow or <code>parsnip</code> model you can reach
+the native ggmlR object and the training time with the standard
+<code>hardhat</code>/<code>tune</code> extractors.</p>
+<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a>spec <span class="ot">&lt;-</span> <span class="fu">mlp</span>(<span class="at">hidden_units =</span> <span class="fu">c</span>(<span class="dv">16</span><span class="dt">L</span>), <span class="at">epochs =</span> <span class="dv">10</span><span class="dt">L</span>) <span class="sc">|&gt;</span></span>
+<span id="cb10-2"><a href="#cb10-2" tabindex="-1"></a>  <span class="fu">set_engine</span>(<span class="st">&quot;ggml&quot;</span>) <span class="sc">|&gt;</span></span>
+<span id="cb10-3"><a href="#cb10-3" tabindex="-1"></a>  <span class="fu">set_mode</span>(<span class="st">&quot;classification&quot;</span>)</span>
+<span id="cb10-4"><a href="#cb10-4" tabindex="-1"></a></span>
+<span id="cb10-5"><a href="#cb10-5" tabindex="-1"></a>fit_obj <span class="ot">&lt;-</span> <span class="fu">fit</span>(spec, Species <span class="sc">~</span> ., <span class="at">data =</span> iris)</span>
+<span id="cb10-6"><a href="#cb10-6" tabindex="-1"></a></span>
+<span id="cb10-7"><a href="#cb10-7" tabindex="-1"></a><span class="co"># The native ggmlR engine object (class &quot;ggmlr_parsnip_model&quot;).</span></span>
+<span id="cb10-8"><a href="#cb10-8" tabindex="-1"></a><span class="co"># extract_fit_*() are re-exported by parsnip (originally from hardhat).</span></span>
+<span id="cb10-9"><a href="#cb10-9" tabindex="-1"></a>eng <span class="ot">&lt;-</span> parsnip<span class="sc">::</span><span class="fu">extract_fit_engine</span>(fit_obj)</span>
+<span id="cb10-10"><a href="#cb10-10" tabindex="-1"></a><span class="fu">class</span>(eng)</span>
+<span id="cb10-11"><a href="#cb10-11" tabindex="-1"></a></span>
+<span id="cb10-12"><a href="#cb10-12" tabindex="-1"></a><span class="co"># Training time parsnip recorded for the fit (one-row tibble: stage_id, elapsed).</span></span>
+<span id="cb10-13"><a href="#cb10-13" tabindex="-1"></a>parsnip<span class="sc">::</span><span class="fu">extract_fit_time</span>(fit_obj)</span></code></pre></div>
+<p>The engine object is the same one returned by ggmlR’s own fit
+wrappers, so all the inspection helpers work on it directly:</p>
+<div class="sourceCode" id="cb11"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" tabindex="-1"></a><span class="fu">ggml_model_backend</span>(eng)            <span class="co"># &quot;vulkan&quot; or &quot;cpu&quot; (actual backend used)</span></span>
+<span id="cb11-2"><a href="#cb11-2" tabindex="-1"></a><span class="fu">head</span>(<span class="fu">ggml_training_history</span>(eng))   <span class="co"># per-epoch loss / accuracy curve</span></span>
+<span id="cb11-3"><a href="#cb11-3" tabindex="-1"></a>generics<span class="sc">::</span><span class="fu">glance</span>(eng)              <span class="co"># one-row model summary</span></span>
+<span id="cb11-4"><a href="#cb11-4" tabindex="-1"></a>generics<span class="sc">::</span><span class="fu">tidy</span>(eng)                <span class="co"># one row per layer</span></span></code></pre></div>
+<hr />
+</div>
+<div id="limitations-of-the-engine-object" class="section level2">
+<h2>9. Limitations of the engine object</h2>
+<p>The fitted engine object holds a <em>live</em> compiled model. Keep
+these limits in mind, especially for resampling and tuning on a GPU.</p>
+<ul>
+<li><p><strong>Serialization / GPU state.</strong> A compiled model
+carries external pointers (the ggml backend and scheduler) and, on GPU,
+weights living in Vulkan buffers. These do <strong>not</strong> survive
+a plain <code>saveRDS()</code> / <code>readRDS()</code> or being shipped
+to a worker process as-is. For mlr3 the learner marshals the model
+(<code>marshal_model()</code> / <code>unmarshal_model()</code>); within
+tidymodels, persist via ggmlR’s own <code>ggml_save_model()</code> /
+<code>ggml_load_model()</code> (sequential/functional) or
+<code>ag_save_model()</code> / <code>ag_load_model()</code> (autograd)
+rather than serializing the raw engine object.</p></li>
+<li><p><strong>Parallel resampling.</strong>
+<code>fit_resamples()</code> / <code>tune_grid()</code> with a parallel
+backend serialize fitted models across workers; because of the GPU state
+above, prefer sequential execution (or CPU) when in doubt. In
+particular, avoid
+<code>control_grid(parallel_over = &quot;everything&quot;)</code> together with a
+live GPU model — it can crash or return wrong results. The safe pattern
+is <code>parallel_over = &quot;resamples&quot;</code> (the default), or running on
+CPU.</p></li>
+<li><p><strong>Autograd tradepath.</strong> Autograd
+(<code>ag_sequential</code>) models are reconstructed on unmarshal from
+a captured <code>(dims, hyperparameters)</code> snapshot,
+<strong>not</strong> from the training task. A custom
+<code>model_fn</code> that reads the <code>task</code> at fit time is
+therefore not round-trippable through marshal (the task is
+<code>NULL</code> at rebuild). Stick to dims/parameters-driven
+architectures if you need marshalable autograd models.</p></li>
+<li><p><strong>One device per fit.</strong> A compiled model is bound to
+the backend chosen at <code>set_engine(&quot;ggml&quot;, backend = ...)</code> (or
+auto-detected). It is not migrated between CPU and GPU after fitting;
+re-fit to change device.</p></li>
+</ul>
+<hr />
+</div>
 <div id="summary" class="section level2">
 <h2>Summary</h2>
 <table>
@@ -570,6 +635,11 @@ handle factors, missing values, and scaling:</p>
 </tr>
 <tr class="odd">
 <td>Workflows</td>
+<td>Yes</td>
+</tr>
+<tr class="even">
+<td><code>extract_fit_engine()</code> /
+<code>extract_fit_time()</code></td>
 <td>Yes</td>
 </tr>
 </tbody>

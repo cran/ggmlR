@@ -352,6 +352,13 @@ ggml_compile.ggml_sequential_model <- function(model, optimizer = "adam",
   model$compilation$optimizer <- optimizer
   model$compilation$loss <- loss
   model$compilation$metrics <- metrics
+  # Record requested vs actually-used backend so a silent "auto" -> CPU
+  # fallback is inspectable later (see ggml_model_backend()).
+  model$compilation$backend_requested <- backend
+  model$compilation$backend_used      <- if (use_vulkan) "vulkan" else "cpu"
+  model$compilation$device <- if (use_vulkan) {
+    ggml_vulkan_device_description(0L)
+  } else "cpu"
   model$compiled <- TRUE
 
   invisible(model)
@@ -746,6 +753,7 @@ nn_build_graph <- function(model, batch_size, training = TRUE) {
 #' @seealso \code{\link{ggml_fit_opt}}, \code{\link{ggml_compile}}
 #' @examples
 #' \donttest{
+#' ggml_set_n_threads(1L)  # deterministic, single OpenMP pool
 #' n <- 128
 #' x <- matrix(runif(n * 4), nrow = n, ncol = 4)
 #' y <- matrix(0, nrow = n, ncol = 2)
@@ -870,10 +878,12 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
   usable_samples <- (n_samples %/% batch_size) * batch_size
   if (usable_samples < n_samples) {
     dropped <- n_samples - usable_samples
-    message("Note: dropping last ", dropped, " sample(s) (", n_samples,
-            " -> ", usable_samples, ") because batch_size=", batch_size,
-            " must divide evenly. Training metrics are computed on ",
-            usable_samples, " samples only.")
+    if (verbose > 0) {
+      message("Note: dropping last ", dropped, " sample(s) (", n_samples,
+              " -> ", usable_samples, ") because batch_size=", batch_size,
+              " must divide evenly. Training metrics are computed on ",
+              usable_samples, " samples only.")
+    }
     x <- slice_first_dim(x, seq_len(usable_samples))
     y <- y[seq_len(usable_samples), , drop = FALSE]
     if (use_weighted_mse) {
@@ -995,6 +1005,7 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
 #' @return Named list with \code{loss} and \code{accuracy}.
 #' @examples
 #' \donttest{
+#' ggml_set_n_threads(1L)  # deterministic, single OpenMP pool
 #' n <- 128
 #' x <- matrix(runif(n * 4), nrow = n, ncol = 4)
 #' y <- matrix(0, nrow = n, ncol = 2)

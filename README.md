@@ -43,10 +43,209 @@ Enable CPU SIMD acceleration (AVX2, SSE4, etc.) for faster inference on your mac
 install.packages("ggmlR", configure.args = "--with-simd")
 ```
 
+Enable the hard-exit path used by **multi-GPU** standalone scripts
+(`ggml_vulkan_shutdown(hard = TRUE)`; see **Clean shutdown** below and
+`vignette("multi-gpu")`). Off by default — the released package must not call
+`_exit()`, as CRAN policy forbids a package terminating the R session:
+```r
+install.packages("ggmlR", configure.args = "--enable-hard-exit")
+```
+
 Options can be combined:
 ```r
-install.packages("ggmlR", configure.args = "--with-vulkan --with-simd")
+install.packages("ggmlR", configure.args = "--with-vulkan --with-simd --enable-hard-exit")
 ```
+
+### Linux (detailed)
+
+Full step-by-step setup on Ubuntu/Debian, from a clean system to a working
+GPU build.
+
+**1. R and the Vulkan loader/tools:**
+
+```bash
+sudo apt install -y r-base
+
+sudo apt install vulkan-tools libvulkan-dev
+```
+
+**2. The `glslc` shader compiler** (needed to build ggmlR's Vulkan backend):
+
+```bash
+# Ubuntu 24.04 (Noble)
+sudo add-apt-repository universe
+sudo apt update
+sudo apt install glslc
+
+# Ubuntu 22.04 (Jammy) — install the LunarG Vulkan SDK instead
+wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | \
+  sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+
+sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list \
+  https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+
+sudo apt update
+sudo apt install -y vulkan-sdk
+```
+
+**3. Verify the GPU is visible to Vulkan:**
+
+```bash
+vulkaninfo --summary
+```
+
+**4. Install ggmlR with CPU SIMD acceleration:**
+
+```bash
+sudo Rscript -e 'install.packages("ggmlR", configure.args = "--with-simd")'
+```
+
+**5. Confirm GPU support from R:**
+
+```bash
+Rscript -e 'library(ggmlR)
+ggml_vulkan_status()'
+```
+
+#### Windows build options
+
+> **Important:** on Windows, R **ignores** `configure.args` / `--configure-args`
+> (they are only honoured by the Unix `./configure` path). Use **environment
+> variables** instead, set in the same R session *before* installing:
+
+```r
+Sys.setenv(GGML_USE_SIMD = "1")     # enable CPU SIMD (AVX2/SSE4/FMA/F16C)
+Sys.setenv(GGML_USE_VULKAN = "1")   # force-enable Vulkan  (or "0" to disable)
+Sys.setenv(GGML_VK_HARD_EXIT = "1") # enable ggml_vulkan_shutdown(hard = TRUE)
+```
+
+The flags are read by `configure.win`, which only runs when the package is
+**built from source**. The CRAN binary for Windows is pre-built without them,
+so pass `type = "source"` to force a source build:
+
+```r
+# From CRAN (force a source build so the flags take effect):
+install.packages("ggmlR", type = "source")
+
+# From GitHub (always builds from source):
+remotes::install_github("Zabis13/ggmlR", force = TRUE)
+```
+
+Vulkan is still auto-detected when the Vulkan SDK is present, so
+`GGML_USE_VULKAN` is only needed to force it on/off. Accepted values:
+`1` / `yes` / `true` / `on` (and `0` / `no` / `false` / `off` for Vulkan).
+OpenMP (multi-threaded CPU executor) is detected automatically on Rtools.
+
+### Diagnostics
+
+`GGMLR_LOG_DEVICE` — when set to a non-empty value other than `0`, enables
+Vulkan telemetry logging. Two messages are emitted:
+
+1. The selected device and its capabilities, once a backend context is created:
+
+   ```
+   ggml_vulkan: device #0 'Vulkan0' selected | fp16=1 bf16=1 coopmat=1 coopmat2=0 bda=1 max_buffer=4095 MB suballoc_block=1024 MB sysmem_fallback=0
+   ```
+
+2. A per-graph summary of any ops the Vulkan backend could not run and fell back
+   to CPU (e.g. `OUT_PROD`, `CROSS_ENTROPY_LOSS_BACK` during training):
+
+   ```
+   ggml_vulkan: 12 op(s) not supported on GPU during graph compute, ran on CPU (per-type: OUT_PROD=12)
+   ```
+
+Both are **off by default** so they do not clutter output (notably during
+tests, where many contexts and training graphs are created). Enable them to
+diagnose which GPU was picked, which acceleration paths (fp16 / bf16 / coopmat)
+are active, and which ops are silently running on CPU:
+
+```r
+Sys.setenv(GGMLR_LOG_DEVICE = "1")
+```
+
+### CPU performance: multithreaded BLAS/LAPACK
+
+ggmlR runs the heavy linear algebra on the GPU, but some steps stay on the CPU
+through R's BLAS/LAPACK — most notably the eigendecomposition in PCA
+(`RunGGML(op = "embed")`) and any `eigen()` / `prcomp()` fallback. R ships with
+the **reference** BLAS/LAPACK, which is single-threaded: on a multi-core machine
+those CPU phases use just one core. Switching to **OpenBLAS** parallelises them
+(e.g. PCA on a 3000-gene object dropped from ~24 s to ~1.6 s here).
+
+This is a system-level change (outside the package, needs `sudo`). On
+Debian/Ubuntu:
+
+```bash
+# 1. Install OpenBLAS. Prefer the OpenMP variant over the default pthreads one
+#    (the R-admin manual recommends the openmp build): its threads are governed
+#    by OMP_NUM_THREADS and it is better behaved under tools like valgrind.
+sudo apt update
+sudo apt install libopenblas-openmp-dev   # or libopenblas-dev for the pthreads build
+
+# 2. Point BLAS at OpenBLAS (pick the openblas entry from the list):
+sudo update-alternatives --config libblas.so.3-x86_64-linux-gnu
+
+# 3. Point LAPACK at OpenBLAS too — eigen() goes through LAPACK, not BLAS:
+sudo update-alternatives --config liblapack.so.3-x86_64-linux-gnu
+```
+
+```r
+# 4. Confirm R picked it up — both lines should name openblas, not
+#    /usr/lib/.../blas/libblas.so or /usr/lib/.../lapack/liblapack.so:
+si <- sessionInfo(); cat("BLAS:  ", si$BLAS, "\nLAPACK:", si$LAPACK, "\n")
+```
+
+OpenBLAS grabs all cores by default. If that oversubscribes alongside parallel
+resampling (tidymodels / mlr3) or trips CRAN's 2-thread limit in checks, cap it:
+`Sys.setenv(OPENBLAS_NUM_THREADS = 2)`.
+
+> **Note (valgrind).** A multithreaded OpenBLAS spawns worker threads, and
+> valgrind reports each worker's thread-local storage as a one-off
+> "possibly lost" block (`definitely lost: 0`). This is a known false positive,
+> not a leak. Run checks with `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1` for a
+> clean valgrind report; CRAN's own machines use single-threaded reference BLAS,
+> so it does not appear there.
+
+## GPU linear algebra (drop-in for `%*%`)
+
+Accelerate an ordinary R matrix multiply on the GPU without rewriting your code —
+plain matrices in, plain matrices out, with a transparent CPU fallback.
+
+```r
+library(ggmlR)
+
+A <- matrix(rnorm(2000 * 1500), 2000, 1500)
+B <- matrix(rnorm(1500 * 1000), 1500, 1000)
+
+C <- ggml_matmul(A, B)        # A %*% B on the GPU, returns a plain matrix
+G <- ggml_crossprod(A)        # t(A) %*% A
+H <- ggml_tcrossprod(A)       # A %*% t(A)
+```
+
+Prefer the operators? Wrap one operand and `%*%` / `crossprod()` / `tcrossprod()`
+dispatch to the GPU — nothing else in your code changes:
+
+```r
+Ag <- as_gpu_matrix(A)
+C  <- Ag %*% B                # GPU
+G  <- crossprod(Ag)           # GPU
+```
+
+- **Dispatch** — `device = "auto"` (default) uses the GPU when one is present *and*
+  the multiply is large enough to amortise the host↔VRAM transfer; small
+  multiplies and machines without a GPU stay on the CPU. Force it with
+  `device = "gpu"` / `"cpu"`.
+- **Precision** — R multiplies in double precision (f64); a GPU offers f32 at
+  best, so the GPU path is a fast *approximate* multiply, not a bit-for-bit
+  replacement. `prec = "f32"` (default) requests f32 accumulation; how close the
+  result lands depends on the Vulkan driver (some, e.g. RADV/Mesa, accumulate in
+  f16 regardless, giving ~`1e-3` relative error either way). `prec = "f16"` only
+  lowers precision further, for speed.
+- **Full double precision** — need bit-accurate results? `ggml_matmul_f64(A, B)`
+  runs the multiply in fp64 on the GPU, matching R's `%*%` to ~`1e-15`. It only
+  pays off on data-centre cards with fast fp64 (Tesla P100/V100, Instinct);
+  consumer GPUs cripple fp64, so it falls back to (and is usually slower than)
+  the CPU there.
 
 ## Sequential API
 
@@ -322,6 +521,87 @@ result$loss_history   # numeric vector, one value per iteration
 result$model          # trained replica 0
 ```
 
+### Multi-GPU: tensor & pipeline parallelism
+
+For machines with several Vulkan GPUs, ggmlR ships a native **tensor-parallel** and **pipeline-parallel** path (not in upstream ggml, which does tensor-split only for CUDA/SYCL). The cross-device transport defaults to portable **host staging** (device→host→device), correct on every driver.
+
+**Tensor parallelism** — split a weight matrix's rows across GPUs, compute each slice on its own device, gather the result:
+
+```r
+W <- matrix(rnorm(4096 * 256), nrow = 4096)   # 4096 outputs x 256 inputs
+X <- matrix(rnorm(8 * 256),    nrow = 8)       # batch of 8
+
+Y <- ggml_vulkan_split_mul_mat(W, X, n_devices = 2)   # == X %*% t(W)
+```
+
+**TP × DP hybrid** — data-parallel over the batch across replicas of tensor-parallel device groups (e.g. 2 replicas × TP=2 on a 4-GPU box):
+
+```r
+# replica A = GPUs {0,1}, replica B = GPUs {2,3}; batch split across replicas,
+# weights tensor-split within each pair. No cross-replica traffic at inference.
+Y <- ggml_tp_dp_forward(W, X, replicas = list(c(0, 1), c(2, 3)))
+```
+
+**Pipeline parallelism** — split a model *by layers* across GPUs; the activation tensor is handed between stages just once per pass (a single cross-device copy). Suits models too large for one card:
+
+```r
+# stage 1 (layers 1..k) on GPU 0  ->  stage 2 (layers k+1..n) on GPU 1
+mk <- function(dev, Wt) list(
+  device = dev, in_shape = c(K, M),
+  build  = function(ctx, input) {
+    w <- ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, K)
+    list(output      = ggml_relu(ctx, ggml_mul_mat(ctx, w, input)),
+         set_weights = function() ggml_backend_tensor_set_data(w, as.numeric(Wt)))
+  })
+y <- ggml_pp_forward(list(mk(0L, W1), mk(1L, W2)), x = as.numeric(X), out_shape = c(K, M))
+```
+
+See `inst/examples/tp_dp_hybrid.R` and `inst/examples/pp_pipeline.R` for complete runnable demos.
+
+#### Benchmark: which split strategy to use
+
+Measured with `llamaR` (which links `libggml.a` statically) driving Qwen2.5-1.5B-Instruct Q4_K_M (Vulkan, host-staging cross-device transport) on two 4-GPU hosts, decode throughput, median of 3 runs of 128 tokens:
+
+- **P100** — 4× Tesla P100-SXM2-16GB
+- **V100** — 4× Tesla V100-32GB, 2× Xeon E5-2698 v4, 256 GB RAM
+
+| Strategy | GPUs | Split | Decode t/s (P100) | Decode t/s (V100) | Notes |
+|---|---|---|---:|---:|---|
+| Baseline | 1 | none | **419.7** | **516.9** | model fits in one card — fastest |
+| Pipeline (PP) | 2 | layer | 150.4 | 221.5 | layers spread across 2 GPUs |
+| Tensor (TP) | 2 | row | 150.4 | 223.2 | rows split, all-reduce per layer |
+| Pipeline (PP) | 4 | layer | 133.3 | 176.3 | more hops → slower |
+| Tensor (TP) | 4 | row | 130.0 | 176.6 | more hops → slower |
+| **TP=2 × DP=2** | 4 | row + replicas | **306** | **446** | 2 replicas × TP=2, run concurrently |
+| **DP=4** | 4 | replicas | **975** | **1300** | 4 single-GPU replicas, run concurrently |
+
+Same model on an **8× Tesla V100-32GB** host (2× Xeon E5-2698 v4, 256 GB RAM), showing how the pattern holds as GPU count doubles:
+
+| Strategy | GPUs | Split | Decode t/s | Notes |
+|---|---|---|---:|---|
+| Baseline | 1 | none | **684.9** | model fits in one card — fastest |
+| Pipeline (PP) | 2 | layer | 229.7 | layers spread across 2 GPUs |
+| Tensor (TP) | 2 | row | 231.3 | rows split, all-reduce per layer |
+| Pipeline (PP) | 4 | layer | 187.5 | more hops → slower |
+| Tensor (TP) | 4 | row | 191.0 | more hops → slower |
+| Pipeline (PP) | 8 | layer | 142.8 | 8-way split — slowest single-context |
+| Tensor (TP) | 8 | row | 137.1 | per-layer all-reduce across 8 cards |
+| **TP=2 × DP=4** | 8 | row + replicas | **897** | 4 replicas × TP=2, run concurrently |
+| **DP=8** | 8 | replicas | **2290** | 8 single-GPU replicas, run concurrently |
+
+**Takeaway:** when a model **fits in one GPU**, data parallelism (DP — independent replicas) wins by a wide margin: DP=4 delivers ~2.3× the single-card throughput and ~7.5× any split mode. Splitting such a model across cards (PP/TP) only adds cross-device overhead — the ~1 GB/s host-staging transport dominates. **PP and TP earn their keep only when the model does not fit in one card** (e.g. a 30B+ model on 16 GB cards): there a split is the *only* way to run it at all, and PP minimizes cross-device hops (one activation copy per pass) while TP maximizes per-token parallelism at the cost of a per-layer all-reduce. Reproduce with `llamaR`'s `inst/examples/bench_pp_tp_dp.sh`.
+
+> **Clean shutdown**: when a standalone script uses several GPUs, make `ggml_vulkan_shutdown(hard = TRUE)` its **last** statement. This tears down Vulkan and then calls `_exit(0)`, skipping the exit-time loader-static-destruction phase that can otherwise flakily segfault *after* your results are printed (the results are already computed by then, so the crash is harmless-but-noisy). Use plain `ggml_vulkan_shutdown()` (no `hard`) mid-session — it releases the devices and is safe to call repeatedly, but does not guarantee a clean process exit on its own.
+>
+> The `_exit(0)` path is **compiled out by default**, because CRAN policy forbids a package terminating the R session. In a default build `hard = TRUE` does the normal teardown and **warns** instead of exiting — never silently — so the flaky exit-time segfault can still fire. Compile it in with `--configure-args="--enable-hard-exit"` (Windows: `Sys.setenv(GGML_VK_HARD_EXIT = "1")` before installing), and check the current build with `ggml_vulkan_hard_exit_available()`.
+>
+> **When to use it — and when not.** `hard = TRUE` only pays off for **multi-GPU** scripts (tensor/pipeline parallelism, `split_mul_mat`/`pp_forward`), where late device finalizers race the loader teardown on exit. A **single-GPU** script never triggers that race, so it does not need `hard = TRUE`. Do **not** use it under a **Jupyter / Kaggle notebook**: there `_exit(0)` kills the R *kernel*, and the notebook runner (papermill/nbclient) reports it as `DeadKernelError: Kernel died` even though all results were already computed and written. In a notebook, either drop the call or use plain `ggml_vulkan_shutdown()` (soft teardown, kernel stays alive). A portable one-liner that keeps the hard exit only outside notebooks:
+>
+> ```r
+> is_notebook <- nzchar(Sys.getenv("KAGGLE_KERNEL_RUN_TYPE")) || nzchar(Sys.getenv("JPY_PARENT_PID"))
+> ggml_vulkan_shutdown(hard = !is_notebook)
+> ```
+
 ### Autograd op reference
 
 | Category | Functions |
@@ -429,6 +709,142 @@ predict(fit_reg, new_data = mtcars)
 ```
 
 `parsnip`, `tibble`, `rlang`, and `dials` are in `Suggests` — ggmlR only wires up the engine when they are installed.
+
+## Single-cell GPU Acceleration (Seurat)
+
+Run GPU-accelerated operations directly on `Seurat` objects — no conversion on your side, and no hard dependency: `Seurat`/`SeuratObject` stay in `Suggests`, so ggmlR installs fine without them and the adapter activates only when they are present.
+
+**Setup.** The adapter needs two packages installed alongside ggmlR — `Seurat` (the object model and its pipeline) and a couple of light helpers it leans on for speed (`Matrix` for the sparse graphs, `FNN` for the kd-tree kNN). They are all `Suggests`, so install them yourself:
+
+```r
+install.packages(c("Seurat", "Matrix", "FNN"))   # ggmlR is already installed
+
+library(ggmlR)
+library(Seurat)        # ggmlR's S3 methods (RunGGML, ggml_extract, ...) activate
+                       # automatically once SeuratObject is on the search path
+```
+
+If `FNN` is absent the kNN falls back to the GPU/CPU distance matrix; if `Matrix` is absent the `"neighbors"` op is unavailable (the graphs are sparse). The rest works with `Seurat` alone.
+
+`RunGGML()` is the one-call, Seurat-style entry point (object in, object out — pipe-friendly, mirrors `RunPCA()`). Vulkan is used automatically when a GPU is present, with a transparent CPU fallback. The supported operations are the heavy matrix steps of a standard pipeline:
+
+| `op` | Replaces | What runs on the GPU |
+|------|----------|----------------------|
+| `"normalize"` | `NormalizeData()` (LogNormalize) | sparse `log1p(x / colSum × sf)` over the stored non-zeros (`sparse_lognorm.comp`) — the counts stay a `dgCMatrix`, never densified |
+| `"scale"` | `ScaleData()` | per-gene z-score `(x − mean) / sd` + clamp over the full dense matrix |
+| `"embed"` | `RunPCA()` | gene-by-gene covariance multiply (eigendecomposition stays on the CPU — ggml has no eigensolver) |
+| `"umap"` | `RunUMAP()` | **two** custom compute shaders: `pairwise_dist.comp` (kNN distances, honest f32) and `umap_sgd.comp` (SGD layout) |
+| `"neighbors"` | `FindNeighbors()` | kNN distances feeding the SNN/Jaccard graph; the FNN kd-tree by default, or a fused GPU kNN (`knn_tiled.comp`) with `knn_backend = "vulkan"`. Exact kNN either way |
+| `"largest_gene"` | `percent.Largest.Gene` | per-cell highest-expressed gene + its share of the cell total, over the sparse `dgCMatrix` CSC slots (no densify); bit-exact with `qlcMatrix::colMax` |
+
+`"normalize"` and `"scale"` write the transformed matrix back into the assay (the `data` and `scale.data` layers), so the rest of the Seurat pipeline picks them up unchanged. `"embed"` and `"umap"` add a dimensionality reduction; `"neighbors"` writes the `<assay>_nn` and `<assay>_snn` graphs into `@graphs`, exactly where `FindClusters()` looks; `"largest_gene"` adds `largest_gene` and `percent.Largest.Gene` columns to `meta.data` / `colData`.
+
+### What runs where
+
+A standard Seurat workflow maps onto the adapter like this — five of the heavy
+steps move to the GPU, and only the final community detection stays on the CPU:
+
+| Standard step | ggmlR | Runs on |
+|---------------|-------|---------|
+| `NormalizeData()` | `RunGGML(op = "normalize")` | **GPU** |
+| `ScaleData()` | `RunGGML(op = "scale")` | **GPU** |
+| `RunPCA()` | `RunGGML(op = "embed")` | **GPU** matrix multiply (eigensolve on CPU — ggml has none) |
+| `RunUMAP()` | `RunGGML(op = "umap")` | **GPU** (distance + SGD shaders) |
+| `FindNeighbors()` | `RunGGML(op = "neighbors")` | kNN on CPU (FNN kd-tree) or **GPU** (`knn_backend = "vulkan"`, `knn_tiled.comp`) → sparse SNN |
+| `FindClusters()` | — (use Seurat's) | CPU — iterative graph Louvain/Leiden, a poor GPU fit and already fast on the CPU |
+
+On a Vulkan GPU (AMD RADV) the GPU steps are markedly faster than a naive
+reference. Indicative numbers at 2000 cells:
+
+| Step | What was sped up | Speed-up |
+|------|------------------|----------|
+| `neighbors` distance kernel | tiled f32 vs `stats::dist` | up to ~4× |
+| `neighbors` GPU kNN (`knn_backend = "vulkan"`) | fused `knn_tiled.comp` vs FNN kd-tree | ~2–3× at 25–50k cells, and grows — the kNN cost is linear in n rather than the kd-tree's ~O(n²) in ~10-D |
+| `largest_gene` | sparse CSC argmax vs `qlcMatrix::colMax` | ~30× (≈20 s → 0.6 s at 53k cells) |
+| `umap` pipeline | kd-tree kNN + sparse fuzzy graph + GPU SGD | ~13× (≈1.45 s → 0.11 s) |
+| `umap` SGD shader alone | one GPU dispatch per epoch | ~10⁹ edge-updates/s |
+
+The whole pipeline A/B is reproducible with `inst/examples/seurat_op2_gpu.R`,
+which runs the classic Seurat route twice — stock CPU vs `RunGGML()` on the GPU —
+on the Kaggle *Open Problems – Single-Cell Perturbations* counts (18 211 genes ×
+240 090 PBMCs), then checks the two arms agree. A representative run (11 %
+subsample = 23 279 cells, 2000 HVGs, 50 PCs, `--gpu-knn`, AMD RADV):
+
+| step | cpu (s) | gpu (s) | speedup |
+|------|--------:|--------:|--------:|
+| `largest_gene` | 8.92 | 0.28 | 32.2× |
+| `normalize` | 2.84 | 1.61 | 1.8× |
+| `scale` | 1.84 | 1.94 | 0.9× |
+| `embed` (PCA) | 15.92 | 3.03 | 5.3× |
+| `neighbors` | 4.43 | 1.45 | 3.1× |
+| `umap` | 15.32 | 5.34 | 2.9× |
+| **TOTAL (GPU ops)** | **49.27** | **13.66** | **3.6×** |
+
+Every accelerated step matches Seurat to float noise (normalize/scale max abs err
+~1e-6, PCA `|cor|` = 1.0000 over PC1–10, clusters ARI 0.94, `largest_gene`
+top-gene agreement 1.0000). `scale` comes out ~1× — it is memory-bound with
+nothing to accelerate, so it defaults to the CPU even under Vulkan; PCA's
+covariance multiply is the biggest matrix-multiply win. See the
+`single-cell-seurat` vignette for the full breakdown.
+
+(Numbers are hardware-dependent; reproduce the UMAP shaders separately with
+`inst/examples/umap_shaders_bench.R`.)
+
+```r
+library(Seurat)
+
+# A whole standard pipeline, GPU-accelerated end to end — every heavy step is a
+# RunGGML() call; only FindClusters (graph Louvain) stays on Seurat's side:
+pbmc <- RunGGML(pbmc, op = "normalize")                       # -> "data" layer
+pbmc <- RunGGML(pbmc, op = "scale")                           # -> "scale.data" layer
+pbmc <- RunGGML(pbmc, op = "embed", n_components = 30,
+                reduction_name = "pca")                       # -> reduction "pca"
+
+# UMAP on the PC coordinates — both phases on the GPU (distance + SGD shaders):
+pbmc <- RunGGML(pbmc, op = "umap", reduction = "pca", dims = 1:30,
+                reduction_name = "umap")                      # -> reduction "umap"
+
+# Neighbour graphs on the PC coordinates -> @graphs, then cluster as usual:
+pbmc <- RunGGML(pbmc, op = "neighbors", reduction = "pca", dims = 1:30)
+pbmc <- FindClusters(pbmc, graph.name = paste0(DefaultAssay(pbmc), "_snn"))
+
+DimPlot(pbmc, reduction = "umap", group.by = "seurat_clusters")
+```
+
+The `"umap"` op has two phases. The **graph/distance** phase uses a tiled f32
+pairwise-distance kernel that sidesteps `mul_mat` (whose f16 accumulation reorders
+nearest neighbours and corrupts the graph), with a kd-tree kNN and a sparse fuzzy
+graph. The **SGD layout** phase defaults to the single-threaded reference, which
+runs in compiled C (`R_umap_sgd_cpu`) — the earlier interpreted-R loop took
+~700 s on ~10k cells; the C version is bit-for-bit identical but finishes in
+seconds, so it stays the default for best embedding quality. Passing
+`sgd_backend = "vulkan"` opts into the `umap_sgd.comp` shader (one dispatch per
+epoch, Hogwild updates — faster still, but the lock-free races smear dense-graph
+clusters, a known hard problem for async UMAP-SGD). Layout numerics match the CPU
+reference to float32 precision; the SNN graph matches `FindNeighbors()`
+bit-for-bit on identical exact kNN.
+
+The adapter is layered, and each layer is a public generic you can call on its own:
+
+| Function | Layer | Responsibility |
+|----------|-------|----------------|
+| `ggml_extract()` | Extraction | Pull a feature × cell matrix out of a `Seurat`/`dgCMatrix`/`matrix`; handles Seurat v4 (`GetAssayData`) vs v5 (`LayerData`) and sparse → dense |
+| `ggml_run()` | Dispatch | Validate against `ggml_ops_registry()`, route to Vulkan GPU or CPU (auto, with fallback) |
+| `ggml_inject()` | Injection | Write the result back into the object — a reduction (`CreateDimReducObject()`) for `"embed"`/`"umap"`, an assay layer for the `"normalize"`/`"scale"` transforms, or `<assay>_nn`/`<assay>_snn` `Graph` objects in `@graphs` for `"neighbors"` |
+
+```r
+# Compose the layers manually (e.g. on a bare matrix, no Seurat needed):
+mat  <- ggml_extract(expr_matrix)               # genes × cells, dense
+task <- ggml_task("embed", mat, params = list(n_components = 30))
+res  <- ggml_run(task)                           # ggml_result: cells × components
+res$embedding
+
+# Check capabilities before dispatch:
+ggml_ops_registry()        # all supported operations
+ggml_ops_registry("embed") # required params + description
+```
+
+A `SingleCellExperiment` (Bioconductor) path with an S4 `runGGML()` generic is planned next.
 
 ## ONNX Model Import
 

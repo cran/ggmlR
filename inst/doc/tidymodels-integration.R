@@ -145,3 +145,24 @@ knitr::opts_chunk$set(
 # 
 # rank_results(specs, rank_metric = "accuracy")
 
+## -----------------------------------------------------------------------------
+# spec <- mlp(hidden_units = c(16L), epochs = 10L) |>
+#   set_engine("ggml") |>
+#   set_mode("classification")
+# 
+# fit_obj <- fit(spec, Species ~ ., data = iris)
+# 
+# # The native ggmlR engine object (class "ggmlr_parsnip_model").
+# # extract_fit_*() are re-exported by parsnip (originally from hardhat).
+# eng <- parsnip::extract_fit_engine(fit_obj)
+# class(eng)
+# 
+# # Training time parsnip recorded for the fit (one-row tibble: stage_id, elapsed).
+# parsnip::extract_fit_time(fit_obj)
+
+## -----------------------------------------------------------------------------
+# ggml_model_backend(eng)            # "vulkan" or "cpu" (actual backend used)
+# head(ggml_training_history(eng))   # per-epoch loss / accuracy curve
+# generics::glance(eng)              # one-row model summary
+# generics::tidy(eng)                # one row per layer
+

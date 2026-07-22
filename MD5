@@ -1,7 +1,7 @@
-0196b0b5da41e21cad3aeec558e3d970 *DESCRIPTION
+ed5f26531d443568ca3d98182cd35b67 *DESCRIPTION
 4d299c90ac2e0e53cd4e038166a88c41 *LICENSE
 75736700b94c35d61e6867fb0d54da52 *NAMESPACE
-335680894756eec1e636d55e5ffce80c *NEWS.md
+c19c759c64501a64f93d3754c43de624 *NEWS.md
 31fd83caf513039fb7dfc1887d4c5bdb *R/LearnerClassifGGML.R
 021f54f6a94874e84cf3f231fcc21c0a *R/LearnerRegrGGML.R
 68ebf3d72fc6c5089ad29c5a35be6898 *R/ag_device.R
@@ -15,7 +15,7 @@ f84da4e4d32573226a336dd6815c1ecc *R/default_mlp.R
 06e13083d27a2105a31fe4b5df8b241f *R/diagnostics.R
 cc53ac44246088c09cc9d3ba3550770f *R/ggml.R
 d3eb25931bbbcc605bcd6d981bf17c82 *R/gguf.R
-73dab45cd6bdf73e1015d050564eda3f *R/gpu_linalg.R
+a6fff649fe4a5225cad44d6aadfd09ba *R/gpu_linalg.R
 937e7e4a6af672a6499fcf70f201467a *R/graph.R
 3206b17e1d0d3cb4184b4dc00f66f86f *R/helpers.R
 56a08d884b609fbdbf5226177a7977a8 *R/keras_api.R
@@ -32,13 +32,13 @@ f50cd614674766679448be6c0aca6bfa *R/onnx.R
 2042eeb89f9ebdfffe07a644c15fbe50 *R/parsnip_mlp.R
 c72d8cd1348420b12c750bc2c2917298 *R/quants.R
 1fecc66691d6c83e2957ce83b769701b *R/sc_compat.R
-1d2addc9a8b7c89c5980eadca255f90a *R/sc_contracts.R
+2028d97fb97676970356de637495ab11 *R/sc_contracts.R
 11fae3115683ca091360ffa042ac0698 *R/sc_dispatch.R
 7264c2b6b9e1ceecc8c6999dd3898dca *R/sc_extract.R
 59537d09da304de289368c9d13c33258 *R/sc_inject.R
 b2b63e686c1992ce1c5501ef9c2dcd82 *R/sc_sce.R
 a901c4041fe9555b7b2895f5ffbadb74 *R/sc_seurat.R
-5136a7110415b5bddddc5cf8e218e99b *R/sc_umap.R
+7ff1a125bef6ade9746cb6a2bec2e5ea *R/sc_umap.R
 dc0ceaa00152a8d5f4d69d4015efd5f9 *R/scheduler.R
 37cf33541ba34eb1aecc9606f49ea657 *R/seed.R
 20fd0fbfded6e03f6e65fde19439ac0a *R/tensor_parallel.R
@@ -46,7 +46,7 @@ dc0ceaa00152a8d5f4d69d4015efd5f9 *R/scheduler.R
 9622328c4ecc5ed4757d22b0ed34c7f8 *R/threading.R
 368fb54a357ae452b2e7d99995758c66 *R/vulkan.R
 a89f3a8f8ee92d6581093c5cc578d457 *R/zzz.R
-b1742cf71c6af83479491c0165e3dc93 *README.md
+4e6a8ffb3004fc91a8bd2f697c43cd5e *README.md
 893bdcbe77445c4c80a2dcc70ce90fb2 *build/vignette.rds
 879a2f1765c95d0e8685e9f37dd0e9bc *cleanup
 ec02867f1cc8ed6afcc1d236eb9f6efe *cleanup.win
@@ -125,6 +125,7 @@ c64214be4cc9206735ff3883d9e9c5df *inst/examples/multi_gpu_example.R
 76d18f9ab5dfbec3f3c5ef043a2890ba *inst/examples/new_features_demo.R
 7bc2c16e4c6a51d4647851a61a9c4c54 *inst/examples/pp_pipeline.R
 330819d3a3a44b59e0030b8723aee1d1 *inst/examples/profile_onnx_superres_gpu.R
+0429b9324a3de8be56e3877319e92bec *inst/examples/profile_tests.R
 b7e1a63c48dbed3f5da35479cb407c06 *inst/examples/seurat_gpu_stress.R
 9b61a755f4b57c084cfe26a6f67da200 *inst/examples/seurat_neighbors.R
 370a3723153a5dab4f36468fa8a05c3f *inst/examples/seurat_op2_gpu.R
@@ -1111,7 +1112,7 @@ b21596707a15fc1faf9344cf50f63f33 *src/r_interface_graph.c
 2b64a6ac580b0d369f6a3ff2445de6cf *src/r_interface_scheduler.c
 0c4398ef3f1c7a219ab8da6c2c2e02f3 *src/r_interface_vulkan.c
 079a007a0fe8827adc7fdc3ebc4de25d *src/r_umap_sgd.c
-2bbb13fc9365264a074275f4856a27ff *tests/testthat.R
+e8937ddfdc525cd2313b4e82683dcb8a *tests/testthat.R
 64aae0b54705cdfc86f4f5267adfe880 *tests/testthat/helper-device.R
 960e18e12a98ae63f4b3c015e9175f7f *tests/testthat/helper-onnx.R
 97ff9bd1b27c99984b3fff3c42074a96 *tests/testthat/setup.R
@@ -1165,7 +1166,7 @@ cf60376b3558ca53aceb53deb6468031 *tests/testthat/test-memory-extended.R
 42f974954db7b296d0733d32a114269b *tests/testthat/test-memory.R
 dde42d067f55bd10355dbeeac05a54f9 *tests/testthat/test-meta-backend.R
 8eceb7c89a50740b959e49dfc1a4aa25 *tests/testthat/test-misc-ops.R
-e6f6ef0bf92bb851964b8afb7ae8790b *tests/testthat/test-mlr3-autograd.R
+59bc46b2a6412cdfda51e25656096a4f *tests/testthat/test-mlr3-autograd.R
 5b44fbae4827fd973d851138ea8e52e4 *tests/testthat/test-mlr3-learner.R
 78ee8ede400562603211006db5e14e2c *tests/testthat/test-model-ops.R
 264c8cd2642342055c0c6bb140cf76d3 *tests/testthat/test-new-functions.R
@@ -1246,7 +1247,7 @@ b5222f56d29fb343454aabb0c5decc6d *tests/testthat/test-sc-neighbors.R
 e3886808a8087592a4ac270606d7d45a *tests/testthat/test-sc-normalize-sparse.R
 c2b0f9a5d505c17bf0f1549e9d58daf5 *tests/testthat/test-sc-sce.R
 95e80a39acf8f5ef9b02137a59c2bb1f *tests/testthat/test-sc-seurat.R
-c50b033e6877bce0581501023d3d5caf *tests/testthat/test-sc-umap.R
+0275426a147b32abc051eb2771b6ccdd *tests/testthat/test-sc-umap.R
 8c51058232c344ad504102ae21aaf14b *tests/testthat/test-scheduler.R
 736e6773fa4cc6f7a9333649b9b14791 *tests/testthat/test-seed.R
 1ab170ebbf5f074944fb0ea424c75757 *tests/testthat/test-sequence-ops.R

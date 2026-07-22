@@ -1,6 +1,16 @@
 # ggmlR — Neural Networks for R
 
+[![CRAN](https://www.r-pkg.org/badges/version/ggmlR)](https://CRAN.R-project.org/package=ggmlR)
+[![downloads](https://cranlogs.r-pkg.org/badges/grand-total/ggmlR)](https://CRAN.R-project.org/package=ggmlR)
 [![R-hub check on the R Consortium cluster](https://github.com/r-hub2/separate-jaguar-ggmlR/actions/workflows/rhub-rc.yaml/badge.svg)](https://github.com/r-hub2/separate-jaguar-ggmlR/actions/workflows/rhub-rc.yaml)
+
+[![ggmlR](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcranlogs.r-pkg.org%2Fdownloads%2Ftotal%2Flast-month%2FggmlR&query=%24%5B0%5D.downloads&label=ggmlR&color=blue)](https://CRAN.R-project.org/package=ggmlR)
+[![sd2R](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcranlogs.r-pkg.org%2Fdownloads%2Ftotal%2Flast-month%2Fsd2R&query=%24%5B0%5D.downloads&label=sd2R&color=blue)](https://CRAN.R-project.org/package=sd2R)
+[![llamaR](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcranlogs.r-pkg.org%2Fdownloads%2Ftotal%2Flast-month%2FllamaR&query=%24%5B0%5D.downloads&label=llamaR&color=blue)](https://CRAN.R-project.org/package=llamaR)
+[![drogonR](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcranlogs.r-pkg.org%2Fdownloads%2Ftotal%2Flast-month%2FdrogonR&query=%24%5B0%5D.downloads&label=drogonR&color=blue)](https://CRAN.R-project.org/package=drogonR)
+[![cayleyR](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcranlogs.r-pkg.org%2Fdownloads%2Ftotal%2Flast-month%2FcayleyR&query=%24%5B0%5D.downloads&label=cayleyR&color=blue)](https://CRAN.R-project.org/package=cayleyR)
+[![cgvR](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcranlogs.r-pkg.org%2Fdownloads%2Ftotal%2Flast-month%2FcgvR&query=%24%5B0%5D.downloads&label=cgvR&color=blue)](https://CRAN.R-project.org/package=cgvR)
+[![AV1R](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcranlogs.r-pkg.org%2Fdownloads%2Ftotal%2Flast-month%2FAV1R&query=%24%5B0%5D.downloads&label=AV1R&color=blue)](https://CRAN.R-project.org/package=AV1R)
 
 A native R package for building, training, and deploying neural networks. Backed by the [ggml](https://github.com/ggml-org/ggml) C library, designed primarily for **Vulkan GPU acceleration** with full CPU fallback — no Python, no TensorFlow, everything runs inside your R session.
 

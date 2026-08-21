@@ -3,6 +3,14 @@
 #include <R_ext/Rdynload.h>
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "r_ptr_check.h"
+
+// Custom-op registry (defined in r_interface_custom.c); exported to downstream
+// packages via R_RegisterCCallable in R_init_ggmlR.
+extern void ggmlR_register_custom_op(const char * name, ggml_custom_op_t fun);
+
+// Built-in demo/utility kernels (r_custom_kernels.c).
+extern void ggmlR_register_builtin_custom_ops(void);
 
 // Vulkan functions (defined in r_interface_vulkan.c)
 extern SEXP R_ggml_vulkan_is_available(void);
@@ -47,6 +55,9 @@ extern SEXP R_ggml_backend_sched_set_tensor_backend(SEXP sched_ptr, SEXP tensor_
 extern SEXP R_ggml_backend_sched_get_tensor_backend(SEXP sched_ptr, SEXP tensor_ptr);
 extern SEXP R_ggml_backend_sched_alloc_graph(SEXP sched_ptr, SEXP graph_ptr);
 extern SEXP R_ggml_backend_sched_graph_compute(SEXP sched_ptr, SEXP graph_ptr);
+extern SEXP R_ggml_backend_sched_trace(SEXP sched_ptr, SEXP enable);
+extern SEXP R_ggml_test_backend_ops(SEXP backend_ptr, SEXP filter);
+extern SEXP R_ggml_test_adamw_steps(SEXP backend_ptr);
 extern SEXP R_ggml_backend_sched_graph_compute_async(SEXP sched_ptr, SEXP graph_ptr);
 extern SEXP R_ggml_backend_sched_synchronize(SEXP sched_ptr);
 extern SEXP R_ggml_backend_sched_reset(SEXP sched_ptr);
@@ -57,6 +68,9 @@ extern SEXP R_ggml_opt_loss_type_sum(void);
 extern SEXP R_ggml_opt_loss_type_cross_entropy(void);
 extern SEXP R_ggml_opt_loss_type_mse(void);
 extern SEXP R_ggml_opt_loss_type_weighted_mse(void);
+extern SEXP R_ggml_opt_loss_type_mae(void);
+extern SEXP R_ggml_opt_loss_type_huber(void);
+extern SEXP R_ggml_opt_loss_type_binary_cross_entropy(void);
 extern SEXP R_ggml_opt_optimizer_type_adamw(void);
 extern SEXP R_ggml_opt_optimizer_type_sgd(void);
 extern SEXP R_ggml_opt_dataset_init(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
@@ -78,6 +92,15 @@ extern SEXP R_ggml_opt_labels(SEXP);
 extern SEXP R_ggml_opt_loss(SEXP);
 extern SEXP R_ggml_opt_pred(SEXP);
 extern SEXP R_ggml_opt_ncorrect(SEXP);
+extern SEXP R_ggml_opt_n_loss(SEXP);
+extern SEXP R_ggml_opt_outputs_i(SEXP, SEXP);
+extern SEXP R_ggml_opt_labels_i(SEXP, SEXP);
+extern SEXP R_ggml_opt_loss_weights_i(SEXP, SEXP);
+extern SEXP R_ggml_opt_loss_i(SEXP, SEXP);
+extern SEXP R_ggml_opt_pred_i(SEXP, SEXP);
+extern SEXP R_ggml_opt_ncorrect_i(SEXP, SEXP);
+extern SEXP R_ggml_opt_dataset_get_batch_head(SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_opt_fit_multi(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
 extern SEXP R_ggml_opt_context_optimizer_type(SEXP);
 extern SEXP R_ggml_opt_optimizer_name(SEXP);
 extern SEXP R_ggml_opt_result_init(void);
@@ -86,6 +109,9 @@ extern SEXP R_ggml_opt_result_reset(SEXP);
 extern SEXP R_ggml_opt_result_ndata(SEXP);
 extern SEXP R_ggml_opt_result_loss(SEXP);
 extern SEXP R_ggml_opt_result_accuracy(SEXP);
+extern SEXP R_ggml_opt_result_n_loss(SEXP);
+extern SEXP R_ggml_opt_result_loss_i(SEXP, SEXP);
+extern SEXP R_ggml_opt_result_accuracy_i(SEXP, SEXP);
 extern SEXP R_ggml_opt_alloc(SEXP, SEXP);
 extern SEXP R_ggml_opt_eval(SEXP, SEXP);
 extern SEXP R_ggml_opt_fit(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
@@ -94,6 +120,8 @@ extern SEXP R_ggml_opt_result_pred(SEXP);
 extern SEXP R_ggml_opt_prepare_alloc(SEXP, SEXP, SEXP, SEXP, SEXP);
 extern SEXP R_ggml_opt_epoch(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
 extern SEXP R_ggml_opt_init_for_fit(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_opt_init_for_fit_multi(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_sched_sync_threads(SEXP);
 extern SEXP R_ggml_opt_set_lr(SEXP, SEXP, SEXP);
 extern SEXP R_ggml_opt_get_lr(SEXP);
 
@@ -123,6 +151,12 @@ extern SEXP R_ggml_backend_dev_supports_op(SEXP, SEXP);
 extern SEXP R_ggml_backend_dev_supports_buft(SEXP, SEXP);
 extern SEXP R_ggml_backend_dev_offload_op(SEXP, SEXP);
 extern SEXP R_ggml_backend_dev_init(SEXP, SEXP);
+extern SEXP R_ggml_backend_dev_buffer_type(SEXP);
+extern SEXP R_ggml_backend_dev_host_buffer_type(SEXP);
+extern SEXP R_ggml_backend_buft_name(SEXP);
+extern SEXP R_ggml_backend_buft_get_alignment(SEXP);
+extern SEXP R_ggml_backend_buft_get_max_size(SEXP);
+extern SEXP R_ggml_backend_buft_is_host(SEXP);
 // Backend registry
 extern SEXP R_ggml_backend_reg_count(void);
 extern SEXP R_ggml_backend_reg_get(SEXP);
@@ -273,6 +307,18 @@ extern SEXP R_ggml_set_op_params_f32(SEXP, SEXP, SEXP);
 // Timestep embedding (defined in r_interface_graph.c)
 extern SEXP R_ggml_timestep_embedding(SEXP, SEXP, SEXP, SEXP);
 
+// State-space (Mamba) and RWKV-family recurrences (defined in r_interface_graph.c)
+extern SEXP R_ggml_ssm_conv(SEXP, SEXP, SEXP);
+extern SEXP R_ggml_ssm_conv_back(SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_ssm_scan_back(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_rwkv_wkv6_back(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_rwkv_wkv7_back(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_gated_linear_attn_back(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_ssm_scan(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_rwkv_wkv6(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_rwkv_wkv7(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+extern SEXP R_ggml_gated_linear_attn(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
+
 // CPU-side tensor data access (defined in r_interface_graph.c)
 extern SEXP R_ggml_set_f32_nd(SEXP, SEXP, SEXP, SEXP, SEXP, SEXP);
 extern SEXP R_ggml_get_f32_nd(SEXP, SEXP, SEXP, SEXP, SEXP);
@@ -408,8 +454,8 @@ SEXP R_ggml_init(SEXP mem_size, SEXP no_alloc) {
 }
 
 SEXP R_ggml_free(SEXP ctx_ptr) {
-    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
-    
+    struct ggml_context * ctx = (struct ggml_context *) r_ptr_freeable(ctx_ptr, "context");
+
     if (ctx != NULL) {
         ggml_free(ctx);
         R_ClearExternalPtr(ctx_ptr);
@@ -776,6 +822,8 @@ SEXP R_ggml_add1(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr);
 SEXP R_ggml_sgn(SEXP ctx_ptr, SEXP a_ptr);
 SEXP R_ggml_step(SEXP ctx_ptr, SEXP a_ptr);
 SEXP R_ggml_build_forward_expand(SEXP ctx_ptr, SEXP tensor_ptr);
+SEXP R_ggml_build_forward_expand_grads(SEXP ctx_ptr, SEXP tensor_ptr, SEXP graph_size);
+SEXP R_ggml_graph_expand(SEXP graph_ptr, SEXP tensor_ptr);
 SEXP R_ggml_graph_compute(SEXP ctx_ptr, SEXP graph_ptr);
 SEXP R_ggml_graph_n_nodes(SEXP graph_ptr);
 SEXP R_ggml_graph_print(SEXP graph_ptr);
@@ -839,6 +887,7 @@ SEXP R_ggml_neg(SEXP ctx_ptr, SEXP a_ptr);
 SEXP R_ggml_sin(SEXP ctx_ptr, SEXP a_ptr);
 SEXP R_ggml_cos(SEXP ctx_ptr, SEXP a_ptr);
 SEXP R_ggml_scale(SEXP ctx_ptr, SEXP a_ptr, SEXP s);
+SEXP R_ggml_scale_bias(SEXP ctx_ptr, SEXP a_ptr, SEXP s, SEXP b);
 SEXP R_ggml_clamp(SEXP ctx_ptr, SEXP a_ptr, SEXP min_val, SEXP max_val);
 SEXP R_ggml_floor(SEXP ctx_ptr, SEXP a_ptr);
 SEXP R_ggml_ceil(SEXP ctx_ptr, SEXP a_ptr);
@@ -930,6 +979,8 @@ SEXP R_ggml_view_4d(SEXP ctx_ptr, SEXP a_ptr, SEXP ne0, SEXP ne1, SEXP ne2, SEXP
 
 // Copy and Set operations
 SEXP R_ggml_cpy(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr);
+SEXP R_ggml_cast(SEXP ctx_ptr, SEXP a_ptr, SEXP type);
+SEXP R_ggml_cast_numeric(SEXP ctx_ptr, SEXP a_ptr, SEXP type);
 SEXP R_ggml_set(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP nb1, SEXP nb2, SEXP nb3, SEXP offset);
 SEXP R_ggml_set_1d(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP offset);
 SEXP R_ggml_set_2d(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP nb1, SEXP offset);
@@ -952,6 +1003,13 @@ SEXP R_ggml_rope_ext_back(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP c_ptr,
 
 // Concatenation
 SEXP R_ggml_concat(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP dim);
+
+// Custom operations (r_interface_custom.c)
+SEXP R_ggml_custom_4d(SEXP ctx_ptr, SEXP type, SEXP ne0, SEXP ne1, SEXP ne2, SEXP ne3,
+                      SEXP args_list, SEXP fun_name, SEXP n_tasks);
+SEXP R_ggml_custom_inplace(SEXP ctx_ptr, SEXP a_ptr, SEXP args_list,
+                           SEXP fun_name, SEXP n_tasks);
+SEXP R_ggml_custom_ops(void);
 
 // Sequence/Token operations
 SEXP R_ggml_pad(SEXP ctx_ptr, SEXP a_ptr, SEXP p0, SEXP p1, SEXP p2, SEXP p3);
@@ -991,6 +1049,7 @@ SEXP R_ggml_nrows(SEXP tensor_ptr);
 SEXP R_ggml_are_same_shape(SEXP a_ptr, SEXP b_ptr);
 SEXP R_ggml_set_name(SEXP tensor_ptr, SEXP name);
 SEXP R_ggml_set_param(SEXP tensor_ptr);
+SEXP R_ggml_set_loss(SEXP tensor_ptr);
 SEXP R_ggml_set_input(SEXP tensor_ptr);
 SEXP R_ggml_set_output(SEXP tensor_ptr);
 SEXP R_ggml_get_name(SEXP tensor_ptr);
@@ -1307,6 +1366,8 @@ static const R_CallMethodDef CallEntries[] = {
 
     // Graph building and execution
     {"R_ggml_build_forward_expand", (DL_FUNC) &R_ggml_build_forward_expand, 2},
+    {"R_ggml_build_forward_expand_grads", (DL_FUNC) &R_ggml_build_forward_expand_grads, 3},
+    {"R_ggml_graph_expand",         (DL_FUNC) &R_ggml_graph_expand,         2},
     {"R_ggml_graph_compute",        (DL_FUNC) &R_ggml_graph_compute,        2},
     {"R_ggml_graph_n_nodes",        (DL_FUNC) &R_ggml_graph_n_nodes,        1},
     {"R_ggml_graph_print",          (DL_FUNC) &R_ggml_graph_print,          1},
@@ -1393,6 +1454,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_ggml_sin",   (DL_FUNC) &R_ggml_sin,   2},
     {"R_ggml_cos",   (DL_FUNC) &R_ggml_cos,   2},
     {"R_ggml_scale", (DL_FUNC) &R_ggml_scale, 3},
+    {"R_ggml_scale_bias", (DL_FUNC) &R_ggml_scale_bias, 4},
     {"R_ggml_clamp", (DL_FUNC) &R_ggml_clamp, 4},
     {"R_ggml_floor", (DL_FUNC) &R_ggml_floor, 2},
     {"R_ggml_ceil",  (DL_FUNC) &R_ggml_ceil,  2},
@@ -1468,6 +1530,8 @@ static const R_CallMethodDef CallEntries[] = {
 
     // Copy and Set operations
     {"R_ggml_cpy",            (DL_FUNC) &R_ggml_cpy,            3},
+    {"R_ggml_cast",           (DL_FUNC) &R_ggml_cast,           3},
+    {"R_ggml_cast_numeric",   (DL_FUNC) &R_ggml_cast_numeric,   3},
     {"R_ggml_set",            (DL_FUNC) &R_ggml_set,            7},
     {"R_ggml_set_1d",         (DL_FUNC) &R_ggml_set_1d,         4},
     {"R_ggml_set_2d",         (DL_FUNC) &R_ggml_set_2d,         5},
@@ -1485,6 +1549,11 @@ static const R_CallMethodDef CallEntries[] = {
 
     // Concatenation
     {"R_ggml_concat",         (DL_FUNC) &R_ggml_concat,         4},
+
+    // Custom operations
+    {"R_ggml_custom_4d",      (DL_FUNC) &R_ggml_custom_4d,      9},
+    {"R_ggml_custom_inplace", (DL_FUNC) &R_ggml_custom_inplace, 5},
+    {"R_ggml_custom_ops",     (DL_FUNC) &R_ggml_custom_ops,     0},
 
     // Sequence/Token operations
     {"R_ggml_pad",            (DL_FUNC) &R_ggml_pad,            6},
@@ -1524,6 +1593,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_ggml_are_same_shape",     (DL_FUNC) &R_ggml_are_same_shape,     2},
     {"R_ggml_set_name",           (DL_FUNC) &R_ggml_set_name,           2},
     {"R_ggml_set_param",          (DL_FUNC) &R_ggml_set_param,          1},
+    {"R_ggml_set_loss",           (DL_FUNC) &R_ggml_set_loss,           1},
     {"R_ggml_set_input",          (DL_FUNC) &R_ggml_set_input,          1},
     {"R_ggml_set_output",         (DL_FUNC) &R_ggml_set_output,         1},
     {"R_ggml_get_name",           (DL_FUNC) &R_ggml_get_name,           1},
@@ -1613,6 +1683,9 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_ggml_backend_sched_get_tensor_backend", (DL_FUNC) &R_ggml_backend_sched_get_tensor_backend, 2},
     {"R_ggml_backend_sched_alloc_graph",        (DL_FUNC) &R_ggml_backend_sched_alloc_graph,        2},
     {"R_ggml_backend_sched_graph_compute",      (DL_FUNC) &R_ggml_backend_sched_graph_compute,      2},
+    {"R_ggml_backend_sched_trace",              (DL_FUNC) &R_ggml_backend_sched_trace,              2},
+    {"R_ggml_test_backend_ops",                 (DL_FUNC) &R_ggml_test_backend_ops,                 2},
+    {"R_ggml_test_adamw_steps",                 (DL_FUNC) &R_ggml_test_adamw_steps,                 1},
     {"R_ggml_backend_sched_graph_compute_async",(DL_FUNC) &R_ggml_backend_sched_graph_compute_async,2},
     {"R_ggml_backend_sched_synchronize",        (DL_FUNC) &R_ggml_backend_sched_synchronize,        1},
     {"R_ggml_backend_sched_reset",              (DL_FUNC) &R_ggml_backend_sched_reset,              1},
@@ -1623,6 +1696,9 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_ggml_opt_loss_type_cross_entropy",      (DL_FUNC) &R_ggml_opt_loss_type_cross_entropy,      0},
     {"R_ggml_opt_loss_type_mse",                (DL_FUNC) &R_ggml_opt_loss_type_mse,                0},
     {"R_ggml_opt_loss_type_weighted_mse",       (DL_FUNC) &R_ggml_opt_loss_type_weighted_mse,       0},
+    {"R_ggml_opt_loss_type_mae",                (DL_FUNC) &R_ggml_opt_loss_type_mae,                0},
+    {"R_ggml_opt_loss_type_huber",              (DL_FUNC) &R_ggml_opt_loss_type_huber,              0},
+    {"R_ggml_opt_loss_type_binary_cross_entropy", (DL_FUNC) &R_ggml_opt_loss_type_binary_cross_entropy, 0},
     {"R_ggml_opt_optimizer_type_adamw",         (DL_FUNC) &R_ggml_opt_optimizer_type_adamw,         0},
     {"R_ggml_opt_optimizer_type_sgd",           (DL_FUNC) &R_ggml_opt_optimizer_type_sgd,           0},
     {"R_ggml_opt_dataset_init",                 (DL_FUNC) &R_ggml_opt_dataset_init,                 6},
@@ -1644,6 +1720,15 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_ggml_opt_loss",                         (DL_FUNC) &R_ggml_opt_loss,                         1},
     {"R_ggml_opt_pred",                         (DL_FUNC) &R_ggml_opt_pred,                         1},
     {"R_ggml_opt_ncorrect",                     (DL_FUNC) &R_ggml_opt_ncorrect,                     1},
+    {"R_ggml_opt_n_loss",                       (DL_FUNC) &R_ggml_opt_n_loss,                       1},
+    {"R_ggml_opt_outputs_i",                    (DL_FUNC) &R_ggml_opt_outputs_i,                    2},
+    {"R_ggml_opt_labels_i",                     (DL_FUNC) &R_ggml_opt_labels_i,                     2},
+    {"R_ggml_opt_loss_weights_i",               (DL_FUNC) &R_ggml_opt_loss_weights_i,               2},
+    {"R_ggml_opt_loss_i",                       (DL_FUNC) &R_ggml_opt_loss_i,                       2},
+    {"R_ggml_opt_pred_i",                       (DL_FUNC) &R_ggml_opt_pred_i,                       2},
+    {"R_ggml_opt_ncorrect_i",                   (DL_FUNC) &R_ggml_opt_ncorrect_i,                   2},
+    {"R_ggml_opt_dataset_get_batch_head",       (DL_FUNC) &R_ggml_opt_dataset_get_batch_head,       5},
+    {"R_ggml_opt_fit_multi",                    (DL_FUNC) &R_ggml_opt_fit_multi,                   13},
     {"R_ggml_opt_context_optimizer_type",       (DL_FUNC) &R_ggml_opt_context_optimizer_type,       1},
     {"R_ggml_opt_optimizer_name",               (DL_FUNC) &R_ggml_opt_optimizer_name,               1},
     {"R_ggml_opt_result_init",                  (DL_FUNC) &R_ggml_opt_result_init,                  0},
@@ -1652,6 +1737,9 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_ggml_opt_result_ndata",                 (DL_FUNC) &R_ggml_opt_result_ndata,                 1},
     {"R_ggml_opt_result_loss",                  (DL_FUNC) &R_ggml_opt_result_loss,                  1},
     {"R_ggml_opt_result_accuracy",              (DL_FUNC) &R_ggml_opt_result_accuracy,              1},
+    {"R_ggml_opt_result_n_loss",                (DL_FUNC) &R_ggml_opt_result_n_loss,                1},
+    {"R_ggml_opt_result_loss_i",                (DL_FUNC) &R_ggml_opt_result_loss_i,                2},
+    {"R_ggml_opt_result_accuracy_i",            (DL_FUNC) &R_ggml_opt_result_accuracy_i,            2},
     {"R_ggml_opt_alloc",                        (DL_FUNC) &R_ggml_opt_alloc,                        2},
     {"R_ggml_opt_eval",                         (DL_FUNC) &R_ggml_opt_eval,                         2},
     {"R_ggml_opt_fit",                          (DL_FUNC) &R_ggml_opt_fit,                          11},
@@ -1660,6 +1748,8 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_ggml_opt_prepare_alloc",                 (DL_FUNC) &R_ggml_opt_prepare_alloc,                 5},
     {"R_ggml_opt_epoch",                         (DL_FUNC) &R_ggml_opt_epoch,                         7},
     {"R_ggml_opt_init_for_fit",                  (DL_FUNC) &R_ggml_opt_init_for_fit,                  7},
+    {"R_ggml_opt_init_for_fit_multi",            (DL_FUNC) &R_ggml_opt_init_for_fit_multi,            9},
+    {"R_ggml_sched_sync_threads",                (DL_FUNC) &R_ggml_sched_sync_threads,                1},
     {"R_ggml_opt_set_lr",                        (DL_FUNC) &R_ggml_opt_set_lr,                        3},
     {"R_ggml_opt_get_lr",                        (DL_FUNC) &R_ggml_opt_get_lr,                        1},
 
@@ -1684,6 +1774,12 @@ static const R_CallMethodDef CallEntries[] = {
     {"R_ggml_backend_dev_supports_op",          (DL_FUNC) &R_ggml_backend_dev_supports_op,           2},
     {"R_ggml_backend_dev_supports_buft",        (DL_FUNC) &R_ggml_backend_dev_supports_buft,         2},
     {"R_ggml_backend_dev_offload_op",           (DL_FUNC) &R_ggml_backend_dev_offload_op,            2},
+    {"R_ggml_backend_dev_buffer_type",          (DL_FUNC) &R_ggml_backend_dev_buffer_type,           1},
+    {"R_ggml_backend_dev_host_buffer_type",     (DL_FUNC) &R_ggml_backend_dev_host_buffer_type,      1},
+    {"R_ggml_backend_buft_name",                (DL_FUNC) &R_ggml_backend_buft_name,                 1},
+    {"R_ggml_backend_buft_get_alignment",       (DL_FUNC) &R_ggml_backend_buft_get_alignment,        1},
+    {"R_ggml_backend_buft_get_max_size",        (DL_FUNC) &R_ggml_backend_buft_get_max_size,         1},
+    {"R_ggml_backend_buft_is_host",             (DL_FUNC) &R_ggml_backend_buft_is_host,              1},
     {"R_ggml_backend_dev_init",                 (DL_FUNC) &R_ggml_backend_dev_init,                  2},
     {"R_ggml_backend_reg_count",                (DL_FUNC) &R_ggml_backend_reg_count,                 0},
     {"R_ggml_backend_reg_get",                  (DL_FUNC) &R_ggml_backend_reg_get,                   1},
@@ -1895,6 +1991,17 @@ static const R_CallMethodDef CallEntries[] = {
 
     // Timestep embedding
     {"R_ggml_timestep_embedding",               (DL_FUNC) &R_ggml_timestep_embedding,                4},
+    // State-space (Mamba) and RWKV-family recurrences
+    {"R_ggml_ssm_conv",                         (DL_FUNC) &R_ggml_ssm_conv,                          3},
+    {"R_ggml_ssm_conv_back",                    (DL_FUNC) &R_ggml_ssm_conv_back,                     4},
+    {"R_ggml_ssm_scan_back",                    (DL_FUNC) &R_ggml_ssm_scan_back,                     9},
+    {"R_ggml_rwkv_wkv6_back",                   (DL_FUNC) &R_ggml_rwkv_wkv6_back,                    8},
+    {"R_ggml_rwkv_wkv7_back",                   (DL_FUNC) &R_ggml_rwkv_wkv7_back,                    9},
+    {"R_ggml_gated_linear_attn_back",           (DL_FUNC) &R_ggml_gated_linear_attn_back,            8},
+    {"R_ggml_ssm_scan",                         (DL_FUNC) &R_ggml_ssm_scan,                          8},
+    {"R_ggml_rwkv_wkv6",                        (DL_FUNC) &R_ggml_rwkv_wkv6,                         7},
+    {"R_ggml_rwkv_wkv7",                        (DL_FUNC) &R_ggml_rwkv_wkv7,                         8},
+    {"R_ggml_gated_linear_attn",                (DL_FUNC) &R_ggml_gated_linear_attn,                 7},
 
     // CPU-side tensor data access
     {"R_ggml_set_f32_nd",                       (DL_FUNC) &R_ggml_set_f32_nd,                        6},
@@ -1936,4 +2043,11 @@ static const R_CallMethodDef CallEntries[] = {
 void R_init_ggmlR(DllInfo *dll) {
     R_registerRoutines(dll, NULL, CallEntries, NULL, NULL);
     R_useDynamicSymbols(dll, FALSE);
+
+    // Let downstream C code register custom-op kernels by name. See
+    // inst/include/ggmlR.h and r_interface_custom.c.
+    R_RegisterCCallable("ggmlR", "ggmlR_register_custom_op",
+                        (DL_FUNC) &ggmlR_register_custom_op);
+
+    ggmlR_register_builtin_custom_ops();
 }

@@ -1,7 +1,7 @@
 Package: ggmlR
 Type: Package
 Title: 'GGML' Tensor Operations for Machine Learning
-Version: 0.8.2
+Version: 0.8.4
 Authors@R: c(
     person("Yuri", "Baramykov",
         email = "lbsbmsu@mail.ru",
@@ -34,7 +34,7 @@ Description: Provides 'R' bindings to the 'GGML' tensor library for machine
     See <https://github.com/ggml-org/ggml> for more information about the
     underlying library.
 Depends: R (>= 4.1.0)
-Imports: generics, R6, methods, stats
+Imports: generics, R6, methods, stats, utils
 License: MIT + file LICENSE
 URL: https://github.com/Zabis13/ggmlR
 BugReports: https://github.com/Zabis13/ggmlR/issues
@@ -52,7 +52,7 @@ RoxygenNote: 7.3.3
 Config/testthat/edition: 3
 Config/build/clean-inst-doc: false
 NeedsCompilation: yes
-Packaged: 2026-07-22 09:51:21 UTC; yuri
+Packaged: 2026-08-20 19:58:32 UTC; yuri
 Author: Yuri Baramykov [aut, cre] (ORCID:
     <https://orcid.org/0009-0000-7627-4217>),
   Georgi Gerganov [ctb, cph] (Author of the GGML library),
@@ -61,4 +61,4 @@ Author: Yuri Baramykov [aut, cre] (ORCID:
   Mozilla Foundation [ctb, cph] (Author of llamafile/sgemm.cpp)
 Maintainer: Yuri Baramykov <lbsbmsu@mail.ru>
 Repository: CRAN
-Date/Publication: 2026-07-22 11:50:02 UTC
+Date/Publication: 2026-08-21 12:40:21 UTC

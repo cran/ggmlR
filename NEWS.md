@@ -1,3 +1,23 @@
+# ggmlR 0.8.4
+
+* Mamba backward on the GPU: `SSM_CONV_BACK` and `SSM_SCAN_BACK` now have Vulkan shaders, so state-space blocks train entirely on the GPU (`inst/examples/mamba_train_demo.R`: 21.7s -> 7.7s). Requires `d_state` 128 or 256 and Mamba-2 shapes; other shapes fall back to the CPU.
+* New multi-head attention: `ggml_layer_attention()` and `ggml_attention()`, with `causal = TRUE` for GPT-style masking and cross-attention via `ggml_apply(list(query, context), attn)`. All heads run in one batched pass.
+* `ggml_layer_dense()` gains `time_distributed = TRUE`, applying one kernel per position and keeping the sequence axis. Together with attention this completes a transformer block in the functional API.
+* New losses `"mae"`, `"huber"` and `"binary_crossentropy"` in `ggml_compile()`, with matching `ggml_opt_loss_type_*()` constants. Binary CE expects probabilities (end the model in a sigmoid).
+* New SSM / RWKV bindings: `ggml_ssm_conv()`, `ggml_ssm_scan()`, `ggml_rwkv_wkv6()`, `ggml_rwkv_wkv7()` and `ggml_gated_linear_attn()`. Each packs sequence output and final state in one tensor; use `ggml_ssm_scan_output()`/`ggml_ssm_scan_state()` and `ggml_rwkv_output()`/`ggml_rwkv_state()` to view either half. Inference only.
+* Functional models with several outputs now train all heads; previously `ggml_fit()` silently optimized only the last one. Per-head losses and weights are set via `ggml_compile(loss = list(...), loss_weights = c(...))`, and per-head losses are reported in `model$history` and `ggml_evaluate()`.
+
+# ggmlR 0.8.3
+
+* New custom operations: `ggml_custom()` / `ggml_custom_inplace()` add a graph node computed by a named C kernel; downstream packages register their own via the `ggmlR_register_custom_op` C callable. Built in: `"row_median"`, `"row_permute"`, `"clip_inplace"`; `ggml_custom_ops()` lists the registry. CPU-only.
+* `ggml_layer_concatenate()` is now trainable: `GGML_OP_CONCAT` has a backward pass, so multi-branch models train end-to-end. See `inst/examples/functional_concatenate.R`.
+* `ggml_vulkan_status()` now invisibly returns `list(available, n_devices, devices)` instead of `NULL`. Console output is unchanged.
+* New `ag_layer_norm()`: LayerNorm for the autograd engine, with learnable `gamma`/`beta` and an exact backward pass. No running statistics, so training and evaluation behave identically.
+* New `clip_grad_value()` for element-wise gradient clipping into `[-clip_value, clip_value]`.
+* New `check_grad_anomaly()`, a post-`backward()` hook reporting `NaN`/`Inf` gradients per parameter, with `action = "warn"`, `"stop"` or `"silent"`.
+* New LR schedulers `lr_scheduler_onecycle()`, `lr_scheduler_cyclic()` and `lr_scheduler_warmup_cosine()`.
+* `lr_scheduler_cosine()` gains `T_mult` for SGDR warm restarts; the default `T_mult = 1` keeps the previous constant-period behaviour.
+
 # ggmlR 0.8.2
 
 * **Fixed a global device-state leak** — the internal GPU paths (`ggml_matmul*()`, single-cell PCA / normalize / scale / UMAP) switched the process-wide `ag_device()` to `"gpu"` and never restored it, so every later `ag_*` operation silently ran on the GPU (and in its dtype). They now restore the caller's device on exit.

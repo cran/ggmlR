@@ -315,6 +315,23 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             elements = { nr, n_t, n_s };
         }
         break;
+    case GGML_OP_OUT_PROD:
+        {
+            // One invocation per dst element, with dims 2 and 3 folded into z.
+            // Folding keeps z within the workgroup-count limit that matters on
+            // NVIDIA (65535 for x, far lower than AMD's), since dims 2/3 are
+            // batch-like and small while ne0/ne1 are the wide ones.
+            elements = { (uint32_t)dst->ne[0], (uint32_t)dst->ne[1],
+                         (uint32_t)(dst->ne[2] * dst->ne[3]) };
+        }
+        break;
+    case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+        {
+            // One workgroup per row; the shader reduces each row in shared
+            // memory, so the grid is the row count rather than the element one.
+            elements = { (uint32_t)ggml_nrows(dst), 1, 1 };
+        }
+        break;
     default:
         elements = { (uint32_t)ggml_nelements(src0), 1, 1 };
         break;
@@ -752,6 +769,200 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         (uint32_t)src0->ne[1],
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
+    });
+}
+
+// ggmlR extension: backward of GGML_OP_SSM_CONV.
+//
+// One invocation per channel; the shader loops over tokens and sequences
+// itself, which is what keeps every write private to a channel and lets the
+// kernel run without atomics. The output is the packed [d_sx | d_c] pair the
+// builder allocates, so the split point goes in as an element offset.
+static void ggml_vk_ssm_conv_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // sx   {ncs, nr, n_s}
+    const ggml_tensor * src1 = dst->src[1];  // c    {nc, nr}
+    const ggml_tensor * src2 = dst->src[2];  // grad {nr, n_t, n_s}
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    const uint32_t nc  = (uint32_t)src1->ne[0];
+    const uint32_t ncs = (uint32_t)src0->ne[0];
+    const uint32_t nr  = (uint32_t)src0->ne[1];
+    const uint32_t n_t = (uint32_t)src2->ne[1];
+    const uint32_t n_s = (uint32_t)src2->ne[2];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src0, src1, src2, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_ssm_conv_back_push_constants pc = {
+        (uint32_t)src0->nb[1], (uint32_t)src0->nb[2],
+        (uint32_t)src1->nb[1],
+        (uint32_t)src2->nb[1], (uint32_t)src2->nb[2],
+        nc, ncs, nr, n_t, n_s,
+        (uint32_t)ggml_nelements(src0),
+    };
+
+    vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer src_buf0 = ggml_vk_tensor_subbuffer(ctx, src0);
+    vk_subbuffer src_buf1 = ggml_vk_tensor_subbuffer(ctx, src1);
+    vk_subbuffer src_buf2 = ggml_vk_tensor_subbuffer(ctx, src2);
+
+    // Work items, not workgroups: ggml_vk_dispatch_pipeline divides by the
+    // pipeline's workgroup size itself. Passing the already-divided count here
+    // launches 1/256 of the channels and silently leaves the rest at zero.
+    const std::array<uint32_t, 3> elements = { nr, 1, 1 };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {src_buf0, src_buf1, src_buf2, dst_buf},
+        pc, elements);
+}
+
+// ggmlR extension: backward of GGML_OP_SSM_SCAN.
+//
+// One workgroup per (sequence, head, channel), d_state invocations wide, time
+// walked sequentially inside the shader. The forward keeps no intermediate
+// states, so the kernel replays the recurrence into a scratch buffer first --
+// (nt+1) states per (head, channel), far too much for shared memory at Mamba
+// sizes, hence prealloc_x rather than a shared array.
+//
+// The output buffer is zeroed first: four of the six gradients accumulate with
+// atomicAdd, so whatever the allocator left behind would otherwise be added to.
+static void ggml_vk_ssm_scan_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];  // s    {d_state, nr, nh, ns+}
+    const ggml_tensor * src1 = dst->src[1];  // x    {nr, nh, nt, ns}
+    const ggml_tensor * src2 = dst->src[2];  // dt   {nh, nt, ns}
+    const ggml_tensor * src3 = dst->src[3];  // A    {1, nh}
+    const ggml_tensor * src4 = dst->src[4];  // B    {d_state, ng, nt, ns}
+    const ggml_tensor * src5 = dst->src[5];  // C    {d_state, ng, nt, ns}
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    const uint32_t d_state = (uint32_t)src0->ne[0];
+    const uint32_t nr      = (uint32_t)src0->ne[1];
+    const uint32_t nh      = (uint32_t)src1->ne[1];
+    const uint32_t ng      = (uint32_t)src4->ne[1];
+    const uint32_t nt      = (uint32_t)src1->ne[2];
+    const uint32_t ns      = (uint32_t)src1->ne[3];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src0, src1, src2, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    // Element offsets of the six gradients inside the packed output, in the
+    // order ggml_ssm_scan takes its inputs. These must match the CPU kernel's
+    // layout exactly -- ggml-graph.c views each part by the same arithmetic.
+    const uint32_t n_s_el  = d_state * nr * nh * ns;
+    const uint32_t n_x_el  = (uint32_t)ggml_nelements(src1);
+    const uint32_t n_dt_el = (uint32_t)ggml_nelements(src2);
+    const uint32_t n_A_el  = (uint32_t)ggml_nelements(src3);
+    const uint32_t n_B_el  = (uint32_t)ggml_nelements(src4);
+
+    const uint32_t d_s_off  = 0;
+    const uint32_t d_x_off  = d_s_off  + n_s_el;
+    const uint32_t d_dt_off = d_x_off  + n_x_el;
+    const uint32_t d_A_off  = d_dt_off + n_dt_el;
+    const uint32_t d_B_off  = d_A_off  + n_A_el;
+    const uint32_t d_C_off  = d_B_off  + n_B_el;
+
+    // The incoming gradient is outputs followed by final states, like the
+    // forward result it belongs to.
+    const uint32_t g_s_off = n_x_el;
+
+    // Scratch: (nt + 1) states for every (sequence, head, channel).
+    const size_t scratch_size =
+        (size_t)ns * nh * nr * (nt + 1) * d_state * sizeof(float);
+
+    if (ctx->prealloc_size_x < scratch_size) {
+        ctx->prealloc_size_x = scratch_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_x_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    // Zero the destination before the atomics start accumulating into it.
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0,
+                                ggml_nbytes(dst));
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const vk_op_ssm_scan_back_push_constants pc = {
+        (uint32_t)src0->nb[2], (uint32_t)src0->nb[3],
+        (uint32_t)src1->nb[2], (uint32_t)src1->nb[3],
+        (uint32_t)src2->nb[1], (uint32_t)src2->nb[2],
+        (uint32_t)src4->nb[2], (uint32_t)src4->nb[3],
+        (uint32_t)src5->nb[2], (uint32_t)src5->nb[3],
+        nh, nr, ng, nt, ns,
+        d_s_off, d_x_off, d_dt_off, d_A_off, d_B_off, d_C_off,
+        g_s_off,
+    };
+
+    vk_subbuffer src_buf[8] = {};
+    for (int i = 0; i < 8 && dst->src[i] != nullptr; i++) {
+        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+    }
+    vk_subbuffer scratch_buf = { ctx->prealloc_x, 0, VK_WHOLE_SIZE };
+
+    // The grid is in work items: one workgroup per (head, channel) on x, and
+    // the pipeline's workgroup is d_state wide, so x counts nh*nr*d_state.
+    const std::array<uint32_t, 3> elements = { nh * nr * d_state, ns, 1 };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5],
+         src_buf[6], src_buf[7], dst_buf, scratch_buf},
+        pc, elements);
+
+    ctx->prealloc_x_need_sync = true;
+}
+
+// ggmlR extension: GGML_OP_OUT_PROD on the GPU.
+//
+// Both gradients of ggml_mul_mat() are built from out_prod, so without this
+// every training step of every dense layer fell back to the CPU. Strides are
+// passed as byte counts; the shader divides by sizeof(float), which is what
+// lets it handle a transposed src1 (the second mul_mat gradient passes
+// ggml_transpose(grad)) and the dim-2/3 broadcast used by grouped-query
+// attention.
+static void ggml_vk_out_prod(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    // Broadcast factors, matching the CPU kernel's dps2/dps3.
+    const uint32_t dps2 = (uint32_t)(dst->ne[2] / src0->ne[2]);
+    const uint32_t dps3 = (uint32_t)(dst->ne[3] / src0->ne[3]);
+
+    ggml_vk_op_f32<vk_op_out_prod_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_OUT_PROD, {
+        (uint32_t)dst->ne[0], (uint32_t)dst->ne[1],
+        (uint32_t)dst->ne[2], (uint32_t)dst->ne[3],
+        (uint32_t)src0->ne[1],
+        (uint32_t)src0->nb[1], (uint32_t)src0->nb[2], (uint32_t)src0->nb[3],
+        (uint32_t)src1->nb[0], (uint32_t)src1->nb[1],
+        (uint32_t)src1->nb[2], (uint32_t)src1->nb[3],
+        (uint32_t)dst->nb[1], (uint32_t)dst->nb[2], (uint32_t)dst->nb[3],
+        dps2, dps3,
+    });
+}
+
+// ggmlR extension: GGML_OP_CROSS_ENTROPY_LOSS_BACK on the GPU.
+//
+//     dst[row] = (softmax(logits[row]) - labels[row]) * grad[0] / nrows
+//
+// src[0] is the scalar loss gradient, src[1] the forward logits, src[2] the
+// labels -- the order ggml_cross_entropy_loss_back() records them in.
+static void ggml_vk_cross_entropy_loss_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * grad  = dst->src[0];
+    const ggml_tensor * src0f = dst->src[1];
+    const ggml_tensor * src1f = dst->src[2];
+
+    const uint32_t nr = (uint32_t) ggml_nrows(src0f);
+
+    ggml_vk_op_f32<vk_op_cross_entropy_loss_back_push_constants>(ctx, subctx, grad, src0f, src1f, nullptr, dst, GGML_OP_CROSS_ENTROPY_LOSS_BACK, {
+        (uint32_t) src0f->ne[0],
+        nr,
+        1.0f / (float) nr,
     });
 }
 

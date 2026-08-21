@@ -822,6 +822,36 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_ssm_conv_f32;
         }
         return nullptr;
+    case GGML_OP_SSM_CONV_BACK:
+        // ggmlR extension: backward of ssm_conv.
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_ssm_conv_back_f32;
+        }
+        return nullptr;
+    case GGML_OP_SSM_SCAN_BACK:
+        // ggmlR extension: backward of ssm_scan. One pipeline per supported
+        // d_state, matching the forward; supports_op has already rejected any
+        // other width and any device without float atomics.
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            const uint32_t d_state = (uint32_t)src0->ne[0];
+            if (d_state == 128) {
+                return ctx->device->pipeline_ssm_scan_back_f32_d128;
+            } else if (d_state == 256) {
+                return ctx->device->pipeline_ssm_scan_back_f32_d256;
+            }
+        }
+        return nullptr;
+    case GGML_OP_OUT_PROD:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+            dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_out_prod_f32;
+        }
+        return nullptr;
+    case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_cross_entropy_loss_back_f32;
+        }
+        return nullptr;
     case GGML_OP_OPT_STEP_ADAMW:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_opt_step_adamw_f32;

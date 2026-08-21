@@ -269,9 +269,25 @@ ggml_unfreeze_weights.ggml_functional_model <- function(model,
 #'
 #' @param model A ggml_sequential_model object
 #' @param optimizer Optimizer name: "adam" or "sgd"
-#' @param loss Loss function name: "categorical_crossentropy" or "mse"
-#' @param metrics Character vector of metrics (currently "accuracy")
+#' @param loss Loss function name: \code{"categorical_crossentropy"} (expects a
+#'   softmax output), \code{"mse"}, \code{"mae"}, \code{"huber"} (smooth L1,
+#'   delta 1) or \code{"binary_crossentropy"} (expects a sigmoid output, one
+#'   independent label per unit).  \code{"mean_squared_error"},
+#'   \code{"mean_absolute_error"}, \code{"huber_loss"} and
+#'   \code{"binary_cross_entropy"} are accepted as aliases.
+#'   For a multi-output functional model, a list or character vector with one
+#'   loss per output -- named after the output layers, or positional:
+#'   \code{loss = list(policy = "categorical_crossentropy", value = "mse")}.
+#' @param metrics Character vector of metrics to report from
+#'   \code{\link{ggml_evaluate}}.  \code{"accuracy"} is reported for
+#'   multi-class outputs whether or not it is requested; \code{"mae"},
+#'   \code{"mse"} and \code{"rmse"} (and the long forms
+#'   \code{"mean_absolute_error"}, \code{"mean_squared_error"}) are computed
+#'   only when asked for.  Any other name is dropped with a warning.
 #' @param backend Backend to use: "auto" (GPU if available, else CPU), "cpu", or "vulkan"
+#' @param loss_weights Optional per-output weights for a multi-output model;
+#'   the optimized total is \code{sum(loss_weights[i] * loss_i)}. Named after
+#'   the output layers or positional. Default: all outputs weighted 1.
 #' @return The compiled model (invisibly).
 #' @export
 #' @examples
@@ -288,8 +304,157 @@ ggml_unfreeze_weights.ggml_functional_model <- function(model,
 ggml_compile <- function(model, optimizer = "adam",
                           loss = "categorical_crossentropy",
                           metrics = c("accuracy"),
-                          backend = "auto") {
+                          backend = "auto",
+                          loss_weights = NULL) {
   UseMethod("ggml_compile")
+}
+
+# Supported names, shared by both compile() methods. The training code maps
+# these with switch() statements whose fallback is cross-entropy/adamw, so an
+# unrecognised name would otherwise be silently substituted -- and
+# ggml_evaluate(), which has no such fallback, would then report loss = NA for
+# the very same model.
+NN_LOSSES <- c("categorical_crossentropy", "crossentropy", "cross_entropy",
+               "mse", "mean_squared_error",
+               "mae", "mean_absolute_error",
+               "huber", "huber_loss",
+               "binary_crossentropy", "binary_cross_entropy")
+NN_OPTIMIZERS <- c("adam", "adamw", "sgd")
+# Metrics ggml_evaluate() knows how to compute. "accuracy" is reported for
+# multi-class outputs whether or not it is asked for; the regression metrics are
+# computed only when requested.
+NN_METRICS <- c("accuracy", "acc",
+                "mae", "mean_absolute_error",
+                "mse", "mean_squared_error",
+                "rmse")
+
+nn_validate_compilation <- function(optimizer, loss, metrics) {
+  # `loss` may be a single name (all heads alike) or, for multi-output models,
+  # a list/vector with one name per output head -- optionally named after the
+  # output layers. Every element still has to be a supported loss name.
+  loss_names <- if (is.list(loss)) unlist(loss, use.names = FALSE) else loss
+  if (!is.character(loss_names) || length(loss_names) < 1L ||
+      !all(loss_names %in% NN_LOSSES)) {
+    bad <- if (is.character(loss_names)) setdiff(loss_names, NN_LOSSES) else loss
+    stop("Unsupported loss: ", paste(format(bad), collapse = ", "),
+         ". Supported: ", paste(NN_LOSSES, collapse = ", "),
+         ". (binary_crossentropy is not implemented; for two classes use ",
+         "categorical_crossentropy with one-hot labels.)", call. = FALSE)
+  }
+  if (!is.character(optimizer) || length(optimizer) != 1L ||
+      !(optimizer %in% NN_OPTIMIZERS)) {
+    stop("Unsupported optimizer: ", paste(format(optimizer), collapse = ", "),
+         ". Supported: ", paste(NN_OPTIMIZERS, collapse = ", "), call. = FALSE)
+  }
+  # Accuracy is reported for multi-class outputs whether or not it is asked
+  # for; the regression metrics in NN_METRICS are computed by ggml_evaluate()
+  # when requested. Anything outside that list would be silently dropped, so
+  # say so rather than letting the caller assume it is being tracked.
+  if (!is.null(metrics)) {
+    unknown <- setdiff(as.character(metrics), NN_METRICS)
+    if (length(unknown) > 0L) {
+      warning("Ignoring unsupported metric(s): ", paste(unknown, collapse = ", "),
+              ". Supported: ", paste(NN_METRICS, collapse = ", "), ".",
+              call. = FALSE)
+    }
+  }
+  invisible(TRUE)
+}
+
+# Map a loss name to its ggml loss-type constant. Kept next to NN_LOSSES so the
+# two cannot drift apart: every name accepted by nn_validate_compilation() must
+# be handled here.
+nn_loss_type_of <- function(loss_name) {
+  switch(loss_name,
+    "categorical_crossentropy" = ,
+    "crossentropy" = ,
+    "cross_entropy" = ggml_opt_loss_type_cross_entropy(),
+    "mse" = ,
+    "mean_squared_error" = ggml_opt_loss_type_mse(),
+    "mae" = ,
+    "mean_absolute_error" = ggml_opt_loss_type_mae(),
+    "huber" = ,
+    "huber_loss" = ggml_opt_loss_type_huber(),
+    "binary_crossentropy" = ,
+    "binary_cross_entropy" = ggml_opt_loss_type_binary_cross_entropy(),
+    stop("Unsupported loss: ", loss_name, call. = FALSE)
+  )
+}
+
+# Is this a cross-entropy loss? CE training needs logits, since
+# ggml_cross_entropy_loss() applies its own softmax -- so a head with this loss
+# has its final softmax stripped when the training graph is built.
+#
+# "binary_crossentropy" is deliberately NOT in this list: it treats every output
+# as an independent Bernoulli and consumes probabilities, so its sigmoid must
+# survive into the training graph. Stripping it would feed logits to log().
+nn_loss_is_ce <- function(loss_name) {
+  loss_name %in% c("categorical_crossentropy", "crossentropy", "cross_entropy")
+}
+
+# Resolve the compiled `loss`/`loss_weights` against a model's output heads.
+#
+# `loss` is either one name for every head, or one name per head -- as a list or
+# character vector, named after the output layers or positional. `output_names`
+# comes from the model's outputs and is used for name-based matching (keras
+# semantics) and for labelling the per-head history.
+#
+# Returns a list with one entry per head: name, loss_type, weight, is_ce.
+nn_resolve_losses <- function(loss, loss_weights, output_names) {
+  n_head <- length(output_names)
+
+  spec_names <- if (is.list(loss)) unlist(loss, use.names = FALSE) else loss
+  keys       <- names(loss)
+
+  if (length(spec_names) == 1L && is.null(keys)) {
+    spec_names <- rep(spec_names, n_head) # one loss for every head
+  } else if (length(spec_names) != n_head) {
+    stop("'loss' must have one entry per output (", length(spec_names),
+         " given, ", n_head, " expected).", call. = FALSE)
+  } else if (!is.null(keys) && !any(keys == "")) {
+    # Named: match outputs by name, as keras does, rather than by position.
+    unknown <- setdiff(keys, output_names)
+    if (length(unknown) > 0L) {
+      stop("'loss' names do not match model outputs: ",
+           paste(unknown, collapse = ", "), ". Model outputs: ",
+           paste(output_names, collapse = ", "), call. = FALSE)
+    }
+    spec_names <- spec_names[match(output_names, keys)]
+  }
+
+  w <- loss_weights
+  if (is.null(w)) {
+    w <- rep(1, n_head)
+  } else {
+    if (is.list(w)) w <- unlist(w, use.names = FALSE)
+    wkeys <- names(loss_weights)
+    if (length(w) == 1L && is.null(wkeys)) {
+      w <- rep(w, n_head)
+    } else if (length(w) != n_head) {
+      stop("'loss_weights' must have one entry per output (", length(w),
+           " given, ", n_head, " expected).", call. = FALSE)
+    } else if (!is.null(wkeys) && !any(wkeys == "")) {
+      unknown <- setdiff(wkeys, output_names)
+      if (length(unknown) > 0L) {
+        stop("'loss_weights' names do not match model outputs: ",
+             paste(unknown, collapse = ", "), call. = FALSE)
+      }
+      w <- w[match(output_names, wkeys)]
+    }
+  }
+  if (!is.numeric(w) || anyNA(w)) {
+    stop("'loss_weights' must be numeric and free of NA.", call. = FALSE)
+  }
+
+  lapply(seq_len(n_head), function(i) {
+    list(
+      name      = output_names[[i]],
+      loss      = spec_names[[i]],
+      loss_type = nn_loss_type_of(spec_names[[i]]),
+      weight    = as.numeric(w[[i]]),
+      is_ce     = nn_loss_is_ce(spec_names[[i]])
+    )
+  })
 }
 
 #' @rdname ggml_compile
@@ -297,10 +462,22 @@ ggml_compile <- function(model, optimizer = "adam",
 ggml_compile.ggml_sequential_model <- function(model, optimizer = "adam",
                                                 loss = "categorical_crossentropy",
                                                 metrics = c("accuracy"),
-                                                backend = "auto") {
+                                                backend = "auto",
+                                                loss_weights = NULL) {
   if (length(model$layers) == 0) {
     stop("Model has no layers. Add layers before compiling.")
   }
+  # Sequential models have exactly one output, so per-head losses/weights have
+  # nothing to attach to. Rejecting is better than accepting and ignoring them.
+  if (!is.null(loss_weights)) {
+    stop("'loss_weights' applies to multi-output models; a sequential model ",
+         "has a single output.", call. = FALSE)
+  }
+  if (length(if (is.list(loss)) unlist(loss, use.names = FALSE) else loss) != 1L) {
+    stop("A sequential model has a single output, so 'loss' must be one loss name.",
+         call. = FALSE)
+  }
+  nn_validate_compilation(optimizer, loss, metrics)
 
   # 1. Shape inference
   model <- nn_infer_shapes(model)
@@ -373,7 +550,14 @@ ggml_compile.ggml_sequential_model <- function(model, optimizer = "adam",
 #' @param batch_size Batch size
 #' @return List with ctx_weights, ctx_compute, inputs, outputs, buffer
 #' @keywords internal
-nn_build_graph <- function(model, batch_size, training = TRUE) {
+# logits_output: drop a final softmax from the graph, leaving the last layer's
+# raw logits as the output. ggml_cross_entropy_loss() applies log_softmax to its
+# own input, so feeding it softmax probabilities would apply softmax twice --
+# that flattens the distribution, understates the reported loss and weakens the
+# gradient. Training with a cross-entropy loss therefore builds the graph with
+# logits_output = TRUE; inference leaves it FALSE and keeps the probabilities.
+nn_build_graph <- function(model, batch_size, training = TRUE,
+                           logits_output = FALSE) {
   input_shape <- model$input_shape
   ne_datapoint <- prod(input_shape)
   backend <- model$compilation$backend
@@ -458,6 +642,13 @@ nn_build_graph <- function(model, batch_size, training = TRUE) {
       layer$weights$beta <- ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_features)
       ggml_set_name(layer$weights$gamma, paste0("bn_", i, "_gamma"))
       ggml_set_name(layer$weights$beta, paste0("bn_", i, "_beta"))
+
+      # Running estimates used at inference time. Not parameters: they are
+      # updated by an EMA during training, never by the optimizer.
+      layer$weights$running_mean <- ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_features)
+      layer$weights$running_var  <- ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_features)
+      ggml_set_name(layer$weights$running_mean, paste0("bn_", i, "_running_mean"))
+      ggml_set_name(layer$weights$running_var, paste0("bn_", i, "_running_var"))
 
     } else if (layer$type == "lstm") {
       # input_shape: c(seq_len, input_size)
@@ -605,6 +796,23 @@ nn_build_graph <- function(model, batch_size, training = TRUE) {
         ggml_backend_tensor_set_data(layer$weights$gamma, rep(1.0, n))
         nn_init_zeros(layer$weights$beta)
       }
+
+      # Running estimates: restore when available, else start from the identity
+      # transform (mean 0, variance 1), matching ag_batch_norm().
+      nbn <- ggml_nelements(layer$weights$running_mean)
+      if (has_weights_data && !is.null(old_layer$weights_data$running_mean)) {
+        ggml_backend_tensor_set_data(layer$weights$running_mean, old_layer$weights_data$running_mean)
+        ggml_backend_tensor_set_data(layer$weights$running_var, old_layer$weights_data$running_var)
+      } else if (has_trained_weights && !is.null(old_layer$weights$running_mean)) {
+        ggml_backend_tensor_set_data(layer$weights$running_mean,
+          ggml_backend_tensor_get_data(old_layer$weights$running_mean))
+        ggml_backend_tensor_set_data(layer$weights$running_var,
+          ggml_backend_tensor_get_data(old_layer$weights$running_var))
+      } else {
+        nn_init_zeros(layer$weights$running_mean)
+        ggml_backend_tensor_set_data(layer$weights$running_var, rep(1.0, nbn))
+      }
+
       if (isTRUE(layer$trainable)) {
         ggml_set_param(layer$weights$gamma)
         ggml_set_param(layer$weights$beta)
@@ -686,13 +894,30 @@ nn_build_graph <- function(model, batch_size, training = TRUE) {
                      ne_datapoint * batch_size * 4 * 20)
   ctx_compute <- ggml_init(compute_mem, no_alloc = TRUE)
 
-  # Build forward graph
+  # Build forward graph.  When the caller wants logits, strip the softmax from
+  # the last layer for the duration of the build; layers_built is a local copy,
+  # so the model's own definition is untouched and inference still sees it.
+  n_layers <- length(layers_built)
+  softmax_stripped <- FALSE
+  if (logits_output && n_layers > 0L) {
+    last_act <- layers_built[[n_layers]]$config$activation
+    if (identical(last_act, "softmax")) {
+      layers_built[[n_layers]]$config$activation <- NULL
+      softmax_stripped <- TRUE
+    }
+  }
+
   current <- inputs
   for (i in seq_along(layers_built)) {
     current <- nn_build_layer(ctx_compute, current, layers_built[[i]],
                               training = training)
   }
   outputs <- current
+
+  # Restore the activation so the returned layers still describe the model.
+  if (softmax_stripped) {
+    layers_built[[n_layers]]$config$activation <- "softmax"
+  }
   ggml_set_output(outputs)
 
   list(
@@ -703,6 +928,108 @@ nn_build_graph <- function(model, batch_size, training = TRUE) {
     buffer = buffer,
     layers_built = layers_built
   )
+}
+
+# Calibrate batch_norm running statistics after training.
+#
+# For each batch_norm layer, runs the trained network up to the layer that feeds
+# it and records the per-feature mean and variance of those activations over the
+# whole training set. Inference then normalizes with these fixed estimates, so a
+# prediction depends only on the sample itself rather than on which other
+# samples share its batch.
+#
+# Conv-shaped inputs are calibrated too: their statistics pool over the batch
+# and every spatial position, matching nn_bn_normalize_conv(). See
+# nn_bn_channel_stats() for how the flattened activations are folded back.
+#
+#' @keywords internal
+# Per-channel mean and population variance of the activations feeding a
+# batch_norm layer.
+#
+# `acts` is what ggml_predict() returns: one row per sample, each row the
+# layer's input flattened in ggml order (ne[0] varies fastest). For a flat
+# [features] input that is already one column per channel, so a plain colMeans
+# does. For conv-shaped inputs the row packs the spatial axes together with the
+# channel, and the statistics must pool over batch AND space -- matching what
+# nn_bn_normalize_conv() computes during training.
+#
+# Returns NULL when the activation width does not match the layer, so the caller
+# can skip rather than write wrong statistics.
+nn_bn_channel_stats <- function(acts, input_shape, n_features) {
+  if (!is.matrix(acts) || ncol(acts) != prod(input_shape)) return(NULL)
+
+  pooled <- if (length(input_shape) == 1L) {
+    # [features, N]: columns are already channels.
+    acts
+  } else if (length(input_shape) == 2L) {
+    # ggml [C, L, N] with C = input_shape[2]: within a row the channel index
+    # varies fastest, so folding to [C, L*samples] puts each channel on a row.
+    matrix(as.vector(t(acts)), nrow = as.integer(input_shape[2]))
+  } else {
+    # ggml [W, H, C, N] with C = input_shape[3]: W and H vary fastest, so a row
+    # is [W*H, C]. Stack all samples and average each channel's block.
+    wh <- as.integer(input_shape[1]) * as.integer(input_shape[2])
+    matrix(as.vector(t(acts)), nrow = wh)
+  }
+
+  if (length(input_shape) == 3L) {
+    # pooled is [W*H, C*samples]: collapse the spatial rows, then average the
+    # per-sample copies of each channel.
+    per_col <- colMeans(pooled)
+    sq_col  <- colMeans(pooled^2)
+    n_ch <- as.integer(input_shape[3])
+    mu <- rowMeans(matrix(per_col, nrow = n_ch))
+    m2 <- rowMeans(matrix(sq_col,  nrow = n_ch))
+  } else if (length(input_shape) == 2L) {
+    mu <- rowMeans(pooled)
+    m2 <- rowMeans(pooled^2)
+  } else {
+    mu <- colMeans(pooled)
+    m2 <- colMeans(pooled^2)
+  }
+
+  if (length(mu) != n_features) return(NULL)
+  # Population variance, matching the batch statistics used during training.
+  list(mean = as.numeric(mu), var = as.numeric(pmax(m2 - mu^2, 0)))
+}
+
+nn_bn_calibrate <- function(model, x) {
+  bn_idx <- which(vapply(model$layers, function(l) identical(l$type, "batch_norm"),
+                         logical(1)))
+  if (length(bn_idx) == 0L) return(model)
+
+  # Cap the calibration set: the statistics converge long before the full data
+  # is needed, and this keeps fit() cheap for large inputs.
+  n_samples <- if (is.matrix(x)) nrow(x) else dim(x)[1]
+  n_use <- min(n_samples, 1024L)
+  x_use <- slice_first_dim(x, seq_len(n_use))
+
+  for (i in bn_idx) {
+    layer <- model$layers[[i]]
+    if (is.null(layer$weights$running_mean)) next
+
+    # A model consisting of everything before this batch_norm layer, sharing the
+    # trained weight tensors.
+    head_model <- model
+    head_model$layers <- model$layers[seq_len(i - 1L)]
+    if (length(head_model$layers) == 0L) next
+    head_model$history <- NULL
+
+    acts <- tryCatch(
+      ggml_predict(head_model, x_use, batch_size = min(n_use, 32L)),
+      error = function(e) NULL
+    )
+    if (is.null(acts) || !is.matrix(acts)) next
+
+    nf <- ggml_nelements(layer$weights$running_mean)
+    stats <- nn_bn_channel_stats(acts, layer$input_shape, nf)
+    if (is.null(stats)) next
+
+    ggml_backend_tensor_set_data(layer$weights$running_mean, stats$mean)
+    ggml_backend_tensor_set_data(layer$weights$running_var, stats$var)
+  }
+
+  model
 }
 
 # ============================================================================
@@ -727,6 +1054,11 @@ nn_build_graph <- function(model, batch_size, training = TRUE) {
 #'   \item{class_weight}{Named vector of weights per class, e.g. c("0"=1, "1"=10). Cannot be used with sample_weight.}
 #'   \item{sample_weight}{Numeric vector of per-sample weights (length = nrow(x)). Cannot be used with class_weight.}
 #'   \item{verbose}{0 = silent, 1 = progress (default: 1)}
+#'   \item{shuffle}{Shuffle the data (default: TRUE). Shuffled once before the
+#'     train/validation split, then the training portion each epoch; the
+#'     validation portion stays fixed. FALSE for time series or exactly
+#'     reproducible runs.}
+#'   \item{callbacks}{List of callback objects (early stopping, LR schedules)}
 #' }
 #'
 #' \strong{Low-level (optimizer loop):}
@@ -741,6 +1073,7 @@ nn_build_graph <- function(model, batch_size, training = TRUE) {
 #'   \item{nepoch}{Number of epochs (default: 10)}
 #'   \item{nbatch_logical}{Logical batch size (default: 32)}
 #'   \item{val_split}{Validation fraction (default: 0)}
+#'   \item{shuffle}{Shuffle the data (default: TRUE)}
 #'   \item{callbacks}{List of callback objects}
 #'   \item{silent}{Suppress output (default: FALSE)}
 #' }
@@ -811,7 +1144,8 @@ ggml_fit.default <- function(model, ...) {
 ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
                                 validation_split = 0.0, validation_data = NULL,
                                 class_weight = NULL, sample_weight = NULL,
-                                verbose = 1, callbacks = list()) {
+                                verbose = 1, shuffle = TRUE,
+                                callbacks = list()) {
   if (!model$compiled) {
     stop("Model must be compiled before training. Call ggml_compile() first.")
   }
@@ -846,6 +1180,10 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
     }
   }
 
+  # Shuffling before the split is only safe when the split is a fraction we
+  # choose; an explicit validation_data set is positional and must stay put.
+  shuffle_all <- shuffle
+
   if (!is.null(validation_data)) {
     if (!is.list(validation_data) || length(validation_data) < 2) {
       stop("validation_data must be a list: list(x_val, y_val)")
@@ -867,6 +1205,10 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
       sample_weight <- c(sample_weight, rep(1.0, n_val))
     }
     validation_split <- n_val / (n_train + n_val)
+    # The split is positional now: these rows ARE the user's validation set, so
+    # a pre-split shuffle would mix them back into training. Per-epoch shuffling
+    # of the training portion is unaffected.
+    shuffle_all <- FALSE
   }
 
   input_shape <- model$input_shape
@@ -931,28 +1273,43 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
     ggml_backend_tensor_set_data(weights_tensor, as.numeric(sample_weight))
   }
 
-  # Build graph (creates contexts, weights, inputs, outputs)
-  graph_info <- nn_build_graph(model, batch_size)
+  # Build graph (creates contexts, weights, inputs, outputs).
+  # Cross-entropy training needs logits, not probabilities -- see the note on
+  # nn_build_graph(). Weighted MSE goes through a different loss node and wants
+  # the model's actual output.
+  # Must agree with the loss_type switch below; both reject anything else.
+  use_ce_loss <- !use_weighted_mse &&
+    model$compilation$loss %in% c("categorical_crossentropy", "crossentropy", "cross_entropy")
+  graph_info <- nn_build_graph(model, batch_size, logits_output = use_ce_loss)
 
   # Map optimizer and loss
   optimizer_type <- switch(model$compilation$optimizer,
     "adam" = , "adamw" = ggml_opt_optimizer_type_adamw(),
     "sgd" = ggml_opt_optimizer_type_sgd(),
-    ggml_opt_optimizer_type_adamw()
+    stop("Unsupported optimizer: ", model$compilation$optimizer, call. = FALSE)
   )
 
+  # nn_loss_type_of() rather than a second switch: a duplicate mapping here
+  # would silently reject any loss added to the shared one.
   loss_type <- if (use_weighted_mse) {
     ggml_opt_loss_type_weighted_mse()
   } else {
-    switch(model$compilation$loss,
-      "categorical_crossentropy" = , "crossentropy" = ggml_opt_loss_type_cross_entropy(),
-      "mse" = , "mean_squared_error" = ggml_opt_loss_type_mse(),
-      ggml_opt_loss_type_cross_entropy()
-    )
+    nn_loss_type_of(model$compilation$loss)
   }
 
-  # Train (returns history list from C)
-  history_raw <- ggml_opt_fit(
+  # Train.  Uses the R-side epoch loop (ggml_fit_opt) rather than the single
+  # C call (ggml_opt_fit) so that callbacks get an on_epoch_begin/on_epoch_end
+  # hook between epochs; early stopping can also cut the run short, so the
+  # history may be shorter than `epochs`.
+  #
+  # Behaviour matches the old C path: shuffling is identical (whole dataset
+  # once, then the training split each epoch), and the LR is unchanged --
+  # ggml_opt_get_default_optimizer_params() ignores its userdata and returns
+  # hard-coded constants (adamw.alpha = 0.001), which is exactly what
+  # ggml_opt_init_for_fit() seeds its LR userdata with.  The difference is only
+  # that the LR is now reachable: a ggml_schedule_* callback can change it
+  # between epochs via ggml_opt_set_lr().
+  history_raw <- ggml_fit_opt(
     sched = model$compilation$sched,
     ctx_compute = graph_info$ctx_compute,
     inputs = graph_info$inputs,
@@ -963,6 +1320,9 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
     nepoch = epochs,
     nbatch_logical = batch_size,
     val_split = validation_split,
+    shuffle = shuffle,
+    shuffle_all = shuffle_all,
+    callbacks = callbacks,
     silent = (verbose == 0)
   )
 
@@ -971,14 +1331,30 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
   model$compilation$ctx_weights <- graph_info$ctx_weights
   model$compilation$buffer <- graph_info$buffer
 
-  # Build history object
+  # Calibrate batch_norm running statistics for inference.
+  #
+  # These have to come from a forward pass over the training data with the final
+  # weights. The epoch loop above is R-side, but a single epoch still runs as one
+  # C call and the intermediate mean/variance tensors it allocates are not
+  # addressable from here. So instead of folding an EMA in per batch, the
+  # statistics are computed once, after training, from the activations feeding
+  # each batch_norm layer. The result is the exact mean and variance over the
+  # training set rather than an exponentially-weighted approximation of it,
+  # which is what inference actually wants.
+  #
+  # Must run after ctx_weights/buffer are attached: it calls ggml_predict(),
+  # which rebuilds the graph from model$compilation.
+  model <- nn_bn_calibrate(model, x)
+
+  # Build history object.  ggml_fit_opt() returns one row per epoch actually
+  # run, which is fewer than `epochs` when a callback stopped training early.
   model$history <- structure(
     list(
       train_loss     = history_raw$train_loss,
       train_accuracy = history_raw$train_accuracy,
       val_loss       = history_raw$val_loss,
       val_accuracy   = history_raw$val_accuracy,
-      epochs         = seq_len(epochs)
+      epochs         = seq_len(nrow(history_raw))
     ),
     class = "ggml_history"
   )
@@ -1002,7 +1378,13 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
 #' @param batch_size Batch size for evaluation
 #' @param sample_weight Numeric vector of per-sample weights (length = nrow(x)).
 #' @param class_weight Named vector of weights per class, e.g. c("0"=1, "1"=10). Cannot be used with sample_weight.
-#' @return Named list with \code{loss} and \code{accuracy}.
+#' @return Named list with \code{loss} and \code{accuracy}. A multi-output
+#'   functional model additionally reports each head as \code{<output>_loss}.
+#'   Note the deliberate difference from the training history, which names the
+#'   same quantities \code{train_<output>_loss} and \code{val_<output>_loss}:
+#'   there the prefix distinguishes the two phases (and keeps an output named
+#'   \code{val_x} from colliding with another output's validation column),
+#'   whereas evaluation has no phases to tell apart, so the bare name is used.
 #' @examples
 #' \donttest{
 #' ggml_set_n_threads(1L)  # deterministic, single OpenMP pool
@@ -1067,18 +1449,10 @@ ggml_evaluate.ggml_sequential_model <- function(model, x, y, batch_size = 32,
   # Get predictions for ALL samples (no truncation)
   preds <- ggml_predict(model, x, batch_size = batch_size)
 
-  # Compute loss
-  loss_name <- model$compilation$loss
-  if (loss_name %in% c("categorical_crossentropy", "crossentropy")) {
-    # Cross-entropy: -sum(y * log(p)) / n
-    eps <- 1e-7
-    preds_clipped <- pmax(pmin(preds, 1 - eps), eps)
-    loss_val <- -mean(rowSums(y * log(preds_clipped)))
-  } else if (loss_name %in% c("mse", "mean_squared_error")) {
-    loss_val <- mean(rowSums((y - preds)^2) / ne_label)
-  } else {
-    loss_val <- NA_real_
-  }
+  # Compute loss. nn_head_loss() is the shared implementation the functional
+  # path uses, so both report the same number for the same loss name -- and a
+  # loss added there is not silently NA here.
+  loss_val <- nn_head_loss(model$compilation$loss, preds, y)
 
   # Compute accuracy (classification: argmax match)
   if (ne_label > 1L) {
@@ -1089,7 +1463,10 @@ ggml_evaluate.ggml_sequential_model <- function(model, x, y, batch_size = 32,
     acc_val <- NA_real_
   }
 
-  list(loss = loss_val, accuracy = acc_val, n_samples = n_samples)
+  out <- list(loss = loss_val, accuracy = acc_val, n_samples = n_samples)
+  # Same helper the functional path uses, so a metric means the same thing in
+  # both APIs -- previously the sequential evaluate() computed none at all.
+  nn_add_extra_metrics(out, model$compilation$metrics, preds, y)
 }
 
 # ============================================================================
@@ -1153,14 +1530,22 @@ ggml_predict.ggml_sequential_model <- function(model, x, batch_size = 32L, ...) 
     sched <- model$compilation$sched
     preds <- matrix(0, nrow = n_batches * bs, ncol = ne_output)
 
+    # Allocate once, outside the loop. Re-running reset + alloc_graph per batch
+    # gives the scheduler a fresh chance to lay out the intermediate buffers, and
+    # on Vulkan the second and later passes then read stale data -- every batch
+    # after the first came out wrong (~0.4 absolute error on softmax outputs)
+    # while the first was exact. The weights live in their own buffer, so nothing
+    # needs re-uploading between batches: set the inputs and compute. This
+    # mirrors the ONNX path, which allocates once behind an `is_allocated` flag.
+    ggml_backend_sched_reset(sched)
+    ggml_backend_sched_alloc_graph(sched, graph)
+
     for (ib in seq_len(n_batches)) {
       data_start <- (ib - 1L) * bs * ne_datapoint + 1L
       data_end <- ib * bs * ne_datapoint
       batch_data <- x_ggml[data_start:data_end]
       ggml_backend_tensor_set_data(graph_info$inputs, batch_data)
 
-      ggml_backend_sched_reset(sched)
-      ggml_backend_sched_alloc_graph(sched, graph)
       ggml_backend_sched_graph_compute(sched, graph)
 
       batch_output <- ggml_backend_tensor_get_data(graph_info$outputs)
@@ -1624,6 +2009,12 @@ ggml_save_model.ggml_sequential_model <- function(model, path) {
     } else if (l$type == "batch_norm" && !is.null(l$weights$gamma)) {
       wdata$gamma <- ggml_backend_tensor_get_data(l$weights$gamma)
       wdata$beta  <- ggml_backend_tensor_get_data(l$weights$beta)
+      # Running estimates are part of the model: without them a reloaded model
+      # would normalize inference batches with the (0, 1) identity transform.
+      if (!is.null(l$weights$running_mean)) {
+        wdata$running_mean <- ggml_backend_tensor_get_data(l$weights$running_mean)
+        wdata$running_var  <- ggml_backend_tensor_get_data(l$weights$running_var)
+      }
     } else if (l$type == "lstm" && !is.null(l$weights$W_gates)) {
       wdata$W_gates <- ggml_backend_tensor_get_data(l$weights$W_gates)
       wdata$U_gates <- ggml_backend_tensor_get_data(l$weights$U_gates)
@@ -1681,9 +2072,12 @@ ggml_save_model.ggml_functional_model <- function(model, path) {
     inputs       = model$inputs,     # pure R ggml_tensor_node lists
     outputs      = model$outputs,
     compilation  = list(
-      optimizer = model$compilation$optimizer,
-      loss      = model$compilation$loss,
-      metrics   = model$compilation$metrics
+      optimizer    = model$compilation$optimizer,
+      loss         = model$compilation$loss,
+      metrics      = model$compilation$metrics,
+      # Per-output weights must survive the round trip: without them a reloaded
+      # multi-output model would silently retrain with every head weighted 1.
+      loss_weights = model$compilation$loss_weights
     ),
     node_weights_data = nw_data,
     version = 2L
@@ -1753,10 +2147,13 @@ ggml_load_model <- function(path, backend = "auto") {
   } else if (data$model_class == "ggml_functional_model") {
     model <- ggml_model(inputs = data$inputs, outputs = data$outputs)
     model <- ggml_compile(model,
-      optimizer = data$compilation$optimizer,
-      loss      = data$compilation$loss,
-      metrics   = data$compilation$metrics,
-      backend   = backend
+      optimizer    = data$compilation$optimizer,
+      loss         = data$compilation$loss,
+      metrics      = data$compilation$metrics,
+      backend      = backend,
+      # NULL for models saved before multi-output support, which is exactly the
+      # single-head default.
+      loss_weights = data$compilation$loss_weights
     )
 
     # Ensure no stale ggml tensor pointers from the freshly-created model.

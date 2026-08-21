@@ -16,6 +16,8 @@
   validation_split = 0,
   validation_data = NULL,
   verbose = 1L,
+  shuffle = TRUE,
+  callbacks = list(),
   ...
 )
 
@@ -41,6 +43,29 @@ ggml_fit(model, ...)
 \item{validation_data}{Optional list(x_val, y_val). Overrides validation_split.}
 
 \item{verbose}{0 = silent, 1 = progress (default: 1).}
+
+\item{shuffle}{Shuffle the data (default \code{TRUE}).  The dataset is
+shuffled once before the train/validation split, then the training portion
+is reshuffled each epoch while the validation portion stays fixed.  Set to
+\code{FALSE} for time series or exactly reproducible runs.}
+
+\item{callbacks}{List of callback objects, e.g.
+  \code{\link{ggml_callback_early_stopping}} or an LR scheduler.  Each is a
+  list with \code{on_epoch_begin(epoch, logs, state)} and/or
+  \code{on_epoch_end(epoch, logs, state)}; setting \code{state$stop <- TRUE}
+  stops training.  \code{logs} holds \code{train_loss},
+  \code{train_accuracy}, \code{val_loss} and \code{val_accuracy}, and for a
+  multi-output model also \code{train_<output>_loss},
+  \code{train_<output>_accuracy}, \code{val_<output>_loss} and
+  \code{val_<output>_accuracy}, so a callback can monitor one head rather
+  than the total.  These are the same names \code{model$history} uses, so a
+  \code{monitor=} naming one of them matches a column there.
+
+  Both phases carry a prefix on purpose: it keeps an output named
+  \code{val_x} from colliding with another output's validation key.
+  \code{\link{ggml_evaluate}} reports the same per-head quantities under the
+  bare \code{<output>_loss}, since a single evaluation has no train/val
+  phases to tell apart.}
 
 \item{...}{Arguments passed to the appropriate implementation.}
 }
@@ -68,6 +93,11 @@ delegates to the low-level optimizer loop (\code{ggml_fit_opt}).
   \item{class_weight}{Named vector of weights per class, e.g. c("0"=1, "1"=10). Cannot be used with sample_weight.}
   \item{sample_weight}{Numeric vector of per-sample weights (length = nrow(x)). Cannot be used with class_weight.}
   \item{verbose}{0 = silent, 1 = progress (default: 1)}
+  \item{shuffle}{Shuffle the data (default: TRUE). Shuffled once before the
+    train/validation split, then the training portion each epoch; the
+    validation portion stays fixed. FALSE for time series or exactly
+    reproducible runs.}
+  \item{callbacks}{List of callback objects (early stopping, LR schedules)}
 }
 
 \strong{Low-level (optimizer loop):}
@@ -82,6 +112,7 @@ delegates to the low-level optimizer loop (\code{ggml_fit_opt}).
   \item{nepoch}{Number of epochs (default: 10)}
   \item{nbatch_logical}{Logical batch size (default: 32)}
   \item{val_split}{Validation fraction (default: 0)}
+  \item{shuffle}{Shuffle the data (default: TRUE)}
   \item{callbacks}{List of callback objects}
   \item{silent}{Suppress output (default: FALSE)}
 }

@@ -15,6 +15,8 @@ ggml_fit_opt(
   nepoch = 10L,
   nbatch_logical = 32L,
   val_split = 0,
+  shuffle = TRUE,
+  shuffle_all = shuffle,
   callbacks = list(),
   silent = FALSE
 )
@@ -39,6 +41,16 @@ ggml_fit_opt(
 \item{nbatch_logical}{Logical batch size (for gradient accumulation)}
 
 \item{val_split}{Fraction of data for validation (0.0 to 1.0)}
+
+\item{shuffle}{Shuffle the training portion each epoch (default
+\code{TRUE}).  Set to \code{FALSE} for time series or to make a run
+exactly reproducible.}
+
+\item{shuffle_all}{Shuffle the whole dataset once before the
+train/validation split is taken, so the validation portion is a random
+sample rather than the tail of the input.  Defaults to \code{shuffle}.
+Callers that append an explicit validation set to the data pass
+\code{FALSE}, since there the split is positional and must be preserved.}
 
 \item{callbacks}{List of callback lists. Each element may have
 `on_epoch_begin(epoch, logs, state)` and/or `on_epoch_end(epoch, logs, state)`.
@@ -70,11 +82,13 @@ history <- ggml_fit_opt(sched, ctx_compute, inputs, outputs, dataset,
 }
 \seealso{
 Other optimization: 
+\code{\link{ggml_fit_opt_multi}()},
 \code{\link{ggml_opt_alloc}()},
 \code{\link{ggml_opt_context_optimizer_type}()},
 \code{\link{ggml_opt_dataset_data}()},
 \code{\link{ggml_opt_dataset_free}()},
 \code{\link{ggml_opt_dataset_get_batch}()},
+\code{\link{ggml_opt_dataset_get_batch_head}()},
 \code{\link{ggml_opt_dataset_init}()},
 \code{\link{ggml_opt_dataset_labels}()},
 \code{\link{ggml_opt_dataset_ndata}()},
@@ -84,24 +98,32 @@ Other optimization:
 \code{\link{ggml_opt_epoch}()},
 \code{\link{ggml_opt_eval}()},
 \code{\link{ggml_opt_fit}()},
+\code{\link{ggml_opt_fit_multi}()},
 \code{\link{ggml_opt_free}()},
 \code{\link{ggml_opt_get_lr}()},
 \code{\link{ggml_opt_grad_acc}()},
 \code{\link{ggml_opt_init}()},
 \code{\link{ggml_opt_init_for_fit}()},
+\code{\link{ggml_opt_init_for_fit_multi}()},
 \code{\link{ggml_opt_inputs}()},
 \code{\link{ggml_opt_labels}()},
 \code{\link{ggml_opt_loss}()},
+\code{\link{ggml_opt_loss_i}()},
+\code{\link{ggml_opt_loss_type_binary_cross_entropy}()},
 \code{\link{ggml_opt_loss_type_cross_entropy}()},
+\code{\link{ggml_opt_loss_type_huber}()},
+\code{\link{ggml_opt_loss_type_mae}()},
 \code{\link{ggml_opt_loss_type_mean}()},
 \code{\link{ggml_opt_loss_type_mse}()},
 \code{\link{ggml_opt_loss_type_sum}()},
 \code{\link{ggml_opt_loss_type_weighted_mse}()},
+\code{\link{ggml_opt_n_loss}()},
 \code{\link{ggml_opt_ncorrect}()},
 \code{\link{ggml_opt_optimizer_name}()},
 \code{\link{ggml_opt_optimizer_type_adamw}()},
 \code{\link{ggml_opt_optimizer_type_sgd}()},
 \code{\link{ggml_opt_outputs}()},
+\code{\link{ggml_opt_outputs_i}()},
 \code{\link{ggml_opt_pred}()},
 \code{\link{ggml_opt_prepare_alloc}()},
 \code{\link{ggml_opt_reset}()},
@@ -109,6 +131,8 @@ Other optimization:
 \code{\link{ggml_opt_result_free}()},
 \code{\link{ggml_opt_result_init}()},
 \code{\link{ggml_opt_result_loss}()},
+\code{\link{ggml_opt_result_loss_i}()},
+\code{\link{ggml_opt_result_n_loss}()},
 \code{\link{ggml_opt_result_ndata}()},
 \code{\link{ggml_opt_result_pred}()},
 \code{\link{ggml_opt_result_reset}()},

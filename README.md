@@ -158,11 +158,15 @@ Vulkan telemetry logging. Two messages are emitted:
    ```
 
 2. A per-graph summary of any ops the Vulkan backend could not run and fell back
-   to CPU (e.g. `OUT_PROD`, `CROSS_ENTROPY_LOSS_BACK` during training):
+   to CPU (e.g. `GET_ROWS_BACK`, the backward of an embedding table):
 
    ```
-   ggml_vulkan: 12 op(s) not supported on GPU during graph compute, ran on CPU (per-type: OUT_PROD=12)
+   ggml_vulkan: 12 op(s) not supported on GPU during graph compute, ran on CPU (per-type: GET_ROWS_BACK=12)
    ```
+
+   This is worth turning on before trusting a training benchmark: a fallback
+   changes only the speed, never the result, so it is otherwise invisible.
+   `inst/examples/backward_gpu_demo.R` checks the backward ops one at a time.
 
 Both are **off by default** so they do not clutter output (notably during
 tests, where many contexts and training graphs are created). Enable them to
@@ -297,12 +301,27 @@ preds <- ggml_predict(model, x_new)
 | Conv2D | `ggml_layer_conv_2d(filters, kernel_size, padding)` |
 | MaxPooling2D | `ggml_layer_max_pooling_2d(pool_size)` |
 | GlobalAvgPool2D | `ggml_layer_global_average_pooling_2d()` |
-| BatchNorm | `ggml_layer_batch_norm()` |
+| BatchNorm | `ggml_layer_batch_norm()` (RMS-normalizes, then scales/shifts) |
 | Flatten | `ggml_layer_flatten()` |
 | Dropout | `ggml_layer_dropout(rate)` |
 | Embedding | `ggml_layer_embedding(vocab_size, dim)` |
 | LSTM | `ggml_layer_lstm(units, return_sequences)` |
 | GRU | `ggml_layer_gru(units, return_sequences)` |
+| Attention | `ggml_layer_attention(d_model, n_heads, causal)` (functional API) |
+
+### Available losses
+
+| `loss =` | Notes |
+|---|---|
+| `"categorical_crossentropy"` | Multi-class; expects a `softmax` output |
+| `"mse"` | Regression, squared error |
+| `"mae"` | Regression, absolute error — robust to outliers |
+| `"huber"` | Quadratic near zero, linear beyond `delta = 1` |
+| `"binary_crossentropy"` | Independent per-output labels; expects a `sigmoid` output |
+
+`"mean_squared_error"`, `"mean_absolute_error"`, `"huber_loss"` and
+`"binary_cross_entropy"` are accepted as aliases. In a multi-output model each
+head takes its own loss — see [Multi-output model](#multi-output-model).
 
 ### CNN example (MNIST)
 
@@ -394,6 +413,74 @@ preds <- ggml_predict(m, x)
 # preds[[2]] — class probabilities [n × 10]
 ```
 
+#### Training several heads at once
+
+Each output gets its own loss and weight; the optimized total is
+`sum(loss_weights[i] * loss_i)`. Losses may be mixed — a cross-entropy head and
+a regression head train in the same model.
+
+```r
+inp    <- ggml_input(shape = 64L)
+trunk  <- inp   |> ggml_layer_dense(64L, activation = "relu")
+policy <- trunk |> ggml_layer_dense(10L, activation = "softmax", name = "policy")
+value  <- trunk |> ggml_layer_dense(1L,  name = "value")
+
+m <- ggml_model(inputs = inp, outputs = list(policy, value))
+m <- ggml_compile(m, optimizer = "adam",
+                  loss         = list(policy = "categorical_crossentropy",
+                                      value  = "mse"),
+                  loss_weights = c(policy = 1.0, value = 0.5))
+
+# y is a list — one matrix per output, matched by name
+m <- ggml_fit(m, x, list(policy = y_policy, value = y_value),
+              epochs = 10L, batch_size = 32L)
+
+m$history$policy_loss   # per-head losses, so a stalled head is visible
+m$history$value_loss
+```
+
+`loss` also accepts a single name (applied to every output) or an unnamed list
+matched by position. `ggml_evaluate()` likewise reports `<output>_loss` per head
+alongside the weighted total.
+
+### Attention / transformer encoder block
+
+Attention takes and returns a sequence node `c(seq_len, d_model)`, so blocks
+stack and a residual merge needs no reshaping. `time_distributed = TRUE` applies
+one dense kernel per position — the position-wise feed-forward sublayer.
+
+```r
+inp <- ggml_input(shape = c(64L, 128L))         # c(seq_len, d_model)
+
+attn <- inp |> ggml_layer_attention(d_model = 128L, n_heads = 8L)
+h    <- ggml_layer_add(list(inp, attn))          # residual 1
+
+ff   <- h  |> ggml_layer_dense(512L, activation = "relu", time_distributed = TRUE)
+ff   <- ff |> ggml_layer_dense(128L, time_distributed = TRUE)
+h2   <- ggml_layer_add(list(h, ff))              # residual 2
+
+out <- h2 |> ggml_layer_flatten() |>
+  ggml_layer_dense(2L, activation = "softmax")
+
+m <- ggml_model(inputs = inp, outputs = out)
+```
+
+`causal = TRUE` masks keys after the query (GPT-style decoder). Cross-attention
+takes queries from one node and keys/values from another, which may have a
+different length:
+
+```r
+dec <- inp |> ggml_layer_attention(128L, n_heads = 8L, causal = TRUE)
+
+ctx <- ggml_input(shape = c(96L, 128L))
+x   <- ggml_apply(list(dec, ctx), ggml_attention(128L, n_heads = 8L))
+```
+
+`ggml_attention()` returns a reusable layer object — applying it to several
+nodes shares one set of projections, which is how an encoder block is reused
+across a stack. All heads are computed in one batched pass, so the graph does
+not grow with `n_heads`.
+
 ### ResNet-like image classifier
 
 ```r
@@ -446,6 +533,27 @@ m <- ggml_model(inputs = list(x1, x2), outputs = out)
 | Multi-output predict | list of numpy arrays | R list of matrices |
 | Backend | TensorFlow / JAX / PyTorch | ggml (Vulkan GPU, CPU fallback) |
 
+#### `evaluate()` masks the keras3 generic
+
+`compile()` and `fit()` are re-exported from the **generics** package, so they
+are shared with keras3 and other packages that use the same generics.
+`evaluate()` is not: ggmlR declares its own.
+
+`generics::evaluate` names its first argument `x`, so S3 dispatch happens on
+whatever is bound to `x`. With the keras3 argument order that works positionally
+— `evaluate(model, x, y)` — but naming the data explicitly,
+`evaluate(model, x = x, y = y)`, binds the *data* to the dispatch argument and
+fails with "no applicable method". Declaring the generic here as
+`evaluate(object, ...)` makes both forms work.
+
+The trade-off: attaching both ggmlR and keras3 makes the two `evaluate` generics
+mask one another, and whichever package was attached later wins. If you use both,
+qualify the call:
+
+```r
+ggmlR::evaluate(model, x_test, y_test)
+```
+
 ## Dynamic Autograd Engine (PyTorch-style)
 
 Build and train arbitrary architectures with eager execution and automatic differentiation.
@@ -475,7 +583,7 @@ opt$zero_grad()
 ```r
 model <- ag_sequential(
   ag_linear(64L, 128L, activation = "relu"),
-  ag_batch_norm(128L),
+  ag_layer_norm(128L),
   ag_dropout(0.1),
   ag_linear(128L, 10L)
 )
@@ -623,11 +731,11 @@ Same model on an **8× Tesla V100-32GB** host (2× Xeon E5-2698 v4, 256 GB RAM),
 | Shape | `ag_reshape`, `ag_transpose` |
 | Attention | `ag_multihead_attention` |
 | Loss | `ag_mse_loss`, `ag_cross_entropy_loss`, `ag_softmax_cross_entropy_loss` |
-| Layers | `ag_linear`, `ag_batch_norm`, `ag_dropout`, `ag_embedding` |
+| Layers | `ag_linear`, `ag_batch_norm`, `ag_layer_norm`, `ag_dropout`, `ag_embedding` |
 | Containers | `ag_sequential` |
 | Optimizers | `optimizer_sgd`, `optimizer_adam` |
-| Schedulers | `lr_scheduler_step`, `lr_scheduler_cosine` |
-| Utilities | `clip_grad_norm`, `ag_gradcheck`, `dp_train` |
+| Schedulers | `lr_scheduler_step`, `lr_scheduler_cosine` (SGDR via `T_mult`), `lr_scheduler_onecycle`, `lr_scheduler_cyclic`, `lr_scheduler_warmup_cosine` |
+| Utilities | `clip_grad_norm`, `clip_grad_value`, `check_grad_anomaly`, `ag_gradcheck`, `dp_train` |
 
 ## mlr3 Integration
 
@@ -1046,6 +1154,98 @@ Reduction: ReduceMean, ReduceSum.
 Quantization: DequantizeLinear, QuantizeLinear, QLinearConv, QLinearAdd, QLinearMatMul, QLinearSigmoid, QLinearConcat.
 Fused custom ops: RelPosBias2D (BoTNet-style 2D relative position bias).
 Pass-through: Dropout.
+
+## Custom Operations
+
+`ggml_custom()` adds a graph node computed by a C kernel — for operations ggml
+has no graph op for. Kernels are addressed **by name**, not by a function
+pointer passed through R, so a wrong name is a clean error instead of a segfault.
+
+Three kernels ship built in; `ggml_custom_ops()` lists the registry.
+
+```r
+ctx <- ggml_init(16 * 1024 * 1024)
+x <- ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5, 2)
+ggml_set_f32(x, c(5, 1, 3, 2, 4,
+                  9, 7, 8, 6, 10))
+
+# One median per row — the output collapses ne[1] to 1
+med <- ggml_custom(ctx, "row_median", args = list(x), ne = c(1, 2))
+
+graph <- ggml_build_forward_expand(ctx, med)
+ggml_graph_compute(ctx, graph)
+ggml_get_f32(med)   # 3, 8
+ggml_free(ctx)
+```
+
+| Kernel | What it does | API path it shows |
+|---|---|---|
+| `row_median` | median of each row | one input, caller-chosen output shape |
+| `row_permute` | `out[i] = x[perm[i]]` *within* each row (`ggml_get_rows()` permutes whole rows) | two inputs, I32 index tensor |
+| `clip_inplace` | clamp into `[lo, hi]`, writing into the input | `ggml_custom_inplace()` |
+
+**Registering your own kernel.** A package that links against ggmlR registers
+its kernels from C at load time, then references them from R by name:
+
+```c
+#include <ggmlR.h>   // system.file("include", "ggmlR.h", package = "ggmlR")
+
+static void my_kernel(struct ggml_tensor * dst, int ith, int nth, void * ud) {
+    const struct ggml_tensor * a = dst->src[0];
+    /* write only the slice of dst that ith owns */
+}
+
+void R_init_mypkg(DllInfo * dll) {
+    ggmlR_register_custom_op_t reg = (ggmlR_register_custom_op_t)
+        R_GetCCallable("ggmlR", "ggmlR_register_custom_op");
+    reg("my_kernel", my_kernel);
+}
+```
+
+Custom nodes are **CPU-only** — the kernel is a host function pointer, so no GPU
+backend can run it. Computing a graph that would put one on a GPU backend raises
+an error rather than failing inside the backend. Kernels may run on any thread
+(`ith` in `[0, nth)`) and must not call into R; pass `n_tasks = 1` for a kernel
+that is not thread-safe.
+
+## State-Space (Mamba) and RWKV Ops
+
+Low-level bindings for the recurrent alternatives to attention — linear in
+sequence length instead of quadratic.
+
+| Op | Signature |
+|---|---|
+| Mamba convolution | `ggml_ssm_conv(ctx, sx, c)` |
+| Mamba selective scan | `ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids)` |
+| RWKV-6 | `ggml_rwkv_wkv6(ctx, k, v, r, tf, td, state)` |
+| RWKV-7 | `ggml_rwkv_wkv7(ctx, r, w, k, v, a, b, state)` |
+| Gated linear attention | `ggml_gated_linear_attn(ctx, k, v, q, g, state, scale)` |
+
+`ggml_ssm_scan()` and the three RWKV-family ops each return **one** tensor with
+the sequence output and the final recurrent state concatenated. View either half
+rather than computing byte offsets by hand:
+
+```r
+r     <- ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids)
+y     <- ggml_ssm_scan_output(ctx, r, x)        # shaped like x
+state <- ggml_ssm_scan_state(ctx, r, s, ids)    # [d_state, head_dim, n_head, n_seqs]
+
+w   <- ggml_rwkv_wkv6(ctx, k, v, rr, tf, td, st)
+out <- ggml_rwkv_output(ctx, w, k)              # [S*H, n_tokens]
+st2 <- ggml_rwkv_state(ctx, w, k, st)           # [S*H, S*n_seqs]
+```
+
+**Trainable** — upstream ggml has no backward pass for any of these, which made
+them inference-only; ggmlR adds one for all five, so a Mamba or RWKV block
+trains end to end. `ggml_ssm_conv()` and `ggml_ssm_scan()` also have backward
+Vulkan shaders, so a state-space block trains entirely on the GPU (`d_state`
+128 or 256, Mamba-2 shapes; other shapes compute the backward on the CPU). The
+RWKV and GLA backward kernels are CPU-only, as is `ggml_gated_linear_attn()` in
+the forward direction.
+
+See `inst/examples/mamba_train_demo.R` for a block trained end to end on both
+backends, and `inst/examples/backward_gpu_demo.R` for which backward ops run
+where.
 
 ## GGUF Pre-trained Weights
 

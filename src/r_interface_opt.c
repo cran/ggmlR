@@ -145,15 +145,21 @@ SEXP R_ggml_opt_dataset_labels(SEXP dataset_ptr) {
     return ptr;
 }
 
-// Get (lazily allocating) per-datapoint weights tensor [1, ndata]
-SEXP R_ggml_opt_dataset_weights(SEXP dataset_ptr) {
+// Get (lazily allocating) loss weights tensor [ne0, ndata].
+// ne0 == 1 is the per-datapoint case; ne0 == ne_label a per-output mask.
+SEXP R_ggml_opt_dataset_weights(SEXP dataset_ptr, SEXP ne0) {
     ggml_opt_dataset_t dataset = (ggml_opt_dataset_t)R_ExternalPtrAddr(dataset_ptr);
 
     if (dataset == NULL) {
         error("Invalid dataset pointer");
     }
 
-    struct ggml_tensor * weights = ggml_opt_dataset_weights(dataset);
+    int64_t n0 = (int64_t) asReal(ne0);
+    if (n0 <= 0) {
+        error("loss weight width must be a positive integer (got %g)", asReal(ne0));
+    }
+
+    struct ggml_tensor * weights = ggml_opt_dataset_weights(dataset, n0);
 
     SEXP ptr = PROTECT(R_MakeExternalPtr(weights, R_NilValue, R_NilValue));
     UNPROTECT(1);
@@ -486,6 +492,13 @@ static SEXP r_opt_head_tensor(SEXP opt_ctx_ptr, SEXP ihead,
 
 SEXP R_ggml_opt_outputs_i(SEXP opt_ctx_ptr, SEXP ihead) {
     return r_opt_head_tensor(opt_ctx_ptr, ihead, ggml_opt_outputs_i, "outputs");
+}
+
+// Make the next ggml_opt_alloc() allocate again; see ggml_opt_invalidate_alloc().
+SEXP R_ggml_opt_invalidate_alloc(SEXP opt_ctx_ptr) {
+    ggml_opt_context_t opt_ctx = (ggml_opt_context_t) r_ptr_required(opt_ctx_ptr, "optimizer context");
+    ggml_opt_invalidate_alloc(opt_ctx);
+    return R_NilValue;
 }
 
 SEXP R_ggml_opt_labels_i(SEXP opt_ctx_ptr, SEXP ihead) {
@@ -1302,7 +1315,8 @@ static void r_opt_lr_userdata_finalizer(SEXP ptr) {
 // Default LR is taken from ggml_opt_get_default_optimizer_params.
 SEXP R_ggml_opt_init_for_fit(SEXP sched_ptr, SEXP loss_type, SEXP optimizer_type,
                               SEXP opt_period, SEXP ctx_compute_ptr,
-                              SEXP inputs_ptr, SEXP outputs_ptr) {
+                              SEXP inputs_ptr, SEXP outputs_ptr,
+                              SEXP loss_mask_ne0) {
     ggml_backend_sched_t sched = (ggml_backend_sched_t)R_ExternalPtrAddr(sched_ptr);
     if (sched == NULL) error("Invalid scheduler pointer");
 
@@ -1310,6 +1324,11 @@ SEXP R_ggml_opt_init_for_fit(SEXP sched_ptr, SEXP loss_type, SEXP optimizer_type
     struct ggml_opt_params params = ggml_opt_default_params(sched, lt);
     params.optimizer = (enum ggml_opt_optimizer_type)asInteger(optimizer_type);
     params.opt_period = asInteger(opt_period);
+    // 0 keeps the per-datapoint weighted-MSE layout; a head's ne[0] selects
+    // the per-output mask. Validated against outputs->ne[0] in ggml_opt_build.
+    if (loss_mask_ne0 != R_NilValue) {
+        params.loss_mask_ne0 = (int64_t)asReal(loss_mask_ne0);
+    }
 
     if (ctx_compute_ptr != R_NilValue)
         params.ctx_compute = (struct ggml_context *)R_ExternalPtrAddr(ctx_compute_ptr);
@@ -1456,6 +1475,19 @@ SEXP R_ggml_opt_set_lr(SEXP ud_ptr, SEXP adamw_lr, SEXP sgd_lr) {
         ud->params.adamw.alpha = (float)asReal(adamw_lr);
     if (!ISNA(asReal(sgd_lr)))
         ud->params.sgd.alpha = (float)asReal(sgd_lr);
+
+    return R_NilValue;
+}
+
+// Set decoupled weight decay in the userdata, for AdamW and SGD alike. ggml
+// applies it to parameter tensors only, so a frozen weight -- never marked as a
+// parameter -- is not decayed. ggml asserts 0 <= wd <= 1; R checks that first.
+SEXP R_ggml_opt_set_wd(SEXP ud_ptr, SEXP wd) {
+    r_opt_lr_userdata * ud = (r_opt_lr_userdata *)R_ExternalPtrAddr(ud_ptr);
+    if (ud == NULL) error("Invalid LR userdata pointer");
+
+    ud->params.adamw.wd = (float)asReal(wd);
+    ud->params.sgd.wd   = (float)asReal(wd);
 
     return R_NilValue;
 }

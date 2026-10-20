@@ -507,6 +507,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_silu_back_f32;
         }
         return nullptr;
+    case GGML_OP_GELU_BACK:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_gelu_back_f32;
+        }
+        return nullptr;
     case GGML_OP_NORM:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_norm_f32;
@@ -529,6 +534,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_RMS_NORM_BACK:
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_rms_norm_back_f32;
+        }
+        return nullptr;
+    // DIVERGENCE from upstream: LayerNorm backward, see ggml_norm_back().
+    case GGML_OP_NORM_BACK:
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_norm_back_f32;
         }
         return nullptr;
     case GGML_OP_L2_NORM:
@@ -578,6 +589,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 return ctx->device->pipeline_step[dst->type == GGML_TYPE_F16];
             case GGML_UNARY_OP_ROUND:
                 return ctx->device->pipeline_round[dst->type == GGML_TYPE_F16];
+            case GGML_UNARY_OP_ROUND_EVEN:
+                return ctx->device->pipeline_round_even[dst->type == GGML_TYPE_F16];
             case GGML_UNARY_OP_CEIL:
                 return ctx->device->pipeline_ceil[dst->type == GGML_TYPE_F16];
             case GGML_UNARY_OP_FLOOR:
@@ -845,6 +858,21 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
             dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_out_prod_f32;
+        }
+        return nullptr;
+    case GGML_OP_GET_ROWS_BACK:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_get_rows_back_f32;
+        }
+        return nullptr;
+    case GGML_OP_IM2COL_BACK:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_im2col_back_f32;
+        }
+        return nullptr;
+    case GGML_OP_FLASH_ATTN_BACK:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_flash_attn_back_f32;
         }
         return nullptr;
     case GGML_OP_CROSS_ENTROPY_LOSS_BACK:

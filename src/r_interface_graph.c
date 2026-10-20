@@ -371,6 +371,60 @@ SEXP R_ggml_graph_node(SEXP graph_ptr, SEXP i) {
     return R_MakeExternalPtr(node, R_NilValue, R_NilValue);
 }
 
+// Diagnostic: every node of a graph with its op, name, shape and its first
+// three sources -- each as the 1-based index of the node that produced it (0 when
+// the source is a leaf, i.e. not a node of this graph; NA when absent) and that
+// source's op. Enough to read the DAG from R (chains of SCALE, REPEAT feeding a
+// MUL, CONT after TRANSPOSE) without a src accessor per tensor.
+SEXP R_ggml_graph_dump(SEXP graph_ptr) {
+    struct ggml_cgraph * graph = (struct ggml_cgraph *) r_ptr_required(graph_ptr, "graph");
+    const int n = ggml_graph_n_nodes(graph);
+    const int NSRC = 3;
+
+    SEXP op   = PROTECT(allocVector(STRSXP, n));
+    SEXP name = PROTECT(allocVector(STRSXP, n));
+    SEXP ne   = PROTECT(allocMatrix(REALSXP, n, 4));
+    SEXP sidx = PROTECT(allocMatrix(INTSXP, n, NSRC));
+    SEXP sop  = PROTECT(allocMatrix(STRSXP, n, NSRC));
+
+    for (int i = 0; i < n; i++) {
+        struct ggml_tensor * t = ggml_graph_node(graph, i);
+        SET_STRING_ELT(op, i, mkChar(ggml_op_desc(t)));
+        SET_STRING_ELT(name, i, mkChar(t->name));
+        for (int d = 0; d < 4; d++) REAL(ne)[i + d * n] = (double) t->ne[d];
+        for (int s = 0; s < NSRC; s++) {
+            struct ggml_tensor * src = t->src[s];
+            int idx = NA_INTEGER;
+            const char * desc = "";
+            if (src != NULL) {
+                idx = 0;
+                for (int j = 0; j < i; j++) {
+                    if (ggml_graph_node(graph, j) == src) { idx = j + 1; break; }
+                }
+                desc = src->op == GGML_OP_NONE ? "LEAF" : ggml_op_desc(src);
+            }
+            INTEGER(sidx)[i + s * n] = idx;
+            SET_STRING_ELT(sop, i + s * n, mkChar(desc));
+        }
+    }
+
+    SEXP out = PROTECT(allocVector(VECSXP, 5));
+    SET_VECTOR_ELT(out, 0, op);
+    SET_VECTOR_ELT(out, 1, name);
+    SET_VECTOR_ELT(out, 2, ne);
+    SET_VECTOR_ELT(out, 3, sidx);
+    SET_VECTOR_ELT(out, 4, sop);
+    SEXP nms = PROTECT(allocVector(STRSXP, 5));
+    SET_STRING_ELT(nms, 0, mkChar("op"));
+    SET_STRING_ELT(nms, 1, mkChar("name"));
+    SET_STRING_ELT(nms, 2, mkChar("ne"));
+    SET_STRING_ELT(nms, 3, mkChar("src_index"));
+    SET_STRING_ELT(nms, 4, mkChar("src_op"));
+    setAttrib(out, R_NamesSymbol, nms);
+    UNPROTECT(7);
+    return out;
+}
+
 SEXP R_ggml_graph_overhead(void) {
     size_t overhead = ggml_graph_overhead();
     return ScalarReal((double) overhead);
@@ -632,6 +686,26 @@ SEXP R_ggml_rms_norm_back(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP eps) {
 
     if (result == NULL) {
         error("Failed to create rms_norm_back operation");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+// Layer Norm backward - for training
+SEXP R_ggml_norm_back(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP eps) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+    struct ggml_tensor * b = (struct ggml_tensor *) R_ExternalPtrAddr(b_ptr);
+    float epsilon = (float) asReal(eps);
+
+    if (ctx == NULL || a == NULL || b == NULL) {
+        error("Invalid pointer (context or tensor is NULL)");
+    }
+
+    struct ggml_tensor * result = ggml_norm_back(ctx, a, b, epsilon);
+
+    if (result == NULL) {
+        error("Failed to create norm_back operation");
     }
 
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
@@ -1621,6 +1695,37 @@ SEXP R_ggml_get_rows(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr) {
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
 }
 
+/* ScatterElements, exposed so the op can be checked without a model.
+ *
+ * It had three independent defects at once -- a 4-dimension push constant
+ * block against the 5-dimension struct the dispatcher sends, a pipeline
+ * declaring a 12-byte push constant range against the 140 bytes actually
+ * pushed, and a shader indexing only gl_GlobalInvocationID.x while the
+ * dispatch spreads work over y -- and every one of them was found by running
+ * a 45 MB detector end to end, minutes per attempt. All three are visible in
+ * a graph of one node. */
+SEXP R_ggml_scatter_elements(SEXP ctx_ptr, SEXP data_ptr, SEXP upd_ptr,
+                             SEXP idx_ptr, SEXP reduction_sexp, SEXP axis_sexp) {
+    struct ggml_context * ctx  = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor  * data = (struct ggml_tensor *) R_ExternalPtrAddr(data_ptr);
+    struct ggml_tensor  * upd  = (struct ggml_tensor *) R_ExternalPtrAddr(upd_ptr);
+    struct ggml_tensor  * idx  = (struct ggml_tensor *) R_ExternalPtrAddr(idx_ptr);
+
+    if (ctx == NULL || data == NULL || upd == NULL || idx == NULL) {
+        error("Invalid pointer");
+    }
+
+    struct ggml_tensor * result =
+        ggml_scatter_elements(ctx, data, upd, idx,
+                              asInteger(reduction_sexp), asInteger(axis_sexp));
+
+    if (result == NULL) {
+        error("Failed to create scatter_elements operation");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
 // ============================================================================
 // Diagonal Masking Operations (for causal attention)
 // ============================================================================
@@ -1971,6 +2076,25 @@ SEXP R_ggml_graph_dump_dot(SEXP graph_ptr, SEXP leafs_ptr, SEXP filename_sexp) {
 // ============================================================================
 
 // Set tensor data from R vector (works with any backend)
+// Element i of an R numeric vector as a float: doubles directly, integers and
+// logicals converted here so R does not have to copy the whole vector to double
+// first (7 ms per million elements). An integer NA becomes NaN, as a double NA
+// does on the way to float.
+static inline float r_numeric_float_at(const double * dx, const int * ix, int i) {
+    if (dx != NULL) return (float) dx[i];
+    return ix[i] == NA_INTEGER ? (float) R_NaN : (float) ix[i];
+}
+
+static void r_numeric_ptrs(SEXP x, const double ** dx, const int ** ix) {
+    *dx = NULL; *ix = NULL;
+    switch (TYPEOF(x)) {
+    case REALSXP: *dx = REAL(x);    break;
+    case INTSXP:  *ix = INTEGER(x); break;
+    case LGLSXP:  *ix = LOGICAL(x); break;
+    default: error("tensor data must be numeric, integer or logical");
+    }
+}
+
 SEXP R_ggml_backend_tensor_set(SEXP tensor_ptr, SEXP data_sexp, SEXP offset_sexp) {
     struct ggml_tensor * tensor = (struct ggml_tensor *) R_ExternalPtrAddr(tensor_ptr);
 
@@ -1995,15 +2119,16 @@ SEXP R_ggml_backend_tensor_set(SEXP tensor_ptr, SEXP data_sexp, SEXP offset_sexp
         int n = length(data_sexp);
         size_t size = n * sizeof(float);
 
-        // Convert R doubles to float
+        // Convert R doubles (or integers) to float
+        const double * dx; const int * ix;
+        r_numeric_ptrs(data_sexp, &dx, &ix);
         float * buffer = (float *) malloc(size);
         if (buffer == NULL) {
             error("Failed to allocate buffer");
         }
 
-        double * r_data = REAL(data_sexp);
         for (int i = 0; i < n; i++) {
-            buffer[i] = (float) r_data[i];
+            buffer[i] = r_numeric_float_at(dx, ix, i);
         }
 
         ggml_backend_tensor_set(tensor, buffer, offset, size);
@@ -2018,14 +2143,15 @@ SEXP R_ggml_backend_tensor_set(SEXP tensor_ptr, SEXP data_sexp, SEXP offset_sexp
         int n = length(data_sexp);
         size_t size = n * sizeof(ggml_fp16_t);
 
+        const double * dx; const int * ix;
+        r_numeric_ptrs(data_sexp, &dx, &ix);
         ggml_fp16_t * buffer = (ggml_fp16_t *) malloc(size);
         if (buffer == NULL) {
             error("Failed to allocate buffer");
         }
 
-        double * r_data = REAL(data_sexp);
         for (int i = 0; i < n; i++) {
-            buffer[i] = ggml_fp32_to_fp16((float) r_data[i]);
+            buffer[i] = ggml_fp32_to_fp16(r_numeric_float_at(dx, ix, i));
         }
 
         ggml_backend_tensor_set(tensor, buffer, offset, size);
@@ -2167,11 +2293,36 @@ static void r_ggml_backend_buffer_finalizer(SEXP ptr) {
 
 // Allocate all tensors in a context using a backend
 SEXP R_ggml_backend_alloc_ctx_tensors(SEXP ctx_ptr, SEXP backend_ptr) {
-    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
-    ggml_backend_t backend = (ggml_backend_t) R_ExternalPtrAddr(backend_ptr);
+    // r_ptr_required() rather than R_ExternalPtrAddr(): callers reach here with
+    // a plain R NULL when no backend was ever created -- ag_device("cpu")
+    // leaves .ag_device_state$backend unset, for one. R_ExternalPtrAddr() on a
+    // NILSXP does not return NULL; it reads a field off an object that is not
+    // an external pointer at all, producing a garbage address that passes a
+    // != NULL check and then segfaults inside ggml-alloc.
+    struct ggml_context * ctx = (struct ggml_context *) r_ptr_required(ctx_ptr, "context");
+    ggml_backend_t backend = (ggml_backend_t) r_ptr_required(backend_ptr, "backend");
 
-    if (ctx == NULL || backend == NULL) {
-        error("Invalid context or backend pointer");
+    // ggml-alloc returns NULL for two different outcomes: a real allocation
+    // failure, and "every tensor already has memory" (ggml-alloc.c:1214-1220,
+    // which also covers an empty context). Only the first is an error, so
+    // decide which one this is BEFORE calling.
+    //
+    // The test must match the upstream criterion for "needs allocating"
+    // exactly (ggml-alloc.c:1185): a tensor is skipped when it is a view
+    // (view_src != NULL, it borrows its parent's memory) OR when data is
+    // already set for any other reason (e.g. created in a no_alloc = false
+    // context). Anything else contributes to the buffer size.
+    bool needs_alloc = false;
+    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx);
+         t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->data == NULL && t->view_src == NULL) {
+            needs_alloc = true;
+            break;
+        }
+    }
+
+    if (!needs_alloc) {
+        return R_NilValue;
     }
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
@@ -2687,6 +2838,24 @@ SEXP R_ggml_silu_back(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr) {
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
 }
 
+SEXP R_ggml_gelu_back(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+    struct ggml_tensor * b = (struct ggml_tensor *) R_ExternalPtrAddr(b_ptr);
+
+    if (ctx == NULL || a == NULL || b == NULL) {
+        error("Invalid pointer");
+    }
+
+    struct ggml_tensor * result = ggml_gelu_back(ctx, a, b);
+
+    if (result == NULL) {
+        error("Failed to create gelu_back operation");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
 // Get rows backward
 SEXP R_ggml_get_rows_back(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP c_ptr) {
     struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
@@ -2883,22 +3052,19 @@ SEXP R_ggml_flash_attn_ext(SEXP ctx_ptr, SEXP q_ptr, SEXP k_ptr, SEXP v_ptr,
 // d: gradient from upstream (same shape as output)
 // masked: whether causal mask was used
 SEXP R_ggml_flash_attn_back(SEXP ctx_ptr, SEXP q_ptr, SEXP k_ptr, SEXP v_ptr,
-                            SEXP d_ptr, SEXP masked_sexp) {
+                            SEXP mask_ptr, SEXP d_ptr, SEXP scale_sexp) {
     struct ggml_context * ctx = (struct ggml_context *) r_ptr_required(ctx_ptr, "context");
     struct ggml_tensor * q = (struct ggml_tensor *) r_ptr_required(q_ptr, "tensor");
     struct ggml_tensor * k = (struct ggml_tensor *) r_ptr_required(k_ptr, "tensor");
     struct ggml_tensor * v = (struct ggml_tensor *) r_ptr_required(v_ptr, "tensor");
+    struct ggml_tensor * mask = (struct ggml_tensor *) r_ptr_or_null(mask_ptr, "mask");
     struct ggml_tensor * d = (struct ggml_tensor *) r_ptr_required(d_ptr, "tensor");
-    bool masked = asLogical(masked_sexp);
+    float scale = (float) Rf_asReal(scale_sexp);
 
-    if (ctx == NULL || q == NULL || k == NULL || v == NULL || d == NULL) {
-        error("Invalid pointer");
-    }
-
-    struct ggml_tensor * result = ggml_flash_attn_back(ctx, q, k, v, d, masked);
+    struct ggml_tensor * result = ggml_flash_attn_back(ctx, q, k, v, mask, d, scale);
 
     if (result == NULL) {
-        error("Failed to create flash_attn_back operation");
+        Rf_error("Failed to create flash_attn_back operation");
     }
 
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
@@ -2928,6 +3094,32 @@ SEXP R_ggml_pad(SEXP ctx_ptr, SEXP a_ptr, SEXP p0_sexp, SEXP p1_sexp,
 
     if (result == NULL) {
         error("Failed to create pad operation");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+// Pad with zeros on both sides of each dimension: lp before, rp after.
+SEXP R_ggml_pad_ext(SEXP ctx_ptr, SEXP a_ptr, SEXP lp_sexp, SEXP rp_sexp) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+
+    if (ctx == NULL || a == NULL) {
+        error("Invalid pointer");
+    }
+    if (length(lp_sexp) != 4 || length(rp_sexp) != 4) {
+        error("lp and rp must have length 4");
+    }
+    int * lp = INTEGER(lp_sexp);
+    int * rp = INTEGER(rp_sexp);
+    for (int i = 0; i < 4; i++) {
+        if (lp[i] < 0 || rp[i] < 0) error("padding must be non-negative");
+    }
+
+    struct ggml_tensor * result = ggml_pad_ext(ctx, a, lp[0], rp[0], lp[1], rp[1],
+                                               lp[2], rp[2], lp[3], rp[3]);
+    if (result == NULL) {
+        error("Failed to create pad_ext operation");
     }
 
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
@@ -3089,6 +3281,108 @@ SEXP R_ggml_set_param(SEXP tensor_ptr) {
     ggml_set_param(tensor);
 
     return tensor_ptr;
+}
+
+// Leaf alias of an already COMPUTED tensor: same memory, op NONE, no src[].
+//
+// Putting a computed node straight into a new graph is not "reading its value":
+// ggml_build_forward_expand() walks src[] and adds every ancestor with an op as
+// a node to compute, so the whole chain is re-run from the leaves' CURRENT
+// values. Measured: a per-op Adam step copied b's gradient through such a graph
+// after W's step had moved W, and got b's gradient for the NEW W (-9%).
+//
+// ggml_view_tensor() gives exactly a leaf over the same bytes: op stays NONE,
+// src[] stays empty, nb is copied, and a view of a view is collapsed to the
+// root buffer (view_offs accumulated, ggml-context.c). The buffer is bound here
+// (ggml_backend_view_init): ggml_backend_alloc_ctx_tensors() would skip it,
+// and Vulkan silently drops tensors without one. The alias carries no flags
+// (no PARAM, no OUTPUT), so nothing treats it as a parameter or an output.
+//
+// A source that is already a leaf (op NONE) is returned as is. A source with
+// no memory yet is an R error: aliasing it would read whatever the bytes hold.
+SEXP R_ggml_leaf_alias(SEXP ctx_ptr, SEXP src_ptr) {
+    struct ggml_context * ctx = (struct ggml_context *) r_ptr_required(ctx_ptr, "context");
+    struct ggml_tensor  * src = (struct ggml_tensor *)  r_ptr_required(src_ptr, "source tensor");
+
+    if (src->op == GGML_OP_NONE) {
+        return src_ptr;
+    }
+    const struct ggml_tensor * root = src->view_src ? src->view_src : src;
+    if (root->buffer == NULL || root->data == NULL || src->data == NULL) {
+        error("ggml leaf alias: source tensor '%s' has no backend memory (never allocated or computed)",
+              src->name);
+    }
+
+    struct ggml_tensor * t = ggml_view_tensor(ctx, src);
+    if (t == NULL) {
+        error("ggml leaf alias: failed to create the alias tensor");
+    }
+    ggml_format_name(t, "%s (leaf)", src->name);
+    if (ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+        error("ggml leaf alias: failed to bind the alias to the source buffer");
+    }
+    return R_MakeExternalPtr(t, R_NilValue, R_NilValue);
+}
+
+// AdamW step node: updates a, m and v IN PLACE when the graph runs; the result
+// is a view of a. Every precondition is checked here as an R error, because
+// ggml_opt_step_adamw() and its kernels GGML_ASSERT/ABORT on them, which would
+// take the R session down. The kernels are F32-only (CPU ops-misc.cpp, Vulkan
+// opt_step_adamw.comp), so an F16/BF16 weight is refused with the reason.
+SEXP R_ggml_opt_step_adamw(SEXP ctx_ptr, SEXP a_ptr, SEXP grad_ptr, SEXP m_ptr,
+                           SEXP v_ptr, SEXP params_ptr) {
+    struct ggml_context * ctx = (struct ggml_context *) r_ptr_required(ctx_ptr, "context");
+    struct ggml_tensor * a    = (struct ggml_tensor *) r_ptr_required(a_ptr,      "weight tensor");
+    struct ggml_tensor * grad = (struct ggml_tensor *) r_ptr_required(grad_ptr,   "grad tensor");
+    struct ggml_tensor * m    = (struct ggml_tensor *) r_ptr_required(m_ptr,      "m tensor");
+    struct ggml_tensor * v    = (struct ggml_tensor *) r_ptr_required(v_ptr,      "v tensor");
+    struct ggml_tensor * pars = (struct ggml_tensor *) r_ptr_required(params_ptr, "adamw_params tensor");
+
+    const struct ggml_tensor * f32s[4] = { a, grad, m, v };
+    const char * names[4] = { "weight", "grad", "m", "v" };
+    for (int i = 0; i < 4; i++) {
+        if (f32s[i]->type != GGML_TYPE_F32) {
+            error("ggml_opt_step_adamw: %s is %s, but the AdamW kernels are F32-only",
+                  names[i], ggml_type_name(f32s[i]->type));
+        }
+        if (!ggml_is_contiguous(f32s[i])) {
+            error("ggml_opt_step_adamw: %s must be contiguous", names[i]);
+        }
+        if (i > 0 && !ggml_are_same_shape(a, f32s[i])) {
+            error("ggml_opt_step_adamw: %s must have the same shape as the weight", names[i]);
+        }
+    }
+    if (pars->type != GGML_TYPE_F32 || ggml_nelements(pars) != 7) {
+        error("ggml_opt_step_adamw: adamw_params must be an F32 tensor of 7 elements "
+              "(alpha, beta1, beta2, eps, wd, beta1h, beta2h)");
+    }
+
+    // ggml_opt_step_adamw() asserts FLAG_PARAM on the weight, but nothing after
+    // construction reads it (the kernels do not). Leaving it set is NOT free:
+    // ggml-graph.c turns a PARAM tensor into a graph node instead of a leaf, so a
+    // persistent weight would change every later forward graph that uses it.
+    // Set it for the call only and restore the caller's flags.
+    const int32_t flags_before = a->flags;
+    a->flags |= GGML_TENSOR_FLAG_PARAM;
+    struct ggml_tensor * result = ggml_opt_step_adamw(ctx, a, grad, m, v, pars);
+    a->flags = flags_before;
+    if (result == NULL) {
+        error("Failed to create opt_step_adamw operation");
+    }
+
+    // The node is a view of a: it needs no memory, only its buffer set. Do it
+    // here when a already lives in a backend buffer. Relying on a later
+    // ggml_backend_alloc_ctx_tensors() does NOT work: in a context holding
+    // nothing but such views it returns early ("all tensors in the context are
+    // already allocated", ggml-alloc.c) without initialising them, and Vulkan
+    // then skips a node whose buffer is NULL -- silently: the graph "runs", the
+    // launch is counted, and the weights never move.
+    if (a->buffer != NULL && result->buffer == NULL) {
+        if (ggml_backend_view_init(result) != GGML_STATUS_SUCCESS) {
+            error("ggml_opt_step_adamw: failed to initialise the step node on the weight's buffer");
+        }
+    }
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
 }
 
 // Mark a tensor as the loss to differentiate. ggml_build_backward_expand()
@@ -4596,6 +4890,30 @@ SEXP R_ggml_mul_mat_set_prec(SEXP tensor_ptr, SEXP prec) {
     return R_NilValue;
 }
 
+// Set the precision of every matrix multiply in a built graph -- MUL_MAT and
+// FLASH_ATTN_EXT, the two ops whose Vulkan kernels keep f16 tiles by default.
+// Done on the graph rather than where each layer builds its multiply, so no
+// layer can be missed. Returns the number of nodes changed.
+SEXP R_ggml_graph_set_matmul_prec(SEXP graph_ptr, SEXP prec) {
+    struct ggml_cgraph * graph = (struct ggml_cgraph *) R_ExternalPtrAddr(graph_ptr);
+    if (graph == NULL) {
+        error("Invalid graph pointer");
+    }
+    enum ggml_prec p = (enum ggml_prec) asInteger(prec);
+    int n = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        struct ggml_tensor * node = ggml_graph_node(graph, i);
+        if (node->op == GGML_OP_MUL_MAT) {
+            ggml_mul_mat_set_prec(node, p);
+            n++;
+        } else if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            ggml_flash_attn_ext_set_prec(node, p);
+            n++;
+        }
+    }
+    return ScalarInteger(n);
+}
+
 // Flash attention get precision
 SEXP R_ggml_flash_attn_ext_get_prec(SEXP tensor_ptr) {
     struct ggml_tensor * tensor = (struct ggml_tensor *) R_ExternalPtrAddr(tensor_ptr);
@@ -4754,8 +5072,17 @@ SEXP R_ggml_log_is_r_enabled(void) {
 // Static flag for R abort handler
 static int r_abort_enabled = 0;
 
+/* Declared here rather than taken from r_ggml_compat.h: this file compiles
+ * with -DR_GGML_IO_IMPL, which switches that header off entirely. */
+extern void (*r_ggml_abort_hook)(void);
+
 // R-compatible abort callback
 static void r_ggml_abort_callback(const char * error_message) {
+    /* Let anything that has been accumulating diagnostics print it first.
+     * Rf_error longjmps, so this is the last point at which any code runs;
+     * ggml reaches here through its own abort callback and never touches
+     * abort(), which is why the hook has to be called from both places. */
+    if (r_ggml_abort_hook) r_ggml_abort_hook();
     if (error_message != NULL) {
         Rf_error("GGML abort: %s", error_message);
     } else {

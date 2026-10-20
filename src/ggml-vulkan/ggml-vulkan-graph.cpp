@@ -3,6 +3,26 @@
 #include <unistd.h>           /* _exit() for ggml_backend_vk_shutdown(hard=1, status) */
 #endif
 
+// Does this tensor sit in a buffer owned by the Vulkan backend?
+//
+// The only safe precondition for casting buffer->context to
+// ggml_backend_vk_buffer_context. A graph handed to this backend may hold
+// tensors that live on the CPU backend -- the scheduler puts an op it cannot
+// run there and leaves its output where it produced it -- and for those the
+// context is a foreign struct or null, so the cast yields a wild pointer.
+//
+// Same identity test as ggml_backend_buffer_is_vk() below, written separately
+// because that one is defined further down this file and callers appear above
+// it. ggml_backend_vk_buffer_type_name is forward-declared in
+// ggml-vulkan-device.cpp, which precedes this file in the translation unit.
+static inline bool vk_tensor_is_vk_buffer(const ggml_tensor * t) {
+    return t != nullptr
+        && t->buffer != nullptr
+        && t->buffer->buft != nullptr
+        && t->buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name
+        && t->buffer->context != nullptr;
+}
+
 static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx) {
 
     if (subctx) {
@@ -49,6 +69,51 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
 }
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
+
+// GGML_VK_TRACE_ORDER=1: diagnostics for graph_optimize reordering + barrier
+// placement. Printed through GGML_LOG_INFO -- std::cerr is a null stream in
+// this build (ggml-vulkan-device.cpp), so GGML_VK_SYNC_LOGGER prints nothing.
+static bool ggml_vk_trace_order() {
+    static const bool on = getenv("GGML_VK_TRACE_ORDER") != nullptr;
+    return on;
+}
+
+// "[buf:base+size)" for a Vulkan-resident tensor, "-" otherwise.
+static std::string ggml_vk_trace_range(const ggml_tensor * t) {
+    if (t == nullptr || !vk_tensor_is_vk_buffer(t)) {
+        return "-";
+    }
+    ggml_backend_vk_buffer_context * bc = (ggml_backend_vk_buffer_context *)t->buffer->context;
+    char s[96];
+    snprintf(s, sizeof(s), "[%p:%zu+%zu)", (void *)bc->dev_buffer.get(),
+             (size_t)(vk_tensor_offset(t) + t->view_offs), ggml_nbytes(t));
+    return s;
+}
+
+// After reordering: every source (and the view_src it aliases) that is itself
+// a node of this graph must come earlier. Prints the order and each violation.
+static void ggml_vk_trace_check_order(const ggml_cgraph * graph) {
+    std::map<const ggml_tensor *, int> pos;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        pos[graph->nodes[i]] = i;
+    }
+    int bad = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * n = graph->nodes[i];
+        GGML_LOG_INFO("[vk-order] %3d %-12s %s\n", i, ggml_op_name(n->op), n->name);
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            for (const ggml_tensor * p = n->src[s]; p != nullptr; p = p->view_src) {
+                auto it = pos.find(p);
+                if (it != pos.end() && it->second >= i) {
+                    GGML_LOG_INFO("[vk-order] VIOLATION: node %d '%s' reads '%s' produced at %d\n",
+                                  i, n->name, p->name, it->second);
+                    bad++;
+                }
+            }
+        }
+    }
+    GGML_LOG_INFO("[vk-order] %d nodes, %d violation(s)\n", graph->n_nodes, bad);
+}
 
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
@@ -109,11 +174,33 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             if (unsynced_nodes.size() == 0) {
                 return false;
             }
+            // Only a VULKAN buffer may be cast to ggml_backend_vk_buffer_context.
+            // Testing buffer != nullptr is not enough and was the bug here: this
+            // graph holds tensors whose buffer belongs to the CPU backend (a
+            // CPU-only op's output, e.g. the NMS custom op in an ONNX detector),
+            // and for those ->context is either a different struct or null, so
+            // reading ->dev_buffer through the cast lands on address 0. That is
+            // the `address (nil)` crash on MaskRCNN-12-int8.
+            //
+            // A tensor on another backend also cannot overlap Vulkan device
+            // memory, so skipping it is the correct answer, not just a safe one.
+            //
+            // The !node->buffer test at the top of ggml_vk_build_graph() does
+            // not cover this. It guards cgraph->nodes[node_idx] alone, while
+            // the callers below pass cur_node->src[j] (a source, never tested)
+            // and, when ops are fused, nodes[node_idx + i] for i > 0 (also
+            // never tested).
+            if (!vk_tensor_is_vk_buffer(node)) {
+                return false;
+            }
             auto n_base = vk_tensor_offset(node) + node->view_offs;
             auto n_size = ggml_nbytes(node);
             ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
             vk_buffer a_buf = a_buf_ctx->dev_buffer;
             for (auto &other : unsynced_nodes) {
+                if (other == nullptr || !vk_tensor_is_vk_buffer(other)) {
+                    continue;
+                }
                 ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
                 vk_buffer o_buf = o_buf_ctx->dev_buffer;
                 if (a_buf == o_buf) {
@@ -151,6 +238,22 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             }
         }
 
+        if (ggml_vk_trace_order()) {
+            const ggml_tensor * n = cgraph->nodes[node_idx];
+            std::string srcs;
+            for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
+                if (n->src[j]) {
+                    srcs += " ";
+                    srcs += ggml_vk_trace_range(n->src[j]);
+                }
+            }
+            GGML_LOG_INFO("[vk-sync] %3d %-12s %-20s fused+%d dst %s src%s %s\n",
+                          node_idx, ggml_op_name(n->op), n->name,
+                          ctx->num_additional_fused_ops,
+                          ggml_vk_trace_range(n).c_str(), srcs.c_str(),
+                          need_sync ? "SYNC" : "");
+        }
+
         if (need_sync) {
             if (vk_enable_sync_logger) {
                 std::cerr <<  "sync" << std::endl;
@@ -168,11 +271,18 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // Multiple outputs could be written, e.g. in topk_moe. Add them all to the list.
-            if (ctx->fused_ops_write_mask & (1 << i)) {
+            if ((ctx->fused_ops_write_mask & (1 << i)) && vk_tensor_is_vk_buffer(cur_node)) {
                 ctx->unsynced_nodes_written.push_back(cur_node);
             }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
                 if (!cur_node->src[j]) {
+                    continue;
+                }
+                // Keep non-Vulkan tensors out of the lists entirely. These lists
+                // answer "does this overlap in Vulkan device memory", which a
+                // tensor on another backend cannot; storing one only means a
+                // later node reads it back through the vk context cast and dies.
+                if (!vk_tensor_is_vk_buffer(cur_node->src[j])) {
                     continue;
                 }
                 ctx->unsynced_nodes_read.push_back(cur_node->src[j]);
@@ -317,6 +427,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_silu_back(ctx, compute_ctx, src0, src1, node);
 
         break;
+    case GGML_OP_GELU_BACK:
+        ggml_vk_gelu_back(ctx, compute_ctx, src0, src1, node);
+
+        break;
     case GGML_OP_NORM:
         ggml_vk_norm(ctx, compute_ctx, src0, node);
 
@@ -330,6 +444,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_RMS_NORM_BACK:
         ggml_vk_rms_norm_back(ctx, compute_ctx, src0, src1, node);
+
+        break;
+    // DIVERGENCE from upstream: LayerNorm backward, see ggml_norm_back().
+    case GGML_OP_NORM_BACK:
+        ggml_vk_norm_back(ctx, compute_ctx, src0, src1, node);
 
         break;
     case GGML_OP_L2_NORM:
@@ -359,6 +478,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         case GGML_UNARY_OP_SOFTPLUS:
         case GGML_UNARY_OP_STEP:
         case GGML_UNARY_OP_ROUND:
+        case GGML_UNARY_OP_ROUND_EVEN:
         case GGML_UNARY_OP_CEIL:
         case GGML_UNARY_OP_FLOOR:
         case GGML_UNARY_OP_TRUNC:
@@ -487,6 +607,20 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_conv_2d_dw(ctx, compute_ctx, src0, src1, node);
 
         break;
+    case GGML_OP_QCONV_I32:
+        // Five sources, two of them optional -- read from node rather than the
+        // src0/src1 locals this switch names.
+        ggml_vk_qconv_i32(ctx, compute_ctx, node->src[0], node->src[1],
+                          node->src[2], node->src[3], node->src[4],
+                          node->src[5], node);
+
+        break;
+    case GGML_OP_QMATMUL_I32:
+        // Four sources, the zero point optional -- read from node, as above.
+        ggml_vk_qmatmul_i32(ctx, compute_ctx, node->src[0], node->src[1],
+                            node->src[2], node->src[3], node);
+
+        break;
     case GGML_OP_LEAKY_RELU:
         ggml_vk_leaky_relu(ctx, compute_ctx, src0, node);
 
@@ -542,6 +676,21 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     case GGML_OP_OUT_PROD:
         ggml_vk_out_prod(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_GET_ROWS_BACK:
+        ggml_vk_get_rows_back(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_IM2COL_BACK:
+        ggml_vk_im2col_back(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_FLASH_ATTN_BACK:
+        ggml_vk_flash_attn_back(ctx, compute_ctx, node);
 
         break;
 
@@ -2284,6 +2433,9 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
     for (int i = 0; i < graph->n_nodes; ++i) {
         graph->nodes[i] = new_order[i];
     }
+    if (ggml_vk_trace_order()) {
+        ggml_vk_trace_check_order(graph);
+    }
 }
 
 static void ggml_backend_vk_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -2709,6 +2861,7 @@ static bool ggml_backend_vk_device_supports_op_impl(ggml_backend_dev_t dev, cons
                 case GGML_UNARY_OP_SOFTPLUS:
                 case GGML_UNARY_OP_STEP:
                 case GGML_UNARY_OP_ROUND:
+                case GGML_UNARY_OP_ROUND_EVEN:
                 case GGML_UNARY_OP_CEIL:
                 case GGML_UNARY_OP_FLOOR:
                 case GGML_UNARY_OP_TRUNC:
@@ -3040,7 +3193,11 @@ static bool ggml_backend_vk_device_supports_op_impl(ggml_backend_dev_t dev, cons
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
                    op->type == GGML_TYPE_F32;
         case GGML_OP_SILU_BACK:
+        // DIVERGENCE from upstream: GELU backward, see ggml_gelu_back().
+        case GGML_OP_GELU_BACK:
         case GGML_OP_RMS_NORM_BACK:
+        // DIVERGENCE from upstream: LayerNorm backward, see ggml_norm_back().
+        case GGML_OP_NORM_BACK:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
@@ -3338,6 +3495,76 @@ static bool ggml_backend_vk_device_supports_op_impl(ggml_backend_dev_t dev, cons
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[0]->nb[0] == sizeof(float) &&
                    op->nb[0] == sizeof(float);
+        case GGML_OP_GET_ROWS_BACK:
+            {
+                // ggmlR: backward of embedding lookup. Repeated tokens scatter
+                // into the same row, so this needs atomic float add.
+                ggml_backend_vk_device_context * vk_ctx =
+                    (ggml_backend_vk_device_context *)dev->context;
+                const vk_device& vk_dev = ggml_vk_get_device(vk_ctx->device);
+                if (!vk_dev->atomic_float_add) {
+                    return false;
+                }
+                return op->type == GGML_TYPE_F32 &&
+                       op->src[0]->type == GGML_TYPE_F32 &&
+                       op->src[1] && op->src[1]->type == GGML_TYPE_I32 &&
+                       ggml_is_contiguous(op) &&
+                       ggml_is_contiguous(op->src[0]);
+            }
+        case GGML_OP_IM2COL_BACK:
+            // ggmlR: backward of convolution. The CPU kernel requires both
+            // sources to be F32 and so does this; an F16 kernel is rejected
+            // earlier, when the backward graph is built (see ggml-graph.c).
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op) &&
+                   ggml_is_contiguous(op->src[0]);
+        case GGML_OP_FLASH_ATTN_BACK:
+            {
+                // ggmlR: backward of flash attention (upstream has neither a
+                // working op nor a shader). Without this the whole backward
+                // left the GPU, splitting a training graph once per attention
+                // block.
+                ggml_backend_vk_device_context * vk_ctx =
+                    (ggml_backend_vk_device_context *)dev->context;
+                const vk_device& vk_dev = ggml_vk_get_device(vk_ctx->device);
+
+                // dk and dv are shared by every query row of a kv head, so
+                // they accumulate with atomicAdd.
+                if (!vk_dev->atomic_float_add) {
+                    return false;
+                }
+
+                // The shader caches the softmax row and dP in shared memory,
+                // sized by the pipeline's MAX_M specialisation constant. Longer
+                // kv runs go to the CPU rather than overrun it.
+                if (op->src[1]->ne[1] > 1024) {
+                    return false;
+                }
+
+                // f32 only, and contiguous: the shader indexes with element
+                // strides and assumes rows are packed.
+                if (op->type != GGML_TYPE_F32 ||
+                    op->src[0]->type != GGML_TYPE_F32 ||
+                    op->src[1]->type != GGML_TYPE_F32 ||
+                    op->src[2]->type != GGML_TYPE_F32 ||
+                    op->src[4] == nullptr || op->src[4]->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op->src[1]) ||
+                    !ggml_is_contiguous(op->src[2]) || !ggml_is_contiguous(op->src[4])) {
+                    return false;
+                }
+
+                // The mask, when present, is f16 and contiguous.
+                if (op->src[3] != nullptr &&
+                    (op->src[3]->type != GGML_TYPE_F16 || !ggml_is_contiguous(op->src[3]))) {
+                    return false;
+                }
+
+                return true;
+            }
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             // ggmlR: the shader indexes rows as row*nc, so everything must be
             // contiguous -- the same restriction the CPU kernel asserts.
@@ -3360,6 +3587,200 @@ static bool ggml_backend_vk_device_supports_op_impl(ggml_backend_dev_t dev, cons
                     ggml_is_contiguous(op->src[0]) &&
                     ggml_is_contiguous(op->src[1]) &&
                     ggml_is_contiguous(op));
+            }
+        // ggmlR extension: ONNX QLinearConv. The shader is a line-for-line
+        // port of the host kernel, int16 pair saturation included, so the two
+        // backends agree bit for bit -- see vulkan-shaders/qconv_i32.comp.
+        case GGML_OP_QCONV_I32:
+            {
+                // Says WHICH condition declined the op. Several can, and a bare
+                // false leaves the node on the CPU with nothing to read: the op
+                // simply appears under CPU-only in a profile, exactly as it
+                // would if the backend had never heard of it.
+                //
+                // This is the only place the reason is visible, and it is a
+                // blind spot worth keeping lit: the same shape of bug -- a GPU
+                // path silently declining and no way to see why -- has cost
+                // this op two debugging sessions already.
+                //
+                // Gated on ONNX_TRACE_NODES, the flag the rest of the ONNX
+                // layer already uses, rather than a private one. The value is
+                // read with getenv instead of calling onnx_trace_nodes(),
+                // because the Vulkan backend deliberately does not link
+                // against the ONNX layer; an environment variable is part of
+                // the program's external interface, so sharing it is not the
+                // same as sharing code.
+                static int trace = -1;
+                if (trace < 0) {
+                    const char * e = getenv("ONNX_TRACE_NODES");
+                    trace = (e && *e && *e != '0') ? 1 : 0;
+                }
+                // GGML_LOG_INFO, the same channel the rest of this backend
+                // logs through (the device-caps line, the unsupported-op
+                // summary below). A plain fprintf does NOT work here:
+                // r_ggml_compat.h rewrites it to REvprintf, which routes to
+                // R's console, and a line emitted from the scheduler's call
+                // into supports_op never reached the terminal at all.
+                #define QC_NO(reason) do {                                     \
+                    if (trace) GGML_LOG_INFO(                                  \
+                        "[qconv-supports] '%s': NO (%s) types x=%d w=%d ws=%d " \
+                        "wz=%d bi=%d dst=%d\n", op->name, reason,              \
+                        (int)op->src[0]->type, (int)op->src[1]->type,          \
+                        op->src[2] ? (int)op->src[2]->type : -1,               \
+                        op->src[3] ? (int)op->src[3]->type : -1,               \
+                        op->src[4] ? (int)op->src[4]->type : -1,               \
+                        (int)op->type);                                        \
+                    return false;                                              \
+                } while (0)
+
+                // The kernel indexes x, w and dst as packed arrays, so a view
+                // with any other stride would read neighbouring data and
+                // return plausible numbers rather than fail.
+                if (!ggml_is_contiguous(op))          QC_NO("dst not contiguous");
+                if (!ggml_is_contiguous(op->src[0]))  QC_NO("x not contiguous");
+                if (!ggml_is_contiguous(op->src[1]))  QC_NO("w not contiguous");
+                if (op->type != GGML_TYPE_F32)          QC_NO("dst not f32");
+                if (op->src[0]->type != GGML_TYPE_F32)  QC_NO("x not f32");
+                if (op->src[1]->type != GGML_TYPE_F32)  QC_NO("w not f32");
+
+                // Each table is bound at the type it actually arrives with,
+                // which is not the same for all three: a scale is float, a
+                // zero point is INT8 in the file and comes out F32 because the
+                // loader widens it, and a bias is INT32 by the operator spec
+                // and stays integer. Requiring one type for all of them
+                // declined every convolution in the model over its bias.
+                if (!op->src[2])                         QC_NO("no w_scale");
+                if (op->src[2]->type != GGML_TYPE_F32)   QC_NO("w_scale not f32");
+                if (op->src[3] && op->src[3]->type != GGML_TYPE_F32)
+                                                         QC_NO("w_zp not f32");
+                if (op->src[4] && op->src[4]->type != GGML_TYPE_I32)
+                                                         QC_NO("bias not i32");
+                if (!op->src[5])                         QC_NO("no mult table");
+                if (op->src[5]->type != GGML_TYPE_F32)   QC_NO("mult not f32");
+
+                // One thread per output element, so the grid is the whole
+                // output. A dispatch axis over the driver's limit does not
+                // fail -- it aborts inside the dispatch, which on NVIDIA
+                // (65535) kills the process with nothing printed. Decline and
+                // let the host kernel take it instead.
+                {
+                    ggml_backend_vk_device_context * dev_ctx =
+                        (ggml_backend_vk_device_context *)dev->context;
+                    vk_device vkdev = ggml_vk_get_device(dev_ctx->device);
+                    // ne[3] included: ggml_vk_qconv_i32 dispatches one flat
+                    // grid over batch*C_out*H_out*W_out, so a guard without
+                    // the batch undercounted by that factor -- 51x on
+                    // MaskRCNN's mask head, which is the shape most likely
+                    // to approach the limit.
+                    const uint64_t total  = (uint64_t)op->ne[0] * (uint64_t)op->ne[1] *
+                                            (uint64_t)op->ne[2] * (uint64_t)op->ne[3];
+                    const uint64_t groups = (total + 255u) / 256u;   // local_size_x
+                    if (groups > (uint64_t)vkdev->properties.limits.maxComputeWorkGroupCount[0]) {
+                        QC_NO("output grid above the workgroup limit");
+                    }
+                }
+                #undef QC_NO
+                // Accepted nodes are reported too: "which of the 63 went to the
+                // GPU" is the other half of the same question, and a trace that
+                // only prints refusals cannot distinguish an op that was
+                // accepted from one that was never asked about.
+                if (trace) {
+                    GGML_LOG_INFO("[qconv-supports] '%s': YES\n", op->name);
+                }
+                return true;
+            }
+        // ggmlR extension: ONNX QLinearMatMul, see vulkan-shaders/qmatmul_i32.comp.
+        // Declining is always safe: the host kernel computes the same bits.
+        case GGML_OP_QMATMUL_I32:
+            {
+                static int trace = -1;
+                if (trace < 0) {
+                    const char * e = getenv("ONNX_TRACE_NODES");
+                    trace = (e && *e && *e != '0') ? 1 : 0;
+                }
+                // Same reasoning and channel as QC_NO above.
+                #define QM_NO(reason) do {                                     \
+                    if (trace) GGML_LOG_INFO(                                  \
+                        "[qmatmul-supports] '%s': NO (%s)\n", op->name, reason); \
+                    return false;                                              \
+                } while (0)
+
+                // The escape hatch the direct dispatch had, kept: =0 sends every
+                // QLinearMatMul to the host kernel, for a driver whose integer
+                // arithmetic disagrees.
+                {
+                    static int off = -1;
+                    if (off < 0) {
+                        const char * e = getenv("GGMLR_ONNX_GPU_QMATMUL");
+                        off = (e && e[0] == '0' && e[1] == '\0') ? 1 : 0;
+                    }
+                    if (off) QM_NO("GGMLR_ONNX_GPU_QMATMUL=0");
+                }
+
+                const ggml_tensor * a  = op->src[0];
+                const ggml_tensor * b  = op->src[1];
+                const ggml_tensor * bs = op->src[2];
+                const ggml_tensor * bz = op->src[3];
+                if (!a || !b || !bs)                     QM_NO("missing source");
+                if (op->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 ||
+                    b->type != GGML_TYPE_F32)            QM_NO("not f32");
+                if (bs->type != GGML_TYPE_F32)           QM_NO("b_scale not f32");
+                // The shader binds the zero point as float; an I32 table would
+                // be read as bit patterns. The host kernel takes either.
+                if (bz && bz->type != GGML_TYPE_F32)     QM_NO("b_zp not f32");
+                if (!ggml_is_contiguous(op) || !ggml_is_contiguous(a) ||
+                    !ggml_is_contiguous(b))              QM_NO("not contiguous");
+                // The batch axes, checked rather than assumed: the shader has
+                // no stride for them, so anything but 1 would be computed as
+                // the first slice only. Decided here from the start rather
+                // than copied from QCONV_I32, whose guard left ne[3] out.
+                if (a->ne[2] != 1 || a->ne[3] != 1 || b->ne[2] != 1 || b->ne[3] != 1 ||
+                    op->ne[2] != 1 || op->ne[3] != 1)    QM_NO("batched");
+
+                const uint64_t M = (uint64_t)a->ne[1];
+                const uint64_t N = (uint64_t)b->ne[1];
+                const uint64_t K = (uint64_t)a->ne[0];
+                {
+                    ggml_backend_vk_device_context * dev_ctx =
+                        (ggml_backend_vk_device_context *)dev->context;
+                    vk_device vkdev = ggml_vk_get_device(dev_ctx->device);
+                    // 2D grid of 16x16 blocks: N across, M down. Each axis
+                    // against its own limit -- overshooting aborts inside the
+                    // dispatch on NVIDIA (65535) with nothing printed.
+                    if ((N + 15u) / 16u > (uint64_t)vkdev->properties.limits.maxComputeWorkGroupCount[0] ||
+                        (M + 15u) / 16u > (uint64_t)vkdev->properties.limits.maxComputeWorkGroupCount[1])
+                        QM_NO("output grid above the workgroup limit");
+                }
+
+                // ⚠️ The workgroup test bounds the number of THREADS, not the
+                // WORK. Each thread walks K end to end, so one dispatch costs
+                // M*N*K and that is unbounded whatever the grid. Untiled, the
+                // box head of MaskRCNN (M=1000, N=1024, K=12544, ~96 GB of
+                // traffic) did not finish inside the driver's watchdog on
+                // RX 9070 / RADV: the compute ring timed out and took the
+                // session with it (MODE1 reset, VRAM lost, only
+                // vk::DeviceLostError reaching the process). The 2D tile
+                // (A and B staged, ~6 GB) brought it to ~285 ms.
+                //
+                // A guard, not a verdict on a shape: 5e10 is ~4x that node,
+                // roughly a second of dispatch, well inside the watchdog.
+                // GGMLR_QI32_MAX_WORK overrides it (0 lifts it); a shape over
+                // the cap runs on the host kernel, slower but unable to hang
+                // the device.
+                {
+                    static double max_work = -1.0;
+                    if (max_work < 0.0) {
+                        const char * e = getenv("GGMLR_QI32_MAX_WORK");
+                        max_work = e ? atof(e) : 5e10;
+                    }
+                    if (max_work > 0.0 && (double)M * (double)N * (double)K > max_work)
+                        QM_NO("M*N*K above GGMLR_QI32_MAX_WORK");
+                }
+                #undef QM_NO
+                if (trace) {
+                    GGML_LOG_INFO("[qmatmul-supports] '%s': YES\n", op->name);
+                }
+                return true;
             }
         default:
             return false;

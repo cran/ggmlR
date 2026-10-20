@@ -776,6 +776,7 @@ void process_shaders() {
     string_to_spv("rms_norm_mul_rope_f32_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
     string_to_spv("rms_norm_mul_rope_f32_f16_rte", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"RMS_NORM_ROPE_FUSION", "1"}, {"RTE16", "1"}}));
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("norm_back_f32", "norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
 
     string_to_spv("cpy_f32_f32", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
@@ -932,6 +933,8 @@ void process_shaders() {
     string_to_spv("step_f32",       "step.comp",        {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("round_f16",      "round.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("round_f32",      "round.comp",       {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
+    string_to_spv("round_even_f16", "round_even.comp",  {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
+    string_to_spv("round_even_f32", "round_even.comp",  {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("ceil_f16",       "ceil.comp",        {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
     string_to_spv("ceil_f32",       "ceil.comp",        {{"A_TYPE", "float"},       {"D_TYPE", "float"}});
     string_to_spv("floor_f16",      "floor.comp",       {{"A_TYPE", "float16_t"},   {"D_TYPE", "float16_t"}});
@@ -959,6 +962,7 @@ void process_shaders() {
 
     string_to_spv("leaky_relu_f32", "leaky_relu.comp",  {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("silu_back_f32",  "silu_back.comp",   {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("gelu_back_f32",  "gelu_back.comp",   {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 
     string_to_spv("diag_mask_inf_f32", "diag_mask_inf.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
 
@@ -1005,6 +1009,18 @@ void process_shaders() {
 
     // Pairwise squared-distance matrix: fixed f32 types, no variants.
     string_to_spv("pairwise_dist", "pairwise_dist.comp", {});
+
+    // RoiAlign (ONNX): fixed f32 in and out, no variants.
+    string_to_spv("roi_align", "roi_align.comp", {});
+
+    // QLinearMatMul with an exact i32 accumulator (ONNX): fixed types.
+    string_to_spv("qmatmul_i32", "qmatmul_i32.comp", {});
+
+    // QLinearConv with an exact i32 accumulator (ONNX): fixed types.
+    string_to_spv("qconv_i32", "qconv_i32.comp", {});
+
+    // NonMaxSuppression (ONNX): one workgroup per (batch, class).
+    string_to_spv("nms", "nms.comp", {});
 
     // Tiled fused k-NN: fixed f32 distance / uint index types. WG/K/MAXD are
     // specialization constants set at pipeline creation, not compile-time
@@ -1127,6 +1143,15 @@ void process_shaders() {
     // ggmlR: OUT_PROD, the op both mul_mat gradients are built from.
     string_to_spv("out_prod_f32", "out_prod.comp", {{"A_TYPE", "float"}});
     string_to_spv("cross_entropy_loss_back_f32", "cross_entropy_loss_back.comp", {{"A_TYPE", "float"}});
+    // ggmlR: backward of flash attention. Upstream has no such shader (and no
+    // working op), so attention training fell back to the CPU once per block.
+    string_to_spv("flash_attn_back_f32", "flash_attn_back.comp", {{"A_TYPE", "float"}});
+    // ggmlR: backward of convolution. Without it a conv training graph ran its
+    // backward on the CPU, which measured SLOWER than training on the CPU outright.
+    string_to_spv("im2col_back_f32", "im2col_back.comp", {{"A_TYPE", "float"}});
+    // ggmlR: backward of embedding lookup. Scatter with atomics; contention was
+    // measured first and is incidental, unlike flash_attn_back's.
+    string_to_spv("get_rows_back_f32", "get_rows_back.comp", {{"A_TYPE", "float"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 

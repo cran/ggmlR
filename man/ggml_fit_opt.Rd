@@ -18,7 +18,9 @@ ggml_fit_opt(
   shuffle = TRUE,
   shuffle_all = shuffle,
   callbacks = list(),
-  silent = FALSE
+  silent = FALSE,
+  loss_mask_ne0 = NULL,
+  weight_decay = 0
 )
 }
 \arguments{
@@ -61,6 +63,13 @@ Built-in factories: `ggml_callback_early_stopping()`,
 `stop` (set TRUE to stop training), `lr_ud`, `nepoch`.}
 
 \item{silent}{Whether to suppress per-epoch progress output}
+
+\item{loss_mask_ne0}{Width of the weighted-MSE weight tensor: \code{NULL} or
+1 for per-datapoint weights, or the output width for a per-output mask.
+Ignored by every other loss type.}
+
+\item{weight_decay}{Decoupled weight decay in \code{[0, 1]}, as for
+\code{\link{ggml_opt_init_for_fit}}; 0 turns it off.}
 }
 \value{
 Data frame with columns epoch, train_loss, train_accuracy, val_loss, val_accuracy
@@ -82,6 +91,7 @@ history <- ggml_fit_opt(sched, ctx_compute, inputs, outputs, dataset,
 }
 \seealso{
 Other optimization: 
+\code{\link{ggml_fit_opt_gen}()},
 \code{\link{ggml_fit_opt_multi}()},
 \code{\link{ggml_opt_alloc}()},
 \code{\link{ggml_opt_context_optimizer_type}()},
@@ -137,6 +147,8 @@ Other optimization:
 \code{\link{ggml_opt_result_pred}()},
 \code{\link{ggml_opt_result_reset}()},
 \code{\link{ggml_opt_set_lr}()},
-\code{\link{ggml_opt_static_graphs}()}
+\code{\link{ggml_opt_static_graphs}()},
+\code{\link{ggml_snapshot_free}()},
+\code{\link{ggml_trainer}()}
 }
 \concept{optimization}

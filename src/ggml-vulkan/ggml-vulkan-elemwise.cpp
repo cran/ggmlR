@@ -33,12 +33,19 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src0, src1, src2, dst, op);
 
     if (pipeline == nullptr) {
-        std::cerr << "ggml_vulkan: Error: Missing op: " << ggml_op_name(op) << " for " << ggml_type_name(src0->type);
-        if (src1 != nullptr) {
-            std::cerr << " and " << ggml_type_name(src1->type);
-        }
-        std::cerr << " to " << ggml_type_name(dst->type) << std::endl;
-        GGML_ABORT("fatal error");
+        // ggmlR: through the ggml log, not std::cerr -- cerr is a null stream in
+        // this build (ggml-vulkan-device.cpp), so the op and types were lost and
+        // the abort said only "fatal error".
+        GGML_LOG_ERROR("ggml_vulkan: Error: Missing op: %s for %s%s%s to %s\n",
+                       ggml_op_name(op), ggml_type_name(src0->type),
+                       src1 != nullptr ? " and " : "",
+                       src1 != nullptr ? ggml_type_name(src1->type) : "",
+                       ggml_type_name(dst->type));
+        GGML_ABORT("ggml_vulkan: missing pipeline for %s (%s%s%s -> %s)",
+                   ggml_op_name(op), ggml_type_name(src0->type),
+                   src1 != nullptr ? ", " : "",
+                   src1 != nullptr ? ggml_type_name(src1->type) : "",
+                   ggml_type_name(dst->type));
     }
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -57,6 +64,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     switch (op) {
     case GGML_OP_NORM:
     case GGML_OP_RMS_NORM_BACK:
+    case GGML_OP_NORM_BACK:   // DIVERGENCE from upstream: LayerNorm backward
     case GGML_OP_L2_NORM:
     case GGML_OP_SOFT_MAX:
     case GGML_OP_SOFT_MAX_BACK:
@@ -317,7 +325,8 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         break;
     case GGML_OP_OUT_PROD:
         {
-            // One invocation per dst element, with dims 2 and 3 folded into z.
+            // dst extent; the pipeline's wg_denoms {32, 32, 1} turn it into one
+            // workgroup per 32 x 32 dst tile, with dims 2 and 3 folded into z.
             // Folding keeps z within the workgroup-count limit that matters on
             // NVIDIA (65535 for x, far lower than AMD's), since dims 2/3 are
             // batch-like and small while ne0/ne1 are the wide ones.
@@ -385,19 +394,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
 }
 
 static void ggml_vk_get_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const uint32_t src0_type_size = ggml_type_size(src0->type);
-    const uint32_t src1_type_size = ggml_type_size(src1->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
-
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GET_ROWS,
         vk_op_binary_push_constants_init(src0, src1, dst));
 }
 
 static void ggml_vk_acc(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const uint32_t src0_type_size = ggml_type_size(src0->type);
-    const uint32_t src1_type_size = ggml_type_size(src1->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
-
     int nb1 = dst->op_params[0] / 4; // 4 bytes of float32
     int nb2 = dst->op_params[1] / 4; // 4 bytes of float32
     // int nb3 = dst->op_params[2] / 4; // 4 bytes of float32 - unused
@@ -520,37 +521,21 @@ static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx,
 }
 
 static void ggml_vk_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const uint32_t src0_type_size = ggml_type_size(src0->type);
-    const uint32_t src1_type_size = ggml_type_size(src1->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
-
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_ADD,
         vk_op_binary_push_constants_init(src0, src1, dst, 0, 0.0f, 0.0f, ctx->do_add_rms_partials));
 }
 
 static void ggml_vk_sub(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const uint32_t src0_type_size = ggml_type_size(src0->type);
-    const uint32_t src1_type_size = ggml_type_size(src1->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
-
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SUB,
         vk_op_binary_push_constants_init(src0, src1, dst));
 }
 
 static void ggml_vk_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const uint32_t src0_type_size = ggml_type_size(src0->type);
-    const uint32_t src1_type_size = ggml_type_size(src1->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
-
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_MUL,
         vk_op_binary_push_constants_init(src0, src1, dst));
 }
 
 static void ggml_vk_div(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const uint32_t src0_type_size = ggml_type_size(src0->type);
-    const uint32_t src1_type_size = ggml_type_size(src1->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
-
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_DIV,
         vk_op_binary_push_constants_init(src0, src1, dst));
 }
@@ -946,6 +931,174 @@ static void ggml_vk_out_prod(ggml_backend_vk_context * ctx, vk_context& subctx, 
     });
 }
 
+// ggmlR extension: GGML_OP_GET_ROWS_BACK on the GPU.
+//
+// src0 is the gradient of the gathered rows, src1 the token ids. The result is
+// the gradient of the whole table, so it is zeroed first and then accumulated
+// into with atomics -- a row nothing points at must come out zero, not stale.
+static void ggml_vk_get_rows_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];   // d(gathered rows)
+    const ggml_tensor * src1 = dst->src[1];   // ids
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    const uint32_t nc = (uint32_t) src0->ne[0];
+    const uint32_t nr = (uint32_t) ggml_nelements(src1);
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, src0, src1, nullptr, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_get_rows_back_push_constants pc = {
+        nc,
+        nr,
+        (uint32_t)(dst->nb[1]  / sizeof(float)),
+        (uint32_t)(src0->nb[1] / sizeof(float)),
+        nr * nc,
+    };
+
+    vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src0);
+    vk_subbuffer ids_buf = ggml_vk_tensor_subbuffer(ctx, src1);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, ggml_nbytes(dst));
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const std::array<uint32_t, 3> elements = { nr * nc, 1, 1 };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {src_buf, ids_buf, dst_buf}, pc, elements);
+}
+
+// ggmlR extension: GGML_OP_IM2COL_BACK on the GPU.
+//
+// src0 is the gradient of the im2col output, src1 the convolution kernel (used
+// for its shape only). One invocation per output element -- see the shader for
+// why that direction needs no atomics.
+static void ggml_vk_im2col_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];   // d(im2col output)
+    const ggml_tensor * src1 = dst->src[1];   // kernel
+
+    const int32_t s0 = ggml_get_op_params_i32(dst, 0);
+    const int32_t s1 = ggml_get_op_params_i32(dst, 1);
+    const int32_t p0 = ggml_get_op_params_i32(dst, 2);
+    const int32_t p1 = ggml_get_op_params_i32(dst, 3);
+    const int32_t d0 = ggml_get_op_params_i32(dst, 4);
+    const int32_t d1 = ggml_get_op_params_i32(dst, 5);
+    const bool is_2D = ggml_get_op_params_i32(dst, 6) == 1;
+
+    // dst carries the image's shape: [IW, IH, IC, N] in 2D, [IW, IC, N] in 1D.
+    const uint32_t N  = (uint32_t)(is_2D ? dst->ne[3] : dst->ne[2]);
+    const uint32_t IC = (uint32_t)(is_2D ? dst->ne[2] : dst->ne[1]);
+    const uint32_t IH = (uint32_t)(is_2D ? dst->ne[1] : 1);
+    const uint32_t IW = (uint32_t) dst->ne[0];
+
+    const uint32_t KH = (uint32_t)(is_2D ? src1->ne[1] : 1);
+    const uint32_t KW = (uint32_t) src1->ne[0];
+
+    const uint32_t OH = (uint32_t)(is_2D ? src0->ne[2] : 1);
+    const uint32_t OW = (uint32_t) src0->ne[1];
+
+    const uint32_t ne_total = N * IC * IH * IW;
+
+    ggml_vk_op_f32<vk_op_im2col_back_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_IM2COL_BACK, {
+        N, IC, IH, IW, OH, OW, KH, KW,
+        s0, s1, p0, p1, d0, d1,
+        is_2D ? 1u : 0u,
+        ne_total,
+    });
+}
+
+// ggmlR extension: backward of GGML_OP_FLASH_ATTN_EXT on the GPU.
+//
+// Produces dq | dk | dv packed into one buffer, the layout ggml-graph.c views
+// each part out of. dk and dv accumulate with atomics because every query row
+// of a kv head contributes to them, so the destination is zeroed first.
+static void ggml_vk_flash_attn_back(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * d    = dst->src[4];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    const uint32_t DK = (uint32_t) q->ne[0];
+    const uint32_t DV = (uint32_t) v->ne[0];
+    const uint32_t N  = (uint32_t) q->ne[1];
+    const uint32_t M  = (uint32_t) k->ne[1];
+    const uint32_t H  = (uint32_t) q->ne[2];
+    const uint32_t B  = (uint32_t) q->ne[3];
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    // Packed offsets, in elements, matching ggml_flash_attn_back()'s own
+    // GGML_PAD arithmetic.
+    const uint32_t pad_el = GGML_MEM_ALIGN / sizeof(float);
+    auto pad = [pad_el](uint32_t n) { return ((n + pad_el - 1) / pad_el) * pad_el; };
+
+    const uint32_t dq_off = 0;
+    const uint32_t dk_off = dq_off + pad((uint32_t) ggml_nelements(q));
+    const uint32_t dv_off = dk_off + pad((uint32_t) ggml_nelements(k));
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, q, k, v, dst, dst->op);
+
+    // Profiling: GGMLR_FAB_PROFILE=1..4 swaps in a copy of the shader truncated
+    // after that phase, so the cost of each phase is the difference between
+    // consecutive runs. Unset (the normal case) uses the real pipeline. The
+    // truncated ones produce WRONG gradients by design -- timing only.
+    {
+        const char * prof = getenv("GGMLR_FAB_PROFILE");
+        if (prof != nullptr && prof[0] >= '1' && prof[0] <= '4') {
+            pipeline = ctx->device->pipeline_flash_attn_back_f32_prof[prof[0] - '0'];
+        }
+    }
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    // Strides as element counts: the shader indexes float arrays directly.
+    const uint32_t fs = sizeof(float);
+
+    const vk_op_flash_attn_back_push_constants pc = {
+        DK, DV, N, M, H, B,
+        H / (uint32_t) k->ne[2], B / (uint32_t) k->ne[3],
+        (uint32_t)(q->nb[1]/fs), (uint32_t)(q->nb[2]/fs), (uint32_t)(q->nb[3]/fs),
+        (uint32_t)(k->nb[1]/fs), (uint32_t)(k->nb[2]/fs), (uint32_t)(k->nb[3]/fs),
+        (uint32_t)(v->nb[1]/fs), (uint32_t)(v->nb[2]/fs), (uint32_t)(v->nb[3]/fs),
+        (uint32_t)(d->nb[1]/fs), (uint32_t)(d->nb[2]/fs), (uint32_t)(d->nb[3]/fs),
+        mask ? (uint32_t)(mask->nb[1]/sizeof(ggml_fp16_t)) : 0u,
+        mask ? (uint32_t)(mask->nb[2]/sizeof(ggml_fp16_t)) : 0u,
+        mask ? (uint32_t)(mask->nb[3]/sizeof(ggml_fp16_t)) : 0u,
+        mask ? (uint32_t) mask->ne[2] : 1u,
+        mask ? (uint32_t) mask->ne[3] : 1u,
+        dq_off, dk_off, dv_off,
+        scale,
+        mask ? 1u : 0u,
+    };
+
+    vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
+    vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, d);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    // The mask binding must be valid even when there is no mask; point it at q.
+    vk_subbuffer m_buf = mask ? ggml_vk_tensor_subbuffer(ctx, mask) : q_buf;
+
+    // Zero the destination: dk and dv are accumulated into it with atomicAdd,
+    // and dq is written per row, so nothing may carry over from a previous run.
+    ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, ggml_nbytes(dst));
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    // One workgroup per query row; the pipeline's workgroup is BLOCK_SIZE wide.
+    const std::array<uint32_t, 3> elements = { N * H * B * 128u, 1, 1 };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {q_buf, k_buf, v_buf, m_buf, d_buf, dst_buf}, pc, elements);
+}
+
 // ggmlR extension: GGML_OP_CROSS_ENTROPY_LOSS_BACK on the GPU.
 //
 //     dst[row] = (softmax(logits[row]) - labels[row]) * grad[0] / nrows
@@ -1025,10 +1178,6 @@ static void ggml_vk_opt_step_sgd(ggml_backend_vk_context * ctx, vk_context& subc
 static void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     int * op_params = (int *)dst->op_params;
 
-    const uint32_t src0_type_size = ggml_type_size(src0->type);
-    const uint32_t src1_type_size = ggml_type_size(src1->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
-
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_CONCAT,
         vk_op_binary_push_constants_init(src0, src1, dst, (uint32_t)ggml_nelements(dst), 0.0f, 0.0f, op_params[0]));
 }
@@ -1077,10 +1226,6 @@ static void ggml_vk_sqrt(ggml_backend_vk_context * ctx, vk_context& subctx, cons
 }
 
 static void ggml_vk_add1(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const uint32_t src0_type_size = ggml_type_size(src0->type);
-    const uint32_t src1_type_size = ggml_type_size(src1->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
-
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_ADD1,
         vk_op_binary_push_constants_init(src0, src1, dst));
 }
@@ -1214,10 +1359,6 @@ static void ggml_vk_cpy(ggml_backend_vk_context * ctx, vk_context& subctx, const
 }
 
 static void ggml_vk_set_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const uint32_t src0_type_size = ggml_type_size(src0->type);
-    const uint32_t src1_type_size = ggml_type_size(src1->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
-
     // Skip empty skip_rows operations. For most ops the empty check at the start
     // of ggml_vk_build_graph is sufficient, but set_rows can have a nonempty dst
     // with empty srcs.
@@ -1234,14 +1375,67 @@ static void ggml_vk_scatter_elements(ggml_backend_vk_context * ctx, vk_context& 
     const ggml_tensor * updates = dst->src[1];
     const ggml_tensor * indices = dst->src[2];
 
-    const uint32_t upd_type_size = ggml_type_size(updates->type);
-    const uint32_t idx_type_size = ggml_type_size(indices->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
+    /* TEMPORARY probe: does supports_op promise more than this function can
+     * keep?  It validates only `reduction` and dst type, never src[0] -- yet
+     * step 1 below copies device-to-device out of src[0], which requires it to
+     * live in a Vulkan buffer.  Printed before the first subbuffer call so the
+     * line survives a fault raised inside it. */
+    if (getenv("GGMLR_TRACE_SCATTER")) {
+        /* GGML_LOG_INFO, never fprintf(stderr, ...): r_ggml_compat.h redirects
+         * `stderr` to a sentinel pointer AND `fprintf` to a wrapper that knows
+         * about it.  In this translation unit only the first half applies, so a
+         * direct fprintf hands the sentinel (0x1) to libc as a FILE* and
+         * segfaults inside vfprintf -- measured, with the probe's own format
+         * string in frame #0. */
+        GGML_LOG_INFO(
+            "[scatter] dst='%s' ne=[%lld,%lld,%lld,%lld] cont=%d\n"
+            "          data='%s' buf=%p buft='%s' cont=%d type=%s ne=[%lld,%lld,%lld,%lld]\n"
+            "          upd ='%s' buf=%p buft='%s' cont=%d type=%s\n"
+            "          idx ='%s' buf=%p buft='%s' cont=%d type=%s\n",
+            dst->name,
+            (long long)dst->ne[0], (long long)dst->ne[1],
+            (long long)dst->ne[2], (long long)dst->ne[3],
+            ggml_is_contiguous(dst) ? 1 : 0,
+            data->name, (void *)data->buffer,
+            data->buffer ? ggml_backend_buft_name(data->buffer->buft) : "(null)",
+            ggml_is_contiguous(data) ? 1 : 0, ggml_type_name(data->type),
+            (long long)data->ne[0], (long long)data->ne[1],
+            (long long)data->ne[2], (long long)data->ne[3],
+            updates->name, (void *)updates->buffer,
+            updates->buffer ? ggml_backend_buft_name(updates->buffer->buft) : "(null)",
+            ggml_is_contiguous(updates) ? 1 : 0, ggml_type_name(updates->type),
+            indices->name, (void *)indices->buffer,
+            indices->buffer ? ggml_backend_buft_name(indices->buffer->buft) : "(null)",
+            ggml_is_contiguous(indices) ? 1 : 0, ggml_type_name(indices->type));
+    }
 
     /* Step 1: copy data → dst buffer */
     {
         vk_subbuffer src_sb = ggml_vk_tensor_subbuffer(ctx, data, true);
         vk_subbuffer dst_sb = ggml_vk_tensor_subbuffer(ctx, dst,  true);
+
+        /* TEMPORARY probe, part 2: are the subbuffer offsets rounded down?
+         *
+         * ggml_vk_tensor_subbuffer(allow_misalign=true) rounds `offset` DOWN to
+         * minStorageBufferOffsetAlignment and adds the same slack to `size`.
+         * The copy below then pairs those rounded offsets with a RAW length
+         * (ggml_nbytes), which is the one mismatch worth measuring: every other
+         * copy_async caller in the tree pairs raw offsets with a raw length
+         * (ggml-vulkan-graph.cpp:1193).  If raw != rounded here, the copy runs
+         * off the end of its region by exactly that difference. */
+        if (getenv("GGMLR_TRACE_SCATTER")) {
+            const size_t src_raw = vk_tensor_offset(data) + data->view_offs;
+            const size_t dst_raw = vk_tensor_offset(dst)  + dst->view_offs;
+            GGML_LOG_INFO(
+                "[scatter-off] align=%zu nbytes=%zu\n"
+                "          src raw=%zu sb.off=%zu delta=%zu sb.size=%zu\n"
+                "          dst raw=%zu sb.off=%zu delta=%zu sb.size=%zu\n",
+                (size_t)ctx->device->properties.limits.minStorageBufferOffsetAlignment,
+                ggml_nbytes(data),
+                src_raw, src_sb.offset, src_raw - src_sb.offset, src_sb.size,
+                dst_raw, dst_sb.offset, dst_raw - dst_sb.offset, dst_sb.size);
+        }
+
         ggml_vk_buffer_copy_async(subctx, dst_sb.buffer, dst_sb.offset,
                                            src_sb.buffer, src_sb.offset,
                                            ggml_nbytes(data));
@@ -1256,12 +1450,35 @@ static void ggml_vk_scatter_elements(ggml_backend_vk_context * ctx, vk_context& 
     }
 
     /* Step 2: run scatter shader — pass updates as src0, indices as src1 */
-    ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, updates, indices, nullptr, nullptr, dst, GGML_OP_SCATTER_ELEMENTS,
-        vk_op_binary_push_constants_init(updates, indices, dst, 0, 0.0f, 0.0f, ((int32_t *)dst->op_params)[1]));
+    {
+        vk_op_binary_push_constants pc =
+            vk_op_binary_push_constants_init(updates, indices, dst, 0, 0.0f, 0.0f,
+                                             ((int32_t *)dst->op_params)[1]);
+        if (getenv("GGMLR_TRACE_SCATTER")) {
+            /* What the shader will actually see.  `total` is recomputed here
+             * exactly as the shader computes it, because that product -- not
+             * ggml_nelements(updates) -- is what bounds its loop, and a
+             * mismatch between the two is invisible from either side alone. */
+            GGML_LOG_INFO(
+                "[scatter-pc] ne=%u ne00..03=%u,%u,%u,%u total=%u "
+                "ne20..22=%u,%u,%u axis=%d misalign=0x%x\n",
+                pc.ne, pc.ne00, pc.ne01, pc.ne02, pc.ne03,
+                pc.ne00 * pc.ne01 * pc.ne02 * pc.ne03,
+                pc.ne20, pc.ne21, pc.ne22, pc.param3, pc.misalign_offsets);
+        }
+        /* std::move: ggml_vk_op_f32 takes PC&&, so a named local has to be
+         * handed over as an rvalue. */
+        ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, updates, indices, nullptr, nullptr, dst,
+                                                    GGML_OP_SCATTER_ELEMENTS, std::move(pc));
+    }
 }
 
 static void ggml_vk_silu_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SILU_BACK, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f, 0.0f, 0.0f });
+}
+
+static void ggml_vk_gelu_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GELU_BACK, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f, 0.0f, 0.0f });
 }
 
 static void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -1356,10 +1573,6 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
         src0 = src1 = dst->src[0];
     }
 
-    const uint32_t src0_type_size = ggml_type_size(src0->type);
-    const uint32_t src1_type_size = ggml_type_size(src1->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
-
     uint32_t param3 = ctx->do_add_rms_partials ? ggml_vk_rms_num_partials(ctx, dst) : 0;
 
     vk_op_binary_push_constants bin = vk_op_binary_push_constants_init(src0, src1, dst, 0, op_params[0], 0.0f, (int32_t)param3);
@@ -1450,6 +1663,12 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, 
 static void ggml_vk_rms_norm_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     float * op_params = (float *)dst->op_params;
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM_BACK, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], op_params[0], 0.0f, 0.0f, 0.0f });
+}
+
+// DIVERGENCE from upstream: LayerNorm backward, see ggml_norm_back().
+static void ggml_vk_norm_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    float * op_params = (float *)dst->op_params;
+    ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_NORM_BACK, { (uint32_t)src0->ne[0], (uint32_t)src0->ne[1], op_params[0], 0.0f, 0.0f, 0.0f });
 }
 
 static void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -1936,10 +2155,6 @@ static void ggml_vk_count_equal(ggml_backend_vk_context * ctx, vk_context& subct
 }
 
 static void ggml_vk_solve_tri(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const uint32_t src0_type_size = ggml_type_size(src0->type);
-    const uint32_t src1_type_size = ggml_type_size(src1->type);
-    const uint32_t dst_type_size = ggml_type_size(dst->type);
-
     ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SOLVE_TRI,
         vk_op_binary_push_constants_init(src0, src1, dst));
 }
@@ -2212,6 +2427,148 @@ static void ggml_vk_conv_2d_dw(ggml_backend_vk_context * ctx, vk_context& subctx
     GGML_ASSERT(src1->ne[3] == p.batches);
 
     ggml_vk_op_f32(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_CONV_2D_DW, std::move(p));
+}
+
+// ggmlR extension: GGML_OP_QCONV_I32 (ONNX QLinearConv).
+//
+// Written out rather than routed through ggml_vk_op_f32 for two reasons: the op
+// has FIVE sources where that helper carries four, and its shader takes its own
+// push constant block rather than the shared one.
+//
+// Everything is read from where the scheduler already put it -- no buffer is
+// created, filled or destroyed here, and there is no fence wait. An earlier
+// direct-dispatch version of this shader did all of that per call, re-uploading
+// the weights every time and blocking on the result; that is what running as a
+// real op removes.
+static void ggml_vk_qconv_i32(ggml_backend_vk_context * ctx, vk_context& subctx,
+                              const ggml_tensor * src0, const ggml_tensor * src1,
+                              const ggml_tensor * src2, const ggml_tensor * src3,
+                              const ggml_tensor * src4, const ggml_tensor * src5,
+                              ggml_tensor * dst) {
+    GGML_ASSERT(src0 != nullptr && src1 != nullptr && src2 != nullptr);
+    GGML_ASSERT(src5 != nullptr);   // the precomputed multiplier is required
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    vk_op_qconv_i32_push_constants p{};
+    p.W_in      = (uint32_t)src0->ne[0];
+    p.H_in      = (uint32_t)src0->ne[1];
+    p.C_in      = (uint32_t)src0->ne[2];
+    p.W_out     = (uint32_t)dst->ne[0];
+    p.H_out     = (uint32_t)dst->ne[1];
+    p.C_out     = (uint32_t)dst->ne[2];
+    p.KW        = (uint32_t)src1->ne[0];
+    p.KH        = (uint32_t)src1->ne[1];
+    p.stride_w  = ggml_get_op_params_i32(dst, 0);
+    p.stride_h  = ggml_get_op_params_i32(dst, 1);
+    p.pad_w     = ggml_get_op_params_i32(dst, 2);
+    p.pad_h     = ggml_get_op_params_i32(dst, 3);
+    p.dil_w     = ggml_get_op_params_i32(dst, 4);
+    p.dil_h     = ggml_get_op_params_i32(dst, 5);
+    p.x_scale   = ggml_get_op_params_f32(dst, 6);
+    p.y_scale   = ggml_get_op_params_f32(dst, 7);
+    p.x_zp      = ggml_get_op_params_i32(dst, 8);
+    p.y_zp      = ggml_get_op_params_i32(dst, 9);
+    p.out_lo    = ggml_get_op_params_f32(dst, 10);
+    p.out_hi    = ggml_get_op_params_f32(dst, 11);
+    p.n_w_scale = (uint32_t)src2->ne[0];
+    p.n_w_zp    = src3 ? (uint32_t)src3->ne[0] : 1u;
+    p.has_bias  = src4 ? 1u : 0u;
+    p.has_w_zp  = src3 ? 1u : 0u;
+    p.N_batch   = (uint32_t)dst->ne[3];
+    // The shader steps x and dst by one image using the shapes above, which is
+    // only the right address when both are packed at that stride.
+    GGML_ASSERT(src0->ne[3] == dst->ne[3]);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+    {
+        static int dbg = -1;
+        if (dbg < 0) {
+            const char * e = getenv("GGMLR_QCONV_DEBUG_ACC");
+            dbg = (e && *e) ? atoi(e) : 0;
+        }
+        p.debug_acc = (uint32_t)dbg;
+    }
+
+    // One thread per output element, the whole reduction inside it: the int16
+    // pair saturation this reproduces is order-dependent, so a workgroup
+    // cooperating on one output would pair different neighbours and diverge.
+    //
+    // ne[3] is part of the count, not a loop around the dispatch: every output
+    // element is independent, so one flat grid over batch*C_out*H_out*W_out
+    // keeps the threads busy when H_out*W_out is small and the batch is large --
+    // which is exactly the mask-head shape (28x28 over 51 images).
+    const uint32_t total = (uint32_t)(dst->ne[0] * dst->ne[1] * dst->ne[2] * dst->ne[3]);
+    const std::array<uint32_t, 3> elements = { total, 1, 1 };
+
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_qconv_i32, 1);
+
+    vk_subbuffer x_buf  = ggml_vk_tensor_subbuffer(ctx, src0, true);
+    vk_subbuffer w_buf  = ggml_vk_tensor_subbuffer(ctx, src1, true);
+    vk_subbuffer ws_buf = ggml_vk_tensor_subbuffer(ctx, src2, true);
+    // Bindings 3 and 4 must be filled even when the tensor is absent: an
+    // unwritten descriptor is not a legal source, and the shader gates every
+    // read behind n_w_zp / has_bias rather than skipping the binding. w_scale
+    // stands in because it is always present and always float.
+    vk_subbuffer wz_buf = src3 ? ggml_vk_tensor_subbuffer(ctx, src3, true) : ws_buf;
+    vk_subbuffer bi_buf = src4 ? ggml_vk_tensor_subbuffer(ctx, src4, true) : ws_buf;
+    vk_subbuffer mt_buf = ggml_vk_tensor_subbuffer(ctx, src5, true);
+    vk_subbuffer d_buf  = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_qconv_i32,
+                              { x_buf, w_buf, ws_buf, wz_buf, bi_buf, d_buf, mt_buf },
+                              p, elements);
+}
+
+// ggmlR extension: GGML_OP_QMATMUL_I32 (ONNX QLinearMatMul).
+//
+// Same shape as ggml_vk_qconv_i32 above and for the same reason: it reads
+// every operand where the scheduler put it. The direct dispatch this replaces
+// created five device buffers, uploaded A and B (~114 MB on MaskRCNN's box
+// head), waited on a fence and read the result back on every call -- about
+// 10% of the node's time, the other 90% being the shader, which is unchanged.
+static void ggml_vk_qmatmul_i32(ggml_backend_vk_context * ctx, vk_context& subctx,
+                                const ggml_tensor * src0, const ggml_tensor * src1,
+                                const ggml_tensor * src2, const ggml_tensor * src3,
+                                ggml_tensor * dst) {
+    GGML_ASSERT(src0 != nullptr && src1 != nullptr && src2 != nullptr);
+    GGML_ASSERT(dst->buffer != nullptr);
+    // 2-D only (the builder asserts the same), and packed: the shader indexes
+    // a[m*K + k] and bmat[n*K + k].
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+                ggml_is_contiguous(dst));
+
+    vk_op_qmatmul_i32_push_constants p{};
+    p.M         = (uint32_t)src0->ne[1];
+    p.N         = (uint32_t)src1->ne[1];
+    p.K         = (uint32_t)src0->ne[0];
+    p.a_scale   = ggml_get_op_params_f32(dst, 0);
+    p.y_scale   = ggml_get_op_params_f32(dst, 1);
+    p.a_zp      = ggml_get_op_params_i32(dst, 2);
+    p.y_zp      = ggml_get_op_params_i32(dst, 3);
+    p.out_lo    = ggml_get_op_params_f32(dst, 4);
+    p.out_hi    = ggml_get_op_params_f32(dst, 5);
+    p.b_zp_any  = (uint32_t)ggml_get_op_params_i32(dst, 6);
+    p.n_b_scale = (uint32_t)src2->ne[0];
+    p.n_b_zp    = src3 ? (uint32_t)src3->ne[0] : 1u;
+
+    // 2D: N across, M down, matching the shader's 16x16 block tile and the
+    // pipeline's {16,16,1} wg_denoms. A flat element count would hand the
+    // shader one long row of blocks and every m would come out zero.
+    const std::array<uint32_t, 3> elements = { p.N, p.M, 1 };
+
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_qmatmul_i32, 1);
+
+    vk_subbuffer a_buf  = ggml_vk_tensor_subbuffer(ctx, src0, true);
+    vk_subbuffer b_buf  = ggml_vk_tensor_subbuffer(ctx, src1, true);
+    vk_subbuffer bs_buf = ggml_vk_tensor_subbuffer(ctx, src2, true);
+    // Binding 3 must be filled even with no zero-point tensor: an unwritten
+    // descriptor is not a legal source. b_scale stands in; the builder sets
+    // b_zp_any = 0 in that case, and the shader reads b_zp only when it is set.
+    vk_subbuffer bz_buf = src3 ? ggml_vk_tensor_subbuffer(ctx, src3, true) : bs_buf;
+    vk_subbuffer d_buf  = ggml_vk_tensor_subbuffer(ctx, dst, true);
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_qmatmul_i32,
+                              { a_buf, b_buf, bs_buf, bz_buf, d_buf },
+                              p, elements);
 }
 
 static void ggml_vk_leaky_relu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {

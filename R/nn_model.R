@@ -117,19 +117,76 @@ ggml_pop_layer <- function(model) {
 # Freeze / unfreeze weights
 # ============================================================================
 
+# Which layers a freeze call means. layer_names and prefix select by name (a
+# layer matching either is selected, and each must select something); without
+# them from/to select by index. Shared by every freeze/unfreeze method, so the
+# rules are the same everywhere.
+nn_layer_name_of <- function(l) if (!is.null(l$name)) l$name else ""
+
+nn_match_names <- function(nms, layer_names, prefix) {
+  hit <- rep(FALSE, length(nms))
+  if (!is.null(layer_names)) {
+    missing <- setdiff(layer_names, nms)
+    if (length(missing))
+      stop("No layers found with names: ", paste(missing, collapse = ", "),
+           call. = FALSE)
+    hit <- hit | nms %in% layer_names
+  }
+  for (p in prefix) {
+    by_p <- startsWith(nms, p)
+    if (!any(by_p))
+      stop("No layer name starts with '", p, "'", call. = FALSE)
+    hit <- hit | by_p
+  }
+  hit
+}
+
+nn_select_seq_layers <- function(model, from, to, layer_names, prefix) {
+  n <- length(model$layers)
+  if (n == 0L) stop("Model has no layers.", call. = FALSE)
+  if (!is.null(layer_names) || !is.null(prefix)) {
+    nms <- vapply(model$layers, nn_layer_name_of, character(1))
+    return(which(nn_match_names(nms, layer_names, prefix)))
+  }
+  from <- as.integer(from); to <- as.integer(to)
+  if (from < 1L || to > n || from > to)
+    stop("Invalid range: from=", from, " to=", to, " (model has ", n, " layers).",
+         call. = FALSE)
+  from:to
+}
+
+# Functional: the non-input nodes selected by name or prefix; all of them when
+# neither is given.
+nn_select_fun_nodes <- function(model, layer_names, prefix) {
+  nodes <- Filter(function(nd) !is.null(nd$node_type) && nd$node_type != "input",
+                  nn_topo_sort(model$outputs))
+  if (is.null(layer_names) && is.null(prefix)) return(nodes)
+  nms <- vapply(nodes, function(nd)
+    if (!is.null(nd$config$name)) nd$config$name else "", character(1))
+  nodes[nn_match_names(nms, layer_names, prefix)]
+}
+
 #' Freeze Layer Weights
 #'
 #' Sets \code{trainable = FALSE} on layers, preventing their weights from being
-#' updated during training. Accepts optional \code{from} / \code{to} to freeze
-#' a range of layers by index, or \code{layer_names} to freeze by name.
-#' If none are provided, all layers are frozen.
+#' updated during training. Layers are chosen by \code{layer_names} and/or
+#' \code{prefix}; without either, by the index range \code{from} / \code{to}
+#' (sequential models), or all of them.
 #'
 #' @param model A model object (ggml_sequential_model or ggml_functional_model)
 #' @param from Integer index of the first layer to freeze (default: 1)
 #' @param to Integer index of the last layer to freeze (default: last layer)
 #' @param layer_names Character vector of layer names to freeze (overrides from/to)
+#' @param prefix Character vector: freeze every layer whose name starts with one
+#'   of these -- a whole transformer block, say: \code{prefix = "block1_"}
+#'   reaches \code{block1_norm1}, \code{block1_attn}, \code{block1_norm2},
+#'   \code{block1_ff1} and \code{block1_ff2} -- not \code{block10_*}. Given with
+#'   \code{layer_names}, the selection is the union of the two; every name and
+#'   every prefix must match at least one layer, or the call stops.
 #' @param ... Additional arguments passed to methods
 #' @return The model with selected layers frozen.
+#' @seealso \code{\link{ggml_freeze_bn_stats}} to fix batch-norm statistics,
+#'   which freezing the weights does not do.
 #' @export
 #' @examples
 #' \donttest{
@@ -144,7 +201,7 @@ ggml_pop_layer <- function(model) {
 #' model <- ggml_freeze_weights(model, from = 1, to = 1)
 #' }
 ggml_freeze_weights <- function(model, from = 1L, to = length(model$layers),
-                                 layer_names = NULL, ...) {
+                                 layer_names = NULL, prefix = NULL, ...) {
   UseMethod("ggml_freeze_weights")
 }
 
@@ -152,54 +209,37 @@ ggml_freeze_weights <- function(model, from = 1L, to = length(model$layers),
 ggml_freeze_weights.ggml_sequential_model <- function(model,
                                                         from = 1L,
                                                         to = length(model$layers),
-                                                        layer_names = NULL, ...) {
-  n <- length(model$layers)
-  if (n == 0L) stop("Model has no layers.")
-  if (!is.null(layer_names)) {
-    names_all <- vapply(model$layers, function(l) if (!is.null(l$name)) l$name else "", character(1))
-    idx <- which(names_all %in% layer_names)
-    if (length(idx) == 0L) stop("No layers found with names: ", paste(layer_names, collapse = ", "))
-    for (i in idx) model$layers[[i]]$trainable <- FALSE
-  } else {
-    from <- as.integer(from); to <- as.integer(to)
-    if (from < 1L || to > n || from > to)
-      stop("Invalid range: from=", from, " to=", to, " (model has ", n, " layers).")
-    for (i in from:to) model$layers[[i]]$trainable <- FALSE
-  }
+                                                        layer_names = NULL,
+                                                        prefix = NULL, ...) {
+  for (i in nn_select_seq_layers(model, from, to, layer_names, prefix))
+    model$layers[[i]]$trainable <- FALSE
   model
 }
 
 #' @export
 ggml_freeze_weights.ggml_functional_model <- function(model,
                                                         from = NULL, to = NULL,
-                                                        layer_names = NULL, ...) {
-  nodes <- nn_topo_sort(model$outputs)
+                                                        layer_names = NULL,
+                                                        prefix = NULL, ...) {
   frozen <- if (is.null(model$frozen_nodes)) list() else model$frozen_nodes
-  if (!is.null(layer_names)) {
-    for (node in nodes) {
-      nm <- if (!is.null(node$config$name)) node$config$name else ""
-      if (nm %in% layer_names) frozen[[node$id]] <- FALSE
-    }
-  } else {
-    for (node in nodes) {
-      if (!is.null(node$node_type) && node$node_type != "input")
-        frozen[[node$id]] <- FALSE
-    }
-  }
+  for (node in nn_select_fun_nodes(model, layer_names, prefix))
+    frozen[[node$id]] <- FALSE
   model$frozen_nodes <- frozen
   model
 }
 
 #' Unfreeze Layer Weights
 #'
-#' Sets \code{trainable = TRUE} on layers. Accepts optional \code{from} / \code{to}
-#' to unfreeze a range of layers, or \code{layer_names} to unfreeze by name.
-#' If none are provided, all layers are unfrozen.
+#' Sets \code{trainable = TRUE} on layers, chosen as in
+#' \code{\link{ggml_freeze_weights}}: by \code{layer_names} and/or
+#' \code{prefix}, else by \code{from} / \code{to}, else all of them.
 #'
 #' @param model A model object (ggml_sequential_model or ggml_functional_model)
 #' @param from Integer index of the first layer to unfreeze (default: 1)
 #' @param to Integer index of the last layer to unfreeze (default: last layer)
 #' @param layer_names Character vector of layer names to unfreeze (overrides from/to)
+#' @param prefix Character vector: unfreeze every layer whose name starts with
+#'   one of these. With \code{layer_names}, the union of the two.
 #' @param ... Additional arguments passed to methods
 #' @return The model with selected layers unfrozen.
 #' @export
@@ -213,7 +253,7 @@ ggml_freeze_weights.ggml_functional_model <- function(model,
 #' model <- ggml_unfreeze_weights(model, from = 2)  # unfreeze last layer only
 #' }
 ggml_unfreeze_weights <- function(model, from = 1L, to = length(model$layers),
-                                   layer_names = NULL, ...) {
+                                   layer_names = NULL, prefix = NULL, ...) {
   UseMethod("ggml_unfreeze_weights")
 }
 
@@ -221,42 +261,140 @@ ggml_unfreeze_weights <- function(model, from = 1L, to = length(model$layers),
 ggml_unfreeze_weights.ggml_sequential_model <- function(model,
                                                           from = 1L,
                                                           to = length(model$layers),
-                                                          layer_names = NULL, ...) {
-  n <- length(model$layers)
-  if (n == 0L) stop("Model has no layers.")
-  if (!is.null(layer_names)) {
-    names_all <- vapply(model$layers, function(l) if (!is.null(l$name)) l$name else "", character(1))
-    idx <- which(names_all %in% layer_names)
-    if (length(idx) == 0L) stop("No layers found with names: ", paste(layer_names, collapse = ", "))
-    for (i in idx) model$layers[[i]]$trainable <- TRUE
-  } else {
-    from <- as.integer(from); to <- as.integer(to)
-    if (from < 1L || to > n || from > to)
-      stop("Invalid range: from=", from, " to=", to, " (model has ", n, " layers).")
-    for (i in from:to) model$layers[[i]]$trainable <- TRUE
-  }
+                                                          layer_names = NULL,
+                                                          prefix = NULL, ...) {
+  for (i in nn_select_seq_layers(model, from, to, layer_names, prefix))
+    model$layers[[i]]$trainable <- TRUE
   model
 }
 
 #' @export
 ggml_unfreeze_weights.ggml_functional_model <- function(model,
                                                           from = NULL, to = NULL,
-                                                          layer_names = NULL, ...) {
-  frozen <- if (is.null(model$frozen_nodes)) list() else model$frozen_nodes
-  if (!is.null(layer_names)) {
-    nodes <- nn_topo_sort(model$outputs)
-    ids_to_unfreeze <- vapply(nodes, function(n) {
-      nm <- if (!is.null(n$config$name)) n$config$name else ""
-      if (nm %in% layer_names) n$id else ""
-    }, character(1))
-    ids_to_unfreeze <- ids_to_unfreeze[nzchar(ids_to_unfreeze)]
-    for (id in ids_to_unfreeze) frozen[[id]] <- NULL
-  } else {
-    frozen <- list()
+                                                          layer_names = NULL,
+                                                          prefix = NULL, ...) {
+  if (is.null(layer_names) && is.null(prefix)) {
+    model$frozen_nodes <- list()
+    return(model)
   }
+  frozen <- if (is.null(model$frozen_nodes)) list() else model$frozen_nodes
+  for (node in nn_select_fun_nodes(model, layer_names, prefix))
+    frozen[[node$id]] <- NULL
   model$frozen_nodes <- frozen
   model
 }
+
+#' Fix or Release Batch-Norm Statistics
+#'
+#' \code{ggml_freeze_bn_stats()} fixes the running mean and variance of
+#' batch-norm layers: they then normalize with those stored statistics during
+#' training as well as at prediction, and \code{\link{ggml_fit}} no longer
+#' recalibrates them. \code{gamma} and \code{beta} still train unless the layer
+#' is also frozen with \code{\link{ggml_freeze_weights}} -- the usual fine-tuning
+#' setting when batches are small. \code{ggml_unfreeze_bn_stats()} returns the
+#' layers to batch statistics in training and recalibration after a fit, which
+#' is the default.
+#'
+#' Freezing the weights alone does not fix the statistics: a frozen batch-norm
+#' still normalizes each training batch by its own mean and variance, and its
+#' running statistics are still recalibrated after \code{ggml_fit()}.
+#'
+#' The fixed state is saved by \code{\link{ggml_save_model}}. Only sequential
+#' models carry running statistics; the functional \code{batch_norm} is a
+#' per-sample RMS normalization (see \code{\link{ggml_layer_batch_norm}}),
+#' already independent of the batch, and is refused with a message.
+#'
+#' @inheritParams ggml_freeze_weights
+#' @return The model with the selected batch-norm layers changed. Selected
+#'   layers of other types are skipped; a selection with no batch-norm layer
+#'   at all is an error.
+#' @export
+ggml_freeze_bn_stats <- function(model, from = 1L, to = length(model$layers),
+                                 layer_names = NULL, prefix = NULL, ...) {
+  UseMethod("ggml_freeze_bn_stats")
+}
+
+#' @rdname ggml_freeze_bn_stats
+#' @export
+ggml_unfreeze_bn_stats <- function(model, from = 1L, to = length(model$layers),
+                                   layer_names = NULL, prefix = NULL, ...) {
+  UseMethod("ggml_unfreeze_bn_stats")
+}
+
+nn_set_bn_stats_fixed <- function(model, from, to, layer_names, prefix, fixed) {
+  idx <- nn_select_seq_layers(model, from, to, layer_names, prefix)
+  bn  <- idx[vapply(model$layers[idx], function(l) identical(l$type, "batch_norm"),
+                    logical(1))]
+  if (!length(bn))
+    stop("no batch_norm layer among the selected layers", call. = FALSE)
+  for (i in bn) model$layers[[i]]$config$fixed_stats <- fixed
+  model
+}
+
+#' @export
+ggml_freeze_bn_stats.ggml_sequential_model <- function(model, from = 1L,
+                                                         to = length(model$layers),
+                                                         layer_names = NULL,
+                                                         prefix = NULL, ...)
+  nn_set_bn_stats_fixed(model, from, to, layer_names, prefix, TRUE)
+
+#' @export
+ggml_unfreeze_bn_stats.ggml_sequential_model <- function(model, from = 1L,
+                                                           to = length(model$layers),
+                                                           layer_names = NULL,
+                                                           prefix = NULL, ...)
+  nn_set_bn_stats_fixed(model, from, to, layer_names, prefix, FALSE)
+
+nn_bn_stats_functional <- function(fn)
+  stop(fn, "(): a functional model has no batch-norm statistics to fix -- its ",
+       "batch_norm is a per-sample RMS normalization, already independent of ",
+       "the batch. Freeze its gamma and beta with ggml_freeze_weights() instead.",
+       call. = FALSE)
+
+#' @export
+ggml_freeze_bn_stats.ggml_functional_model <- function(model, from = NULL, to = NULL,
+                                                         layer_names = NULL,
+                                                         prefix = NULL, ...)
+  nn_bn_stats_functional("ggml_freeze_bn_stats")
+
+#' @export
+ggml_unfreeze_bn_stats.ggml_functional_model <- function(model, from = NULL, to = NULL,
+                                                           layer_names = NULL,
+                                                           prefix = NULL, ...)
+  nn_bn_stats_functional("ggml_unfreeze_bn_stats")
+
+# Anything else -- ag_* modules above all -- has no layers these marks reach.
+# Without a default method R would stop with "no applicable method", which
+# names neither what is supported nor what to do instead.
+nn_freeze_unsupported <- function(fn, model) {
+  cls <- paste(class(model), collapse = "/")
+  hint <- if (inherits(model, "ag_layer"))
+    paste0(" For ag_* modules, leave the parameters to keep out of the list ",
+           "given to the optimizer (e.g. optimizer_adam(params)).")
+  else ""
+  stop(fn, "() works on models from ggml_model_sequential() and ggml_model(); ",
+       "got an object of class '", cls, "'.", hint, call. = FALSE)
+}
+
+#' @export
+ggml_freeze_weights.default <- function(model, from = 1L, to = length(model$layers),
+                                 layer_names = NULL, prefix = NULL, ...)
+  nn_freeze_unsupported("ggml_freeze_weights", model)
+
+#' @export
+ggml_unfreeze_weights.default <- function(model, from = 1L, to = length(model$layers),
+                                 layer_names = NULL, prefix = NULL, ...)
+  nn_freeze_unsupported("ggml_unfreeze_weights", model)
+
+#' @export
+ggml_freeze_bn_stats.default <- function(model, from = 1L, to = length(model$layers),
+                                 layer_names = NULL, prefix = NULL, ...)
+  nn_freeze_unsupported("ggml_freeze_bn_stats", model)
+
+#' @export
+ggml_unfreeze_bn_stats.default <- function(model, from = 1L, to = length(model$layers),
+                                 layer_names = NULL, prefix = NULL, ...)
+  nn_freeze_unsupported("ggml_unfreeze_bn_stats", model)
 
 # ============================================================================
 # Compile
@@ -288,6 +426,15 @@ ggml_unfreeze_weights.ggml_functional_model <- function(model,
 #' @param loss_weights Optional per-output weights for a multi-output model;
 #'   the optimized total is \code{sum(loss_weights[i] * loss_i)}. Named after
 #'   the output layers or positional. Default: all outputs weighted 1.
+#' @param weight_decay Decoupled weight decay for the optimizer, in \code{[0, 1]};
+#'   0 (the default) turns it off. It is applied to trainable weights only:
+#'   layers frozen with \code{\link{ggml_freeze_weights}} are not decayed.
+#' @param predict_precision Matrix-multiply precision for prediction:
+#'   \code{"default"} (as ggml builds it; f16 tiles on an fp16 Vulkan device)
+#'   or \code{"f32"}. Used by \code{\link{ggml_predict}}, a trainer's
+#'   \code{$predict()} and its snapshots unless a call gives its own
+#'   \code{matmul_precision}; training is unaffected. See the precision section
+#'   of \code{\link{ggml_predict}}.
 #' @return The compiled model (invisibly).
 #' @export
 #' @examples
@@ -305,8 +452,35 @@ ggml_compile <- function(model, optimizer = "adam",
                           loss = "categorical_crossentropy",
                           metrics = c("accuracy"),
                           backend = "auto",
-                          loss_weights = NULL) {
+                          loss_weights = NULL,
+                          weight_decay = 0,
+                          predict_precision = "default") {
   UseMethod("ggml_compile")
+}
+
+# Matrix-multiply precision: "default" leaves each multiply as ggml builds it
+# (f16 tiles on an fp16 Vulkan device), "f32" marks it GGML_PREC_F32.
+NN_MATMUL_PRECISIONS <- c("default", "f32")
+
+nn_check_precision <- function(x, arg) {
+  if (!is.character(x) || length(x) != 1L || !x %in% NN_MATMUL_PRECISIONS)
+    stop("'", arg, "' must be \"default\" or \"f32\"", call. = FALSE)
+  x
+}
+
+# The precision a prediction runs at: the call's argument, then the model's
+# predict_precision, then "default".
+nn_predict_precision <- function(model, override = NULL) {
+  if (!is.null(override)) return(nn_check_precision(override, "matmul_precision"))
+  model$compilation$predict_precision %||% "default"
+}
+
+# Marks every multiply in a built graph with the precision; nothing to do for
+# "default". GGML_PREC_F32 is 10 (ggml.h).
+nn_apply_matmul_precision <- function(graph, precision) {
+  if (identical(precision, "f32"))
+    .Call("R_ggml_graph_set_matmul_prec", graph, 10L, PACKAGE = "ggmlR")
+  invisible(NULL)
 }
 
 # Supported names, shared by both compile() methods. The training code maps
@@ -463,7 +637,9 @@ ggml_compile.ggml_sequential_model <- function(model, optimizer = "adam",
                                                 loss = "categorical_crossentropy",
                                                 metrics = c("accuracy"),
                                                 backend = "auto",
-                                                loss_weights = NULL) {
+                                                loss_weights = NULL,
+                                                weight_decay = 0,
+                                                predict_precision = "default") {
   if (length(model$layers) == 0) {
     stop("Model has no layers. Add layers before compiling.")
   }
@@ -478,6 +654,8 @@ ggml_compile.ggml_sequential_model <- function(model, optimizer = "adam",
          call. = FALSE)
   }
   nn_validate_compilation(optimizer, loss, metrics)
+  weight_decay <- nn_check_weight_decay(weight_decay)
+  predict_precision <- nn_check_precision(predict_precision, "predict_precision")
 
   # 1. Shape inference
   model <- nn_infer_shapes(model)
@@ -529,6 +707,8 @@ ggml_compile.ggml_sequential_model <- function(model, optimizer = "adam",
   model$compilation$optimizer <- optimizer
   model$compilation$loss <- loss
   model$compilation$metrics <- metrics
+  model$compilation$weight_decay <- weight_decay
+  model$compilation$predict_precision <- predict_precision
   # Record requested vs actually-used backend so a silent "auto" -> CPU
   # fallback is inspectable later (see ggml_model_backend()).
   model$compilation$backend_requested <- backend
@@ -545,6 +725,26 @@ ggml_compile.ggml_sequential_model <- function(model, optimizer = "adam",
 # Internal: Build graph with weights for a given batch_size
 # ============================================================================
 
+# A sequential model whose first layer is an embedding is fed token indices.
+nn_seq_takes_indices <- function(model)
+  length(model$layers) > 0L && identical(model$layers[[1L]]$type, "embedding")
+
+# The vocabulary its token indices must fit, or NULL when the input is not
+# indices. For a functional model: the smallest table among the embeddings fed
+# straight from an int32 input.
+nn_index_vocab <- function(model) {
+  if (inherits(model, "ggml_sequential_model"))
+    return(if (nn_seq_takes_indices(model)) model$layers[[1L]]$config$vocab_size)
+  inp <- model$inputs[[1L]]
+  if (!identical(inp$config$dtype, "int32")) return(NULL)
+  v <- integer(0)
+  for (node in nn_topo_sort(model$outputs))
+    if (identical(node$node_type, "embedding") &&
+        identical(node$parents[[1L]]$id, inp$id))
+      v <- c(v, node$config$vocab_size)
+  if (length(v)) min(v)
+}
+
 #' Build computation graph with allocated weights and inputs
 #' @param model Compiled model
 #' @param batch_size Batch size
@@ -558,6 +758,11 @@ ggml_compile.ggml_sequential_model <- function(model, optimizer = "adam",
 # logits_output = TRUE; inference leaves it FALSE and keeps the probabilities.
 nn_build_graph <- function(model, batch_size, training = TRUE,
                            logits_output = FALSE) {
+  if (length(model$layers) > 1L)
+    for (l in model$layers[-1L]) if (identical(l$type, "embedding"))
+      stop("an embedding layer must be the first layer of a sequential model ",
+           "(it reads token indices); use the functional API to place it ",
+           "elsewhere", call. = FALSE)
   input_shape <- model$input_shape
   ne_datapoint <- prod(input_shape)
   backend <- model$compilation$backend
@@ -574,20 +779,23 @@ nn_build_graph <- function(model, batch_size, training = TRUE,
                   2 * 1024 * 1024)
   ctx_weights <- ggml_init(mem_size, no_alloc = TRUE)
 
+  # An embedding first takes token indices, so the input is I32, not F32.
+  in_type <- if (nn_seq_takes_indices(model)) GGML_TYPE_I32 else GGML_TYPE_F32
+
   # Create input tensor in ctx_weights (will be allocated with backend)
   if (length(input_shape) == 3) {
     # Image: R [H, W, C] -> ggml [W, H, C, N]
-    inputs <- ggml_new_tensor_4d(ctx_weights, GGML_TYPE_F32,
+    inputs <- ggml_new_tensor_4d(ctx_weights, in_type,
                                   input_shape[2], input_shape[1],
                                   input_shape[3], batch_size)
   } else if (length(input_shape) == 2) {
     # Sequence: R [seq_len, input_size] -> ggml [input_size, seq_len, N]
     # (input_size is dim0 so each time step's features are contiguous)
-    inputs <- ggml_new_tensor_3d(ctx_weights, GGML_TYPE_F32,
+    inputs <- ggml_new_tensor_3d(ctx_weights, in_type,
                                   input_shape[2], input_shape[1], batch_size)
   } else {
     # Flat vector: R [features] -> ggml [features, N]
-    inputs <- ggml_new_tensor_2d(ctx_weights, GGML_TYPE_F32,
+    inputs <- ggml_new_tensor_2d(ctx_weights, in_type,
                                   ne_datapoint, batch_size)
   }
   ggml_set_name(inputs, "inputs")
@@ -632,7 +840,7 @@ nn_build_graph <- function(model, batch_size, training = TRUE,
       ggml_set_name(layer$weights$weight, paste0("dense_", i, "_weight"))
       ggml_set_name(layer$weights$bias, paste0("dense_", i, "_bias"))
 
-    } else if (layer$type == "batch_norm") {
+    } else if (nn_is_norm_type(layer$type)) {
       # Determine number of features for gamma/beta
       n_features <- if (length(layer$input_shape) == 1) layer$input_shape
                     else if (length(layer$input_shape) == 2) layer$input_shape[2]
@@ -640,15 +848,26 @@ nn_build_graph <- function(model, batch_size, training = TRUE,
 
       layer$weights$gamma <- ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_features)
       layer$weights$beta <- ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_features)
-      ggml_set_name(layer$weights$gamma, paste0("bn_", i, "_gamma"))
-      ggml_set_name(layer$weights$beta, paste0("bn_", i, "_beta"))
+      pfx <- switch(layer$type, rms_norm = "rmsn_", layer_norm = "ln_", "bn_")
+      ggml_set_name(layer$weights$gamma, paste0(pfx, i, "_gamma"))
+      ggml_set_name(layer$weights$beta, paste0(pfx, i, "_beta"))
 
       # Running estimates used at inference time. Not parameters: they are
-      # updated by an EMA during training, never by the optimizer.
-      layer$weights$running_mean <- ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_features)
-      layer$weights$running_var  <- ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_features)
-      ggml_set_name(layer$weights$running_mean, paste0("bn_", i, "_running_mean"))
-      ggml_set_name(layer$weights$running_var, paste0("bn_", i, "_running_var"))
+      # updated by an EMA during training, never by the optimizer. RMS norm has
+      # no batch statistics, so it needs none of this.
+      if (layer$type == "batch_norm") {
+        layer$weights$running_mean <- ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_features)
+        layer$weights$running_var  <- ggml_new_tensor_1d(ctx_weights, GGML_TYPE_F32, n_features)
+        ggml_set_name(layer$weights$running_mean, paste0("bn_", i, "_running_mean"))
+        ggml_set_name(layer$weights$running_var, paste0("bn_", i, "_running_var"))
+      }
+
+    } else if (layer$type == "embedding") {
+      # Table [dim, vocab_size], as in the functional embedding.
+      layer$weights$weight <- ggml_new_tensor_2d(ctx_weights, GGML_TYPE_F32,
+                                                   layer$config$dim,
+                                                   layer$config$vocab_size)
+      ggml_set_name(layer$weights$weight, paste0(layer$name, "_weight"))
 
     } else if (layer$type == "lstm") {
       # input_shape: c(seq_len, input_size)
@@ -710,6 +929,9 @@ nn_build_graph <- function(model, batch_size, training = TRUE,
     layer <- layers_built[[i]]
     old_layer <- model$layers[[i]]
     has_weights_data <- !is.null(old_layer$weights_data)
+    if (has_weights_data)
+      nn_check_saved_weights(layer$weights, old_layer$weights_data, layer$type,
+                             sprintf("layer %d (%s)", i, layer$type))
     has_trained_weights <- !is.null(old_layer$weights) &&
       (!is.null(old_layer$weights$kernel) || !is.null(old_layer$weights$weight) ||
        !is.null(old_layer$weights$gamma))
@@ -781,7 +1003,7 @@ nn_build_graph <- function(model, batch_size, training = TRUE,
         ggml_set_param(layer$weights$bias)
       }
 
-    } else if (layer$type == "batch_norm") {
+    } else if (nn_is_norm_type(layer$type)) {
       if (has_weights_data && !is.null(old_layer$weights_data$gamma)) {
         ggml_backend_tensor_set_data(layer$weights$gamma, old_layer$weights_data$gamma)
         ggml_backend_tensor_set_data(layer$weights$beta, old_layer$weights_data$beta)
@@ -798,25 +1020,41 @@ nn_build_graph <- function(model, batch_size, training = TRUE,
       }
 
       # Running estimates: restore when available, else start from the identity
-      # transform (mean 0, variance 1), matching ag_batch_norm().
-      nbn <- ggml_nelements(layer$weights$running_mean)
-      if (has_weights_data && !is.null(old_layer$weights_data$running_mean)) {
-        ggml_backend_tensor_set_data(layer$weights$running_mean, old_layer$weights_data$running_mean)
-        ggml_backend_tensor_set_data(layer$weights$running_var, old_layer$weights_data$running_var)
-      } else if (has_trained_weights && !is.null(old_layer$weights$running_mean)) {
-        ggml_backend_tensor_set_data(layer$weights$running_mean,
-          ggml_backend_tensor_get_data(old_layer$weights$running_mean))
-        ggml_backend_tensor_set_data(layer$weights$running_var,
-          ggml_backend_tensor_get_data(old_layer$weights$running_var))
-      } else {
-        nn_init_zeros(layer$weights$running_mean)
-        ggml_backend_tensor_set_data(layer$weights$running_var, rep(1.0, nbn))
+      # transform (mean 0, variance 1), matching ag_batch_norm(). RMS norm keeps
+      # no batch statistics, so it has no such tensors to restore.
+      if (!is.null(layer$weights$running_mean)) {
+        nbn <- ggml_nelements(layer$weights$running_mean)
+        if (has_weights_data && !is.null(old_layer$weights_data$running_mean)) {
+          ggml_backend_tensor_set_data(layer$weights$running_mean, old_layer$weights_data$running_mean)
+          ggml_backend_tensor_set_data(layer$weights$running_var, old_layer$weights_data$running_var)
+        } else if (has_trained_weights && !is.null(old_layer$weights$running_mean)) {
+          ggml_backend_tensor_set_data(layer$weights$running_mean,
+            ggml_backend_tensor_get_data(old_layer$weights$running_mean))
+          ggml_backend_tensor_set_data(layer$weights$running_var,
+            ggml_backend_tensor_get_data(old_layer$weights$running_var))
+        } else {
+          nn_init_zeros(layer$weights$running_mean)
+          ggml_backend_tensor_set_data(layer$weights$running_var, rep(1.0, nbn))
+        }
       }
 
       if (isTRUE(layer$trainable)) {
         ggml_set_param(layer$weights$gamma)
         ggml_set_param(layer$weights$beta)
       }
+
+    } else if (layer$type == "embedding") {
+      if (has_weights_data && !is.null(old_layer$weights_data$weight)) {
+        ggml_backend_tensor_set_data(layer$weights$weight, old_layer$weights_data$weight)
+      } else if (!is.null(old_layer$weights$weight)) {
+        ggml_backend_tensor_set_data(layer$weights$weight,
+          ggml_backend_tensor_get_data(old_layer$weights$weight))
+      } else {
+        # Same init as the functional embedding.
+        ggml_backend_tensor_set_data(layer$weights$weight,
+          runif(ggml_nelements(layer$weights$weight), -0.05, 0.05))
+      }
+      if (isTRUE(layer$trainable)) ggml_set_param(layer$weights$weight)
 
     } else if (layer$type == "lstm") {
       units    <- layer$config$units
@@ -994,7 +1232,8 @@ nn_bn_channel_stats <- function(acts, input_shape, n_features) {
 }
 
 nn_bn_calibrate <- function(model, x) {
-  bn_idx <- which(vapply(model$layers, function(l) identical(l$type, "batch_norm"),
+  bn_idx <- which(vapply(model$layers, function(l) identical(l$type, "batch_norm") &&
+                                                !isTRUE(l$config$fixed_stats),
                          logical(1)))
   if (length(bn_idx) == 0L) return(model)
 
@@ -1052,13 +1291,30 @@ nn_bn_calibrate <- function(model, x) {
 #'   \item{validation_split}{Fraction of data for validation (default: 0)}
 #'   \item{validation_data}{Optional list(x_val, y_val) for validation. Overrides validation_split.}
 #'   \item{class_weight}{Named vector of weights per class, e.g. c("0"=1, "1"=10). Cannot be used with sample_weight.}
-#'   \item{sample_weight}{Numeric vector of per-sample weights (length = nrow(x)). Cannot be used with class_weight.}
+#'   \item{sample_weight}{Per-sample weights: a numeric vector of length
+#'     \code{nrow(x)}, or -- for \code{mean_squared_error} only -- a
+#'     \code{nrow(x)} by \code{ncol(y)} matrix acting as a per-output loss mask.
+#'     A mask trains only the outputs whose weight is non-zero, which is what a
+#'     Q-model needs: 1 on the action that has a TD target, 0 elsewhere. The
+#'     denominator is unchanged (\code{sum(w*(pred-y)^2)/nelements}), so masking
+#'     does not renormalise over the active outputs. Cannot be used with
+#'     class_weight.}
 #'   \item{verbose}{0 = silent, 1 = progress (default: 1)}
 #'   \item{shuffle}{Shuffle the data (default: TRUE). Shuffled once before the
 #'     train/validation split, then the training portion each epoch; the
 #'     validation portion stays fixed. FALSE for time series or exactly
 #'     reproducible runs.}
 #'   \item{callbacks}{List of callback objects (early stopping, LR schedules)}
+#'   \item{generator}{Function of no arguments yielding \code{list(x, y)} for
+#'     one batch, or \code{NULL} when exhausted -- an alternative to \code{x}
+#'     and \code{y} that keeps only the current batch in memory. See
+#'     \code{\link{ggml_fit_generator}}, to which the call is forwarded along
+#'     with \code{steps_per_epoch}, \code{initial_epoch},
+#'     \code{validation_generator} and \code{validation_steps}. The arguments
+#'     that are defined in terms of a whole dataset --
+#'     \code{validation_split}, \code{validation_data}, \code{class_weight}
+#'     and \code{sample_weight} -- are rejected rather than ignored, and
+#'     \code{shuffle} is inert because the generator owns its own order.}
 #' }
 #'
 #' \strong{Low-level (optimizer loop):}
@@ -1145,7 +1401,34 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
                                 validation_split = 0.0, validation_data = NULL,
                                 class_weight = NULL, sample_weight = NULL,
                                 verbose = 1, shuffle = TRUE,
-                                callbacks = list()) {
+                                callbacks = list(), generator = NULL, ...) {
+  # Streaming path: no dataset is materialised, so the arguments that are
+  # defined in terms of one are rejected rather than quietly ignored. `shuffle`
+  # is simply inert here -- the generator owns the order it yields batches in.
+  if (!is.null(generator)) {
+    if (!missing(x) && !is.null(x)) {
+      stop("Give either 'x'/'y' or 'generator', not both.", call. = FALSE)
+    }
+    if (!identical(validation_split, 0.0) && validation_split > 0) {
+      stop("'validation_split' needs the total number of samples in order to ",
+           "cut a tail off it, which a generator does not have. Use ",
+           "'validation_generator' with 'validation_steps' instead.",
+           call. = FALSE)
+    }
+    if (!is.null(validation_data)) {
+      stop("'validation_data' is not used with a generator; pass ",
+           "'validation_generator' with 'validation_steps' instead.",
+           call. = FALSE)
+    }
+    if (!is.null(class_weight) || !is.null(sample_weight)) {
+      stop("'class_weight'/'sample_weight' are applied to a whole dataset ",
+           "before training and are not supported with a generator; scale the ",
+           "labels inside the generator instead.", call. = FALSE)
+    }
+    return(ggml_fit_generator(model, generator = generator, epochs = epochs,
+                              batch_size = batch_size, verbose = verbose,
+                              callbacks = callbacks, ...))
+  }
   if (!model$compiled) {
     stop("Model must be compiled before training. Call ggml_compile() first.")
   }
@@ -1167,16 +1450,41 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
   # When TRUE, sample weights are applied through the weighted-MSE loss node
   # (sum(w*(pred-y)^2)) instead of by scaling the labels, which would be wrong
   # for squared error. CE is unaffected: CE(p, w*y) == w*CE(p, y).
+  # A matrix sample_weight is a per-output mask rather than one weight per
+  # sample; loss_mask_ne0 carries its width down to the loss node. NULL keeps
+  # the [1, ndata] layout, so the vector case is untouched.
   use_weighted_mse <- FALSE
+  loss_mask_ne0 <- NULL
   if (!is.null(sample_weight)) {
-    if (length(sample_weight) != nrow(y)) {
-      stop("sample_weight length must match number of training samples.")
-    }
     is_mse <- model$compilation$loss %in% c("mse", "mean_squared_error")
-    if (is_mse) {
-      use_weighted_mse <- TRUE   # weights go into the loss node below, not y
+
+    if (is.matrix(sample_weight)) {
+      if (!is_mse) {
+        stop("A matrix 'sample_weight' is a per-output loss mask and only ",
+             "applies to mean_squared_error; got loss '",
+             model$compilation$loss, "'.", call. = FALSE)
+      }
+      if (nrow(sample_weight) != nrow(y)) {
+        stop("'sample_weight' must have one row per training sample (",
+             nrow(sample_weight), " rows for ", nrow(y), " samples).",
+             call. = FALSE)
+      }
+      if (ncol(sample_weight) != ncol(y)) {
+        stop("A matrix 'sample_weight' must have one column per output (",
+             ncol(sample_weight), " columns for ", ncol(y), " outputs).",
+             call. = FALSE)
+      }
+      use_weighted_mse <- TRUE
+      loss_mask_ne0    <- ncol(sample_weight)
     } else {
-      y <- y * sample_weight     # cross-entropy: scaling the label is correct
+      if (length(sample_weight) != nrow(y)) {
+        stop("sample_weight length must match number of training samples.")
+      }
+      if (is_mse) {
+        use_weighted_mse <- TRUE   # weights go into the loss node below, not y
+      } else {
+        y <- y * sample_weight     # cross-entropy: scaling the label is correct
+      }
     }
   }
 
@@ -1202,7 +1510,12 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
     # Validation rows carry no user weight; default to 1.0 so weighted MSE
     # reduces to plain MSE on the validation split.
     if (use_weighted_mse) {
-      sample_weight <- c(sample_weight, rep(1.0, n_val))
+      sample_weight <- if (is.matrix(sample_weight)) {
+        rbind(sample_weight,
+              matrix(1.0, nrow = n_val, ncol = ncol(sample_weight)))
+      } else {
+        c(sample_weight, rep(1.0, n_val))
+      }
     }
     validation_split <- n_val / (n_train + n_val)
     # The split is positional now: these rows ARE the user's validation set, so
@@ -1229,14 +1542,18 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
     x <- slice_first_dim(x, seq_len(usable_samples))
     y <- y[seq_len(usable_samples), , drop = FALSE]
     if (use_weighted_mse) {
-      sample_weight <- sample_weight[seq_len(usable_samples)]
+      sample_weight <- if (is.matrix(sample_weight)) {
+        sample_weight[seq_len(usable_samples), , drop = FALSE]
+      } else {
+        sample_weight[seq_len(usable_samples)]
+      }
     }
     n_samples <- usable_samples
   }
 
   # Prepare dataset
   dataset <- ggml_opt_dataset_init(
-    type_data = GGML_TYPE_F32,
+    type_data = if (nn_seq_takes_indices(model)) GGML_TYPE_I32 else GGML_TYPE_F32,
     type_label = GGML_TYPE_F32,
     ne_datapoint = ne_datapoint,
     ne_label = ne_label,
@@ -1244,19 +1561,9 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
     ndata_shard = 1
   )
 
-  # Convert data to ggml format
-  if (length(input_shape) == 3) {
-    # Image data: R [N, H, W, C] -> ggml [W, H, C, N]
-    x_ggml <- as.vector(aperm(x, c(3, 2, 4, 1)))
-  } else if (length(input_shape) == 2) {
-    # Sequence: R [N, seq_len, input_size] -> ggml [input_size, seq_len, N]
-    x_ggml <- as.vector(aperm(x, c(3, 2, 1)))
-  } else if (length(input_shape) == 1) {
-    # Vector data: R [N, features] -> ggml [features, N]
-    x_ggml <- as.vector(t(x))
-  } else {
-    stop("Unsupported input_shape length: ", length(input_shape))
-  }
+  # Convert data to ggml format -- the layout the generator and the trainer use,
+  # with token indices checked against the embedding's vocabulary.
+  x_ggml <- .gen_to_ggml_layout(x, input_shape, nn_index_vocab(model))
 
   # Labels: R [N, classes] -> ggml [classes, N]
   y_ggml <- as.vector(t(y))
@@ -1267,10 +1574,19 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
   ggml_backend_tensor_set_data(data_tensor, x_ggml)
   ggml_backend_tensor_set_data(labels_tensor, y_ggml)
 
-  # Per-datapoint weights for weighted MSE (loss = sum(w*(pred-y)^2)/nelem)
+  # Loss weights for weighted MSE (loss = sum(w*(pred-y)^2)/nelem).
+  # A vector gives [1, ndata] (one weight per sample); a matrix gives
+  # [n_out, ndata] -- a per-output mask, transposed on the way in exactly like
+  # the labels above, since ggml wants the output axis on ne[0].
   if (use_weighted_mse) {
-    weights_tensor <- ggml_opt_dataset_weights(dataset)
-    ggml_backend_tensor_set_data(weights_tensor, as.numeric(sample_weight))
+    w_ne0 <- if (is.null(loss_mask_ne0)) 1L else as.integer(loss_mask_ne0)
+    weights_tensor <- ggml_opt_dataset_weights(dataset, w_ne0)
+    w_ggml <- if (is.matrix(sample_weight)) {
+      as.numeric(t(sample_weight))
+    } else {
+      as.numeric(sample_weight)
+    }
+    ggml_backend_tensor_set_data(weights_tensor, w_ggml)
   }
 
   # Build graph (creates contexts, weights, inputs, outputs).
@@ -1323,7 +1639,9 @@ ggml_fit_sequential <- function(model, x, y, epochs = 1, batch_size = 32,
     shuffle = shuffle,
     shuffle_all = shuffle_all,
     callbacks = callbacks,
-    silent = (verbose == 0)
+    silent = (verbose == 0),
+    loss_mask_ne0 = loss_mask_ne0,
+    weight_decay = model$compilation$weight_decay %||% 0
   )
 
   # Store built layers (with trained weights)
@@ -1482,15 +1800,37 @@ ggml_evaluate.ggml_sequential_model <- function(model, x, y, batch_size = 32,
 #' @param model A trained ggml_sequential_model
 #' @param x Input data (matrix or array)
 #' @param batch_size Batch size for inference
+#' @param matmul_precision \code{"default"} or \code{"f32"} for this call;
+#'   \code{NULL} (the default) takes the model's \code{predict_precision}
+#'   from \code{\link{ggml_compile}}. See the section on precision.
+#' @section Precision:
+#'   On a Vulkan device with fp16 support the matrix multiplies keep their
+#'   tiles in f16 by default. Results then carry a relative error near 1e-3
+#'   that depends on the batch size (a single row takes an exact f32 path,
+#'   larger batches the tiled one), so the same input can predict slightly
+#'   differently in a batch of 1 and a batch of 64. \code{"f32"} marks every
+#'   multiply \code{GGML_PREC_F32} and selects f32 tiles: the result then
+#'   matches the CPU to about 1e-6, at a cost in matmul throughput that depends
+#'   on the device and driver. The CPU backend is exact either way.
+#'
+#'   Which setting wins: the \code{matmul_precision} argument of the call, then
+#'   the model's \code{predict_precision}, then \code{"default"}.
 #' @return Matrix of predictions with shape \code{[N, output_units]}
 #' @export
 ggml_predict <- function(model, ...) {
+  # A trainer snapshot whose memory has been released would read freed tensors.
+  if (is.environment(model$snapshot_state) && !isTRUE(model$snapshot_state$alive)) {
+    stop("this snapshot has been released with ggml_snapshot_free(); take a ",
+         "new one with $snapshot().", call. = FALSE)
+  }
   UseMethod("ggml_predict")
 }
 
 #' @rdname ggml_predict
 #' @export
-ggml_predict.ggml_sequential_model <- function(model, x, batch_size = 32L, ...) {
+ggml_predict.ggml_sequential_model <- function(model, x, batch_size = 32L,
+                                               matmul_precision = NULL, ...) {
+  precision <- nn_predict_precision(model, matmul_precision)
   if (!model$compiled) {
     stop("Model must be compiled before prediction.")
   }
@@ -1512,21 +1852,16 @@ ggml_predict.ggml_sequential_model <- function(model, x, batch_size = 32L, ...) 
   }
 
   # Convert all data to ggml format upfront (before any slicing)
-  nn_convert_to_ggml <- function(x, input_shape) {
-    if (length(input_shape) == 3) {
-      as.vector(aperm(x, c(3, 2, 4, 1)))
-    } else if (length(input_shape) == 2) {
-      as.vector(aperm(x, c(3, 2, 1)))
-    } else {
-      as.vector(t(x))
-    }
-  }
+  vocab <- nn_index_vocab(model)
+  nn_convert_to_ggml <- function(x, input_shape)
+    .gen_to_ggml_layout(x, input_shape, vocab)
 
   # Helper: run forward pass for a batch of given size, return prediction matrix
   nn_predict_batch_run <- function(model, x_ggml, bs, ne_datapoint, ne_output,
                                    n_batches, input_shape) {
     graph_info <- nn_build_graph(model, bs, training = FALSE)
     graph <- ggml_build_forward_expand(graph_info$ctx_compute, graph_info$outputs)
+    nn_apply_matmul_precision(graph, precision)
     sched <- model$compilation$sched
     preds <- matrix(0, nrow = n_batches * bs, ncol = ne_output)
 
@@ -1611,6 +1946,64 @@ ggml_predict_classes <- function(model, x, batch_size = 32L) {
 # Save / Load Weights
 # ============================================================================
 
+# File format written by ggml_save_model() and the newest ggml_load_model()
+# reads. 1 is ggml_save_weights(); 2 added whole models; 3 adds a functional
+# model's ggml_freeze_weights() marks (frozen_nodes), the compiled
+# weight_decay and predict_precision, and batch-norm fixed_stats. Raise it
+# whenever a field appears that an older reader would drop without noticing:
+# the reader refuses anything newer than this, rather than load it with the
+# field ignored.
+NN_MODEL_FORMAT <- 3L
+
+# The weights ggml_save_model() writes for each layer type, by the names the
+# graph builders read them back under. A layer with saved data must have every
+# one of them: a missing name would otherwise fall through to random init.
+NN_SAVED_WEIGHTS <- list(
+  dense                = c("weight", "bias"),
+  conv_1d              = c("kernel", "bias"),
+  conv_2d              = c("kernel", "bias"),
+  batch_norm           = c("gamma", "beta"),
+  layer_norm           = c("gamma", "beta"),
+  rms_norm             = c("gamma", "beta"),
+  embedding            = "weight",
+  positional_embedding = "pos",
+  lstm                 = c("W_gates", "U_gates", "b_gates"),
+  gru                  = c("W_zh", "U_zh", "b_zh", "W_n", "U_n", "b_n"),
+  attention            = c("W_q", "W_k", "W_v", "W_o")
+)
+# Saved only by some layers of a type; checked when present.
+NN_SAVED_OPTIONAL <- c("running_mean", "running_var", "b_o")
+
+# Checks saved weight vectors against the tensors they are about to be written
+# into, before any is written. A file from another architecture, or a damaged
+# one, then stops with the layer and tensor named instead of being copied in
+# short (ggml reads past the vector) or long (silently cut).
+nn_check_saved_weights <- function(tensors, data, type, where) {
+  if (length(data) == 0L) return(invisible(NULL))
+  required <- NN_SAVED_WEIGHTS[[type]]
+  missing  <- setdiff(required, names(data))
+  if (length(missing))
+    stop(where, ": the saved weights lack ", paste(missing, collapse = ", "),
+         " -- the file does not match this model", call. = FALSE)
+  for (nm in intersect(c(required, NN_SAVED_OPTIONAL), names(data))) {
+    v <- data[[nm]]
+    if (is.null(v)) next
+    t <- tensors[[nm]]
+    if (is.null(t))
+      stop(where, ": the file has saved '", nm, "', which this layer does not ",
+           "have", call. = FALSE)
+    if (!is.numeric(v) || anyNA(v))
+      stop(where, ": saved '", nm, "' is not a complete numeric vector -- ",
+           "the file is damaged", call. = FALSE)
+    n <- ggml_nelements(t)
+    if (length(v) != n)
+      stop(sprintf("%s: saved '%s' has %d values, the layer expects %d (shape %s)",
+                   where, nm, length(v), n,
+                   paste(ggml_tensor_shape(t), collapse = " x ")), call. = FALSE)
+  }
+  invisible(NULL)
+}
+
 #' Save Model Weights to File
 #'
 #' Saves the trained weights of a sequential model to an RDS file.
@@ -1642,7 +2035,7 @@ ggml_save_weights <- function(model, path) {
         layer_weights$weight <- ggml_backend_tensor_get_data(layer$weights$weight)
         layer_weights$bias <- ggml_backend_tensor_get_data(layer$weights$bias)
       }
-    } else if (layer$type == "batch_norm") {
+    } else if (nn_is_norm_type(layer$type)) {
       if (!is.null(layer$weights$gamma)) {
         layer_weights$gamma <- ggml_backend_tensor_get_data(layer$weights$gamma)
         layer_weights$beta <- ggml_backend_tensor_get_data(layer$weights$beta)
@@ -1849,6 +2242,9 @@ summary.ggml_sequential_model <- function(object, ...) {
 #' @return Number of parameters
 #' @keywords internal
 nn_count_layer_params <- function(layer) {
+  if (layer$type == "embedding") {
+    return(as.numeric(layer$config$vocab_size) * layer$config$dim)
+  }
   if (layer$type == "conv_2d") {
     if (!is.null(layer$input_shape)) {
       ksize <- layer$config$kernel_size
@@ -1865,7 +2261,7 @@ nn_count_layer_params <- function(layer) {
       fan_in <- if (length(layer$input_shape) == 1) layer$input_shape else prod(layer$input_shape)
       fan_in * layer$config$units + layer$config$units
     } else 0
-  } else if (layer$type == "batch_norm") {
+  } else if (nn_is_norm_type(layer$type)) {
     if (!is.null(layer$input_shape)) {
       n <- if (length(layer$input_shape) == 1) layer$input_shape
            else if (length(layer$input_shape) == 2) layer$input_shape[2]
@@ -2006,7 +2402,8 @@ ggml_save_model.ggml_sequential_model <- function(model, path) {
     } else if (l$type == "dense" && !is.null(l$weights$weight)) {
       wdata$weight <- ggml_backend_tensor_get_data(l$weights$weight)
       wdata$bias   <- ggml_backend_tensor_get_data(l$weights$bias)
-    } else if (l$type == "batch_norm" && !is.null(l$weights$gamma)) {
+    } else if (nn_is_norm_type(l$type) &&
+               !is.null(l$weights$gamma)) {
       wdata$gamma <- ggml_backend_tensor_get_data(l$weights$gamma)
       wdata$beta  <- ggml_backend_tensor_get_data(l$weights$beta)
       # Running estimates are part of the model: without them a reloaded model
@@ -2045,9 +2442,11 @@ ggml_save_model.ggml_sequential_model <- function(model, path) {
     compilation  = list(
       optimizer = model$compilation$optimizer,
       loss      = model$compilation$loss,
-      metrics   = model$compilation$metrics
+      metrics   = model$compilation$metrics,
+      weight_decay = model$compilation$weight_decay,
+      predict_precision = model$compilation$predict_precision
     ),
-    version = 2L
+    version = NN_MODEL_FORMAT
   ), path)
   invisible(model)
 }
@@ -2077,10 +2476,15 @@ ggml_save_model.ggml_functional_model <- function(model, path) {
       metrics      = model$compilation$metrics,
       # Per-output weights must survive the round trip: without them a reloaded
       # multi-output model would silently retrain with every head weighted 1.
-      loss_weights = model$compilation$loss_weights
+      loss_weights = model$compilation$loss_weights,
+      weight_decay = model$compilation$weight_decay,
+      predict_precision = model$compilation$predict_precision
     ),
     node_weights_data = nw_data,
-    version = 2L
+    # ggml_freeze_weights() keeps its marks here, keyed by node id, not on the
+    # nodes themselves; without them a reloaded model would train every layer.
+    frozen_nodes      = model$frozen_nodes,
+    version = NN_MODEL_FORMAT
   ), path)
   invisible(model)
 }
@@ -2111,10 +2515,26 @@ ggml_save_model.ggml_functional_model <- function(model, path) {
 #' model2 <- ggml_load_model(tmp)
 #' }
 ggml_load_model <- function(path, backend = "auto") {
-  data <- readRDS(path)
+  data <- tryCatch(readRDS(path), error = function(e)
+    stop("ggml_load_model(): cannot read '", path, "' -- the file is missing, ",
+         "truncated or not an RDS file (", conditionMessage(e), ")", call. = FALSE))
+  if (!is.list(data) || is.null(data$model_class)) {
+    if (is.list(data) && !is.null(data$weights) && !is.null(data$architecture))
+      stop("This file was saved with ggml_save_weights(). ",
+           "Use ggml_load_weights() instead, or re-save with ggml_save_model().",
+           call. = FALSE)
+    stop("ggml_load_model(): '", path, "' is not a file written by ",
+         "ggml_save_model()", call. = FALSE)
+  }
   if (is.null(data$version) || data$version < 2L) {
     stop("This file was saved with ggml_save_weights(). ",
-         "Use ggml_load_weights() instead, or re-save with ggml_save_model().")
+         "Use ggml_load_weights() instead, or re-save with ggml_save_model().",
+         call. = FALSE)
+  }
+  if (data$version > NN_MODEL_FORMAT) {
+    stop(sprintf(paste0("ggml_load_model(): '%s' is format %d, written by a newer ",
+                        "ggmlR; this version reads up to format %d. Update ggmlR."),
+                 path, as.integer(data$version), NN_MODEL_FORMAT), call. = FALSE)
   }
 
   if (data$model_class == "ggml_sequential_model") {
@@ -2140,12 +2560,17 @@ ggml_load_model <- function(path, backend = "auto") {
       optimizer = data$compilation$optimizer,
       loss      = data$compilation$loss,
       metrics   = data$compilation$metrics,
-      backend   = backend
+      backend   = backend,
+      # NULL in files saved before weight_decay existed: off, as it was then.
+      weight_decay = data$compilation$weight_decay %||% 0,
+      predict_precision = data$compilation$predict_precision %||% "default"
     )
     return(invisible(model))
 
   } else if (data$model_class == "ggml_functional_model") {
     model <- ggml_model(inputs = data$inputs, outputs = data$outputs)
+    # NULL for files saved before frozen marks were kept: nothing frozen.
+    model$frozen_nodes <- data$frozen_nodes
     model <- ggml_compile(model,
       optimizer    = data$compilation$optimizer,
       loss         = data$compilation$loss,
@@ -2153,7 +2578,9 @@ ggml_load_model <- function(path, backend = "auto") {
       backend      = backend,
       # NULL for models saved before multi-output support, which is exactly the
       # single-head default.
-      loss_weights = data$compilation$loss_weights
+      loss_weights = data$compilation$loss_weights,
+      weight_decay = data$compilation$weight_decay %||% 0,
+      predict_precision = data$compilation$predict_precision %||% "default"
     )
 
     # Ensure no stale ggml tensor pointers from the freshly-created model.

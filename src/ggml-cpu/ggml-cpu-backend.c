@@ -14,6 +14,18 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+/* ggmlR extension: the host kernel for GGML_OP_QCONV_I32 lives with the ONNX
+ * code it was written for, rather than in ops.c, because it reproduces ONNX
+ * Runtime's arithmetic and is only meaningful next to that reasoning. */
+#include "../onnx/qconv_i32.h"
+#include "../onnx/qmatmul_i32.h"
+
+/* The kernel takes its barrier as a callback so qconv_i32.c need not include
+ * the threadpool internals; a wrapper rather than a cast of ggml_barrier,
+ * whose parameter type differs from void *. */
+static void qconv_i32_barrier(void * tp) {
+    ggml_barrier((struct ggml_threadpool *) tp);
+}
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1797,6 +1809,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_silu_back(params, tensor);
             } break;
+        case GGML_OP_GELU_BACK:
+            {
+                ggml_compute_forward_gelu_back(params, tensor);
+            } break;
         case GGML_OP_NORM:
             {
                 ggml_compute_forward_norm(params, tensor);
@@ -1808,6 +1824,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_RMS_NORM_BACK:
             {
                 ggml_compute_forward_rms_norm_back(params, tensor);
+            } break;
+        // DIVERGENCE from upstream: LayerNorm backward, see ggml_norm_back().
+        case GGML_OP_NORM_BACK:
+            {
+                ggml_compute_forward_norm_back(params, tensor);
             } break;
         case GGML_OP_GROUP_NORM:
             {
@@ -1913,6 +1934,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_conv_2d(params, tensor);
             } break;
+        case GGML_OP_QCONV_I32:
+            {
+                qconv_i32_compute(tensor, params->ith, params->nth,
+                                  params->wdata, params->wsize,
+                                  qconv_i32_barrier, params->threadpool);
+            } break;
+        case GGML_OP_QMATMUL_I32:
+            {
+                qmatmul_i32_compute(tensor, params->ith, params->nth);
+            } break;
         case GGML_OP_CONV_3D:
             {
                 ggml_compute_forward_conv_3d(params, tensor);
@@ -1987,10 +2018,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
-                int32_t t = ggml_get_op_params_i32(tensor, 0);
-                GGML_ASSERT(t == 0 || t == 1);
-                bool masked = t != 0;
-                ggml_compute_forward_flash_attn_back(params, masked, tensor);
+                ggml_compute_forward_flash_attn_back(params, tensor);
             } break;
         case GGML_OP_SSM_CONV:
             {
@@ -2284,6 +2312,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_UNARY_OP_FLOOR:
                 case GGML_UNARY_OP_CEIL:
                 case GGML_UNARY_OP_ROUND:
+                case GGML_UNARY_OP_ROUND_EVEN:
                 case GGML_UNARY_OP_TRUNC:
                     {
                         n_tasks = 1;
@@ -2317,11 +2346,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             }
             break;
         case GGML_OP_SILU_BACK:
+        case GGML_OP_GELU_BACK:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
         case GGML_OP_RMS_NORM_BACK:
+        // DIVERGENCE from upstream: LayerNorm backward, see ggml_norm_back().
+        case GGML_OP_NORM_BACK:
         case GGML_OP_L2_NORM:
         case GGML_OP_GROUP_NORM:
         case GGML_OP_CONCAT:
@@ -2376,6 +2408,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONV_2D_DW:
         case GGML_OP_CONV_TRANSPOSE_1D:
         case GGML_OP_CONV_TRANSPOSE_2D:
+        case GGML_OP_QMATMUL_I32:
+        case GGML_OP_QCONV_I32:
             {
                 n_tasks = n_threads;
             } break;
@@ -2939,6 +2973,12 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = GGML_IM2COL_WORK_SIZE;
                     } break;
+                case GGML_OP_QCONV_I32:
+                    {
+                        // ggmlR extension: packed weights + per-thread
+                        // im2col rows, see qconv_i32.c.
+                        cur = qconv_i32_work_size(node, n_tasks);
+                    } break;
                 case GGML_OP_CONV_TRANSPOSE_2D:
                     {
                         const int64_t ne00 = node->src[0]->ne[0]; // W
@@ -2976,19 +3016,16 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
-                        const int64_t    D = node->src[0]->ne[0];
-                        const int64_t ne11 = ggml_up(node->src[1]->ne[1], GGML_SOFT_MAX_UNROLL);
-                        const int64_t mxDn = MAX(D, ne11) * 2; // *2 because of S and SM in ggml_compute_forward_flash_attn_back
-                        if (node->src[1]->type == GGML_TYPE_F32) {
-                            cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
-                            cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
-                        } else if (node->src[1]->type == GGML_TYPE_F16) {
-                            cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
-                            cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
-                        } else if (node->src[1]->type == GGML_TYPE_BF16) {
-                            cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
-                            cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
-                        }
+                        // Two scratch rows per thread (S and SM), each padded
+                        // to a cache line because the kernel indexes them as
+                        // ith*2*(mxDM + CACHE_LINE_SIZE_F32). mxDM spans the
+                        // longest of DK, DV and the padded kv length.
+                        const int64_t DK   = node->src[0]->ne[0];
+                        const int64_t DV   = node->src[2]->ne[0];
+                        const int64_t Mup  = ggml_up(node->src[1]->ne[1], GGML_SOFT_MAX_UNROLL);
+                        const int64_t mxDM = MAX(MAX(DK, DV), Mup);
+
+                        cur = sizeof(float)*2*(mxDM + CACHE_LINE_SIZE_F32)*n_tasks;
                     } break;
 
                 case GGML_OP_CROSS_ENTROPY_LOSS:

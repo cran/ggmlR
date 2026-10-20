@@ -367,3 +367,250 @@ bool ggml_vk_matmul_f64_run(
 
     return true;
 }
+
+// RoiAlign (ONNX opset 10+) — direct Vulkan dispatch.
+//
+// One thread per output element over a flat 1-D grid; see
+// vulkan-shaders/roi_align.comp for the sampling itself. The three inputs are
+// uploaded, one dispatch covers the whole [ow, oh, C, num_rois] output, and the
+// result is read straight back — there is no cross-thread state, so nothing
+// needs staging or a second pass.
+//
+// ⚠️ Bit-exactness, not speed, is the acceptance criterion here. MaskRCNN-12-int8
+// agrees with ONNX Runtime to the last bit on the CPU path, and this op is only
+// allowed to take over once it reproduces that exactly; the shader is a
+// line-for-line port of src/onnx/roi_align.c for that reason.
+bool ggml_vk_roi_align_run(
+        ggml_backend_t backend,
+        const float * x, const float * rois, const float * batch_indices,
+        float * dst,
+        unsigned int W, unsigned int H, unsigned int C, unsigned int N,
+        unsigned int num_rois, unsigned int ow, unsigned int oh,
+        int sampling_ratio, unsigned int mode, float spatial_scale) {
+
+    if (!ggml_backend_is_vk(backend)) {
+        return false;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    vk_device& device = ctx->device;
+
+    if (W == 0 || H == 0 || C == 0 || N == 0 || num_rois == 0 || ow == 0 || oh == 0) {
+        return true;  // nothing to do
+    }
+
+    const size_t total = (size_t)ow * oh * C * num_rois;
+
+    // One workgroup per 256 output elements. NVIDIA caps a dispatch axis at
+    // 65535 groups, and exceeding it aborts inside the dispatch rather than
+    // failing here, so refuse and let the caller stay on the CPU kernel.
+    const uint32_t max_wg = device->properties.limits.maxComputeWorkGroupCount[0];
+    if (CEIL_DIV(total, (size_t)256) > (size_t)max_wg) {
+        return false;
+    }
+
+    // ⚠️ The adaptive branch (sampling_ratio <= 0) takes its loop bound from
+    // the ROI VALUES, not from any dimension, and nothing upstream bounds
+    // them. An oversized or non-finite ROI makes the shader run millions of
+    // taps per output element, which the driver's watchdog cannot wait out:
+    // measured on MaskRCNN, that hung the amdgpu compute ring three times and
+    // the third hang took the graphics ring with it (MODE1 reset, VRAM lost).
+    //
+    // The shader clamps too — this gate exists so the condition is DIAGNOSED
+    // on the host rather than silently absorbed on the GPU. The values are
+    // already here in `rois`, so checking costs one pass over 4*num_rois
+    // floats. Falling back to the CPU kernel keeps the answer identical to
+    // what that kernel would have produced (it applies the same clamp) while
+    // leaving the GPU out of it entirely.
+    //
+    // Reaching this means the ROIs are malformed and the bug is upstream in
+    // the box decode; the cap is a guard, not a tuning knob.
+    //
+    // The same number lives in ROI_ALIGN_MAX_SAMPLES (../onnx/roi_align.h) and
+    // as a literal in roi_align.comp. Kept in step by hand, as the NMS gate
+    // below does with MAX_CAND: this backend deliberately does not include the
+    // ONNX headers.
+    const int ROI_ALIGN_MAX_SAMPLES = 128;
+    if (sampling_ratio <= 0) {
+        const float cap = (float)ROI_ALIGN_MAX_SAMPLES;
+        for (unsigned int i = 0; i < num_rois; i++) {
+            const float rw = (rois[2 + 4 * i] - rois[0 + 4 * i]) * spatial_scale;
+            const float rh = (rois[3 + 4 * i] - rois[1 + 4 * i]) * spatial_scale;
+            // !(x <= cap) rather than (x > cap): true for NaN, which would
+            // otherwise sail through and reach int(ceil()) as undefined.
+            if (!(rh / (float)oh <= cap) || !(rw / (float)ow <= cap)) {
+                GGML_LOG_INFO("%s: ROI %u is %.1fx%.1f, over the %d-sample cap "
+                              "-- staying on the CPU kernel. Malformed ROIs "
+                              "mean the box decode upstream is wrong.\n",
+                              __func__, i, (double)rw, (double)rh,
+                              ROI_ALIGN_MAX_SAMPLES);
+                return false;
+            }
+        }
+    }
+
+    const size_t x_bytes    = (size_t)W * H * C * N * sizeof(float);
+    const size_t rois_bytes = (size_t)4 * num_rois * sizeof(float);
+    const size_t bi_bytes   = (size_t)num_rois * sizeof(float);
+    const size_t dst_bytes  = total * sizeof(float);
+
+    vk_buffer d_x    = ggml_vk_create_buffer_device(device, x_bytes);
+    vk_buffer d_rois = ggml_vk_create_buffer_device(device, rois_bytes);
+    vk_buffer d_bi   = ggml_vk_create_buffer_device(device, bi_bytes);
+    vk_buffer d_dst  = ggml_vk_create_buffer_device(device, dst_bytes);
+
+    ggml_vk_buffer_write(d_x,    0, x,             x_bytes);
+    ggml_vk_buffer_write(d_rois, 0, rois,          rois_bytes);
+    ggml_vk_buffer_write(d_bi,   0, batch_indices, bi_bytes);
+
+    // Pipelines compile lazily: without this the bind below would run against
+    // an empty handle and segfault. Requests one descriptor set for the one
+    // dispatch (a no-op on push-descriptor drivers such as RADV).
+    ctx->pipeline_descriptor_set_requirements = 0;
+    ctx->descriptor_set_idx = 0;
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_roi_align, 1);
+
+    vk_context subctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+    ggml_vk_ctx_begin(device, subctx);
+
+    vk_op_roi_align_push_constants pc{};
+    pc.W              = W;
+    pc.H              = H;
+    pc.C              = C;
+    pc.num_rois       = num_rois;
+    pc.ow             = ow;
+    pc.oh             = oh;
+    pc.sampling_ratio = sampling_ratio;
+    pc.mode           = mode;
+    pc.spatial_scale  = spatial_scale;
+
+    // elements = total threads; wg_denoms (256,1,1) come from the shader's
+    // local_size, so the dispatch rounds up to whole workgroups and the
+    // shader's own `gid >= total` test drops the tail.
+    const std::array<uint32_t, 3> elements = { (uint32_t)total, 1, 1 };
+
+    ggml_vk_dispatch_pipeline(
+        ctx, subctx, ctx->device->pipeline_roi_align,
+        { vk_subbuffer{ d_x,    0, x_bytes    },
+          vk_subbuffer{ d_rois, 0, rois_bytes },
+          vk_subbuffer{ d_bi,   0, bi_bytes   },
+          vk_subbuffer{ d_dst,  0, dst_bytes  } },
+        pc, elements);
+
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, ctx->fence);
+    ggml_vk_wait_for_fence(ctx);
+
+    ggml_vk_buffer_read(d_dst, 0, dst, dst_bytes);
+
+    ggml_vk_destroy_buffer(d_x);
+    ggml_vk_destroy_buffer(d_rois);
+    ggml_vk_destroy_buffer(d_bi);
+    ggml_vk_destroy_buffer(d_dst);
+
+    return true;
+}
+
+
+// NonMaxSuppression (ONNX) — direct Vulkan dispatch.
+//
+// One workgroup per (batch, class) pair; see vulkan-shaders/nms.comp for why
+// the work splits that way (filter and sort are parallel, selection is not)
+// and src/onnx/nms.c for the arithmetic it mirrors.
+//
+// The shader sorts candidates in shared memory of a fixed size, so a class with
+// more candidates than that cannot be served: this returns false and the caller
+// runs the CPU kernel for the whole node. num_boxes is the bound that matters
+// because every box is a potential candidate when no score threshold is given.
+bool ggml_vk_nms_run(
+        ggml_backend_t backend,
+        const float * boxes, const float * scores,
+        int * sel_idx, int * sel_cnt,
+        unsigned int num_boxes, unsigned int num_classes, unsigned int N,
+        unsigned int max_per_pair, int max_output,
+        float iou_thresh, float score_thresh, unsigned int have_score_thresh,
+        unsigned int center_point_box) {
+
+    if (!ggml_backend_is_vk(backend)) {
+        return false;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    vk_device& device = ctx->device;
+
+    if (num_boxes == 0 || num_classes == 0 || N == 0 || max_per_pair == 0) {
+        return true;  // nothing to do
+    }
+
+    // MAX_CAND in nms.comp. Kept in step by hand: the shader needs it as a
+    // compile-time constant for its shared arrays, and exceeding it would drop
+    // candidates silently rather than fail, so refuse here instead.
+    const unsigned int MAX_CAND = 1024u;
+    if (num_boxes > MAX_CAND) {
+        return false;
+    }
+
+    const size_t n_pairs = (size_t)num_classes * N;
+
+    const uint32_t max_wg = device->properties.limits.maxComputeWorkGroupCount[0];
+    if (n_pairs > (size_t)max_wg) {
+        return false;
+    }
+
+    const size_t boxes_bytes  = (size_t)4 * num_boxes * N * sizeof(float);
+    const size_t scores_bytes = (size_t)num_boxes * num_classes * N * sizeof(float);
+    const size_t idx_bytes    = n_pairs * max_per_pair * sizeof(int32_t);
+    const size_t cnt_bytes    = n_pairs * sizeof(int32_t);
+
+    vk_buffer d_boxes  = ggml_vk_create_buffer_device(device, boxes_bytes);
+    vk_buffer d_scores = ggml_vk_create_buffer_device(device, scores_bytes);
+    vk_buffer d_idx    = ggml_vk_create_buffer_device(device, idx_bytes);
+    vk_buffer d_cnt    = ggml_vk_create_buffer_device(device, cnt_bytes);
+
+    ggml_vk_buffer_write(d_boxes,  0, boxes,  boxes_bytes);
+    ggml_vk_buffer_write(d_scores, 0, scores, scores_bytes);
+
+    // Pipelines compile lazily; without this the bind runs against an empty
+    // handle and segfaults.
+    ctx->pipeline_descriptor_set_requirements = 0;
+    ctx->descriptor_set_idx = 0;
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_nms, 1);
+
+    vk_context subctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+    ggml_vk_ctx_begin(device, subctx);
+
+    vk_op_nms_push_constants pc{};
+    pc.num_boxes         = num_boxes;
+    pc.num_classes       = num_classes;
+    pc.N                 = N;
+    pc.max_per_pair      = max_per_pair;
+    pc.max_output        = max_output;
+    pc.iou_thresh        = iou_thresh;
+    pc.score_thresh      = score_thresh;
+    pc.have_score_thresh = have_score_thresh;
+    pc.center_point_box  = center_point_box;
+
+    // wg_denoms for this pipeline are {1,1,1}, so the element count IS the
+    // workgroup count: one group per (batch, class) pair.
+    const std::array<uint32_t, 3> elements = { (uint32_t)n_pairs, 1, 1 };
+
+    ggml_vk_dispatch_pipeline(
+        ctx, subctx, ctx->device->pipeline_nms,
+        { vk_subbuffer{ d_boxes,  0, boxes_bytes  },
+          vk_subbuffer{ d_scores, 0, scores_bytes },
+          vk_subbuffer{ d_idx,    0, idx_bytes    },
+          vk_subbuffer{ d_cnt,    0, cnt_bytes    } },
+        pc, elements);
+
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, ctx->fence);
+    ggml_vk_wait_for_fence(ctx);
+
+    ggml_vk_buffer_read(d_idx, 0, sel_idx, idx_bytes);
+    ggml_vk_buffer_read(d_cnt, 0, sel_cnt, cnt_bytes);
+
+    ggml_vk_destroy_buffer(d_boxes);
+    ggml_vk_destroy_buffer(d_scores);
+    ggml_vk_destroy_buffer(d_idx);
+    ggml_vk_destroy_buffer(d_cnt);
+
+    return true;
+}

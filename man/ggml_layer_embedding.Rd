@@ -4,7 +4,14 @@
 \alias{ggml_layer_embedding}
 \title{Add Embedding Layer}
 \usage{
-ggml_layer_embedding(model, vocab_size, dim, name = NULL, trainable = TRUE)
+ggml_layer_embedding(
+  model,
+  vocab_size,
+  dim,
+  name = NULL,
+  trainable = TRUE,
+  input_shape = NULL
+)
 }
 \arguments{
 \item{model}{A \code{ggml_sequential_model} or \code{ggml_tensor_node}.}
@@ -16,6 +23,11 @@ ggml_layer_embedding(model, vocab_size, dim, name = NULL, trainable = TRUE)
 \item{name}{Optional layer name.}
 
 \item{trainable}{Logical; whether embedding weights are updated during training.}
+
+\item{input_shape}{Sequence length, for an embedding that is the first layer
+of a sequential model (its input is then a matrix of token indices,
+one row per sample). Ignored in the functional API, where
+\code{ggml_input(dtype = "int32")} gives the shape.}
 }
 \value{
 The model with the embedding layer appended, or a new tensor node.
@@ -25,13 +37,18 @@ Looks up dense vectors for integer token indices.  The input must be an
 integer matrix of 0-based indices in \code{[0, vocab_size - 1]} (use
 \code{ggml_input(shape, dtype = "int32")} in Functional mode).
 }
-\section{Axis order (ggml vs Keras)}{
+\section{Axis order}{
 
-ggml stores tensors in column-major order, so the output shape is
-\code{[dim, seq_len]} per sample (ggml convention) rather than
-\code{[seq_len, dim]} as in Keras.  When you call \code{ggml_layer_flatten()}
-after embedding the result is the same flattened vector regardless of order,
-but if you access raw output tensors be aware of this transposition.
+The layer's output shape is \code{c(seq_len, dim)} -- one row per position,
+as in Keras -- which is the same convention a declared sequence input
+(\code{ggml_input(shape = c(seq_len, features))}) uses. So the output feeds
+\code{\link{ggml_layer_attention}}, \code{\link{ggml_layer_gru}} and
+\code{\link{ggml_layer_lstm}} directly, with no axis juggling in between.
+
+The underlying tensor is \code{[dim, seq_len, N]}: ggml is column-major, so
+an R shape \code{c(a, b)} is the tensor \code{[b, a, N]} throughout the
+package. That matters only when reading raw output tensors --
+\code{ggml_layer_flatten()} gives the same vector either way.
 }
 
 \section{Index validation}{

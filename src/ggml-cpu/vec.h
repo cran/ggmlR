@@ -1413,6 +1413,37 @@ inline static void ggml_vec_silu_backward_f16(const int n, ggml_fp16_t * dx, con
     }
 }
 
+// Derivative of the tanh approximation ggml_gelu_f32() computes:
+//   g(x)  = 0.5*x*(1 + tanh(u)),  u = c*x*(1 + a*x^2)
+//   g'(x) = 0.5*(1 + tanh(u)) + 0.5*x*(1 - tanh(u)^2)*c*(1 + 3*a*x^2)
+// Must stay in step with ggml_gelu_f32 above: the exact (erf) and quick
+// variants have different derivatives and are separate ops.
+inline static float ggml_gelu_backward_f32(float x, float dy) {
+    const float u  = SQRT_2_OVER_PI*x*(1.0f + GELU_COEF_A*x*x);
+    const float th = tanhf(u);
+    const float dg = 0.5f*(1.0f + th) +
+                     0.5f*x*(1.0f - th*th)*SQRT_2_OVER_PI*(1.0f + 3.0f*GELU_COEF_A*x*x);
+    return dy*dg;
+}
+
+inline static ggml_fp16_t ggml_gelu_backward_f16(ggml_fp16_t x, ggml_fp16_t dy) {
+    const float v = GGML_CPU_FP16_TO_FP32(x);
+    return GGML_CPU_FP32_TO_FP16(
+        ggml_gelu_backward_f32(v, GGML_CPU_FP16_TO_FP32(dy)));
+}
+
+inline static void ggml_vec_gelu_backward_f32(const int n, float * dx, const float * x, const float * dy) {
+    for (int i = 0; i < n; ++i) {
+        dx[i] = ggml_gelu_backward_f32(x[i], dy[i]);
+    }
+}
+
+inline static void ggml_vec_gelu_backward_f16(const int n, ggml_fp16_t * dx, const ggml_fp16_t * x, const ggml_fp16_t * dy) {
+    for (int i = 0; i < n; ++i) {
+        dx[i] = ggml_gelu_backward_f16(x[i], dy[i]);
+    }
+}
+
 inline static void ggml_vec_reglu_f32 (const int n, float * y, const float * x, const float * g) {
     for (int i = 0; i < n; ++i) {
         y[i] = (x[i] > 0.f) ? x[i] * g[i] : 0.f;
@@ -1571,11 +1602,14 @@ inline static void ggml_vec_norm_inv_f32(const int n, float * s, const float * x
 }
 
 inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
+    // ggmlR divergence from upstream (which keeps the LAST of equal maxima):
+    // ties go to the FIRST index, like R's which.max and the Vulkan argmax
+    // shader. NaN is never selected (x > max is false for it); a row with
+    // nothing above -inf (all NaN / all -inf) gives 0.
     float max = -INFINITY;
     int idx = 0;
     for (int i = 0; i < n; ++i) {
-        max = MAX(max, x[i]);
-        if (max == x[i]) { idx = i; }
+        if (x[i] > max) { max = x[i]; idx = i; }
     }
     *s = idx;
 }

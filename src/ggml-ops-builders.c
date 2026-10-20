@@ -929,6 +929,21 @@ struct ggml_tensor * ggml_silu_back(
     return result;
 }
 
+// ggml_gelu_back
+
+struct ggml_tensor * ggml_gelu_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    result->op     = GGML_OP_GELU_BACK;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
 // ggml hardswish
 
 struct ggml_tensor * ggml_hardswish(
@@ -1028,6 +1043,14 @@ struct ggml_tensor * ggml_round_inplace(
         struct ggml_context * ctx,
         struct ggml_tensor  * a) {
     return ggml_unary_inplace(ctx, a, GGML_UNARY_OP_ROUND);
+}
+
+//ggml_round_even
+
+struct ggml_tensor * ggml_round_even(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    return ggml_unary(ctx, a, GGML_UNARY_OP_ROUND_EVEN);
 }
 
 //ggml_trunc
@@ -1258,6 +1281,24 @@ struct ggml_tensor * ggml_rms_norm_back(
     return result;
 }
 
+// ggml_norm_back
+
+struct ggml_tensor * ggml_norm_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 eps) {
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
+
+    ggml_set_op_params(result, &eps, sizeof(eps));
+
+    result->op     = GGML_OP_NORM_BACK;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
 // ggml_group_norm
 
 static struct ggml_tensor * ggml_group_norm_impl(
@@ -1360,6 +1401,27 @@ void ggml_mul_mat_set_prec(
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 0, prec_i32);
+}
+
+// ggmlR-patch: backport from ggml 0.27
+bool ggml_prec_set_acc(
+        struct ggml_tensor * a,
+        enum ggml_prec       prec) {
+    const int32_t prec_i32 = (int32_t) prec;
+
+    switch (a->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            ggml_set_op_params_i32(a, 0, prec_i32);
+            break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            ggml_set_op_params_i32(a, 3, prec_i32); // scale is on first pos, max_bias on second
+            break;
+        default:
+            return false;
+    }
+
+    return true;
 }
 
 void ggml_mul_mat_set_hint(
@@ -1722,6 +1784,15 @@ struct ggml_tensor * ggml_reshape_1d(
         struct ggml_tensor  * a,
         int64_t               ne0) {
     GGML_ASSERT(ggml_is_contiguous(a));
+    if (ggml_nelements(a) != ne0) {
+        /* Name the tensor: "some reshape had the wrong count" is not enough
+         * to locate the node in a graph of thousands. */
+        GGML_LOG_ERROR("%s: '%s' has %lld elements, cannot reshape to [%lld]; "
+                       "ne=[%lld,%lld,%lld,%lld]\n", __func__,
+                       a->name, (long long) ggml_nelements(a), (long long) ne0,
+                       (long long) a->ne[0], (long long) a->ne[1],
+                       (long long) a->ne[2], (long long) a->ne[3]);
+    }
     GGML_ASSERT(ggml_nelements(a) == ne0);
 
     const int64_t ne[1] = { ne0 };
@@ -3005,6 +3076,169 @@ struct ggml_tensor * ggml_conv_2d_direct(
     return result;
 }
 
+// ggml_qconv_i32
+//
+// ggmlR extension: ONNX QLinearConv, absent upstream.
+//
+// It exists as a real op rather than a custom one for a scheduling reason, not
+// a numerical one: GGML_OP_CUSTOM reports unsupported on every backend, so a
+// model's quantised convolutions were each pinned to the CPU and split the
+// graph around them -- 63 splits on MaskRCNN, with the tensor copies that
+// implies. The arithmetic is unchanged; see ggml.h for why it reproduces ONNX
+// Runtime's int16 pair saturation instead of an exact sum.
+//
+// The per-channel tables arrive as SOURCES rather than in op_params: op_params
+// holds 64 bytes and these run to one entry per output channel. Carrying them
+// as tensors also lets the scheduler place them on whichever backend runs the
+// op, which a userdata pointer could not do.
+
+struct ggml_tensor * ggml_qconv_i32(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,        // [W_in, H_in, C_in, 1]
+        struct ggml_tensor  * w,        // [KW, KH, C_in, C_out]
+        struct ggml_tensor  * w_scale,  // [n_w_scale]
+        struct ggml_tensor  * w_zp,     // [n_w_zp], I32
+        struct ggml_tensor  * bias,     // [C_out], I32, or NULL
+        struct ggml_tensor  * mult,     // [C_out], F32, precomputed
+        int                   stride_w,
+        int                   stride_h,
+        int                   pad_w,
+        int                   pad_h,
+        int                   dil_w,
+        int                   dil_h,
+        float                 x_scale,
+        float                 y_scale,
+        int                   x_zp,
+        int                   y_zp,
+        float                 out_lo,
+        float                 out_hi) {
+
+    GGML_ASSERT(x->ne[2] == w->ne[2]);   // C_in agrees
+    // The tables arrive with the type the ONNX loader gave them: a zero point
+    // is INT8 in the file and is widened to F32 on load, while a bias is INT32
+    // by the operator spec and stays integer. Both hold whole numbers either
+    // way; the kernel reads each at its own type rather than requiring one.
+    GGML_ASSERT(w_scale->type == GGML_TYPE_F32);
+    // w_zp is optional in the operator spec and absent on a symmetric export,
+    // which is the common case; NULL there means every zero point is zero.
+    GGML_ASSERT(w_zp == NULL || w_zp->type == GGML_TYPE_F32 ||
+                                w_zp->type == GGML_TYPE_I32);
+    GGML_ASSERT(bias == NULL || bias->type == GGML_TYPE_I32 ||
+                                bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(stride_w > 0 && stride_h > 0);
+    GGML_ASSERT(dil_w    > 0 && dil_h    > 0);
+
+    // A per-channel table is either one entry (the exporter quantised per
+    // tensor) or exactly one per output channel. Anything else means the
+    // caller read the wrong initializer, and silently indexing it would
+    // mis-scale whole channels rather than fail.
+    const int64_t C_out = w->ne[3];
+    GGML_ASSERT(w_scale->ne[0] == 1 || w_scale->ne[0] == C_out);
+    GGML_ASSERT(w_zp == NULL || w_zp->ne[0] == 1 || w_zp->ne[0] == C_out);
+    GGML_ASSERT(bias == NULL || bias->ne[0] == C_out);
+    // One multiplier per output channel, always materialised: the whole point
+    // is that no kernel recomputes it.
+    GGML_ASSERT(mult != NULL && mult->type == GGML_TYPE_F32);
+    GGML_ASSERT(mult->ne[0] == C_out);
+
+    int64_t ne[4];
+    ne[0] = ggml_calc_conv_output_size(x->ne[0], w->ne[0], stride_w, pad_w, dil_w);
+    ne[1] = ggml_calc_conv_output_size(x->ne[1], w->ne[1], stride_h, pad_h, dil_h);
+    ne[2] = C_out;
+    ne[3] = x->ne[3];
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result,  0, stride_w);
+    ggml_set_op_params_i32(result,  1, stride_h);
+    ggml_set_op_params_i32(result,  2, pad_w);
+    ggml_set_op_params_i32(result,  3, pad_h);
+    ggml_set_op_params_i32(result,  4, dil_w);
+    ggml_set_op_params_i32(result,  5, dil_h);
+    ggml_set_op_params_f32(result,  6, x_scale);
+    ggml_set_op_params_f32(result,  7, y_scale);
+    ggml_set_op_params_i32(result,  8, x_zp);
+    ggml_set_op_params_i32(result,  9, y_zp);
+    ggml_set_op_params_f32(result, 10, out_lo);
+    ggml_set_op_params_f32(result, 11, out_hi);
+    // Slots 12..15 are free: op_params holds 16 of them and the kernel reads
+    // the table lengths off the source tensors rather than from here.
+
+    result->op     = GGML_OP_QCONV_I32;
+    result->src[0] = x;
+    result->src[1] = w;
+    result->src[2] = w_scale;
+    result->src[3] = w_zp;
+    result->src[4] = bias;   // NULL is legal: the conv simply has no bias
+    result->src[5] = mult;
+
+    return result;
+}
+
+// ggml_qmatmul_i32
+//
+// ggmlR extension: ONNX QLinearMatMul, absent upstream. See ggml.h for the
+// arithmetic and ggml_qconv_i32() above for why it is a real op: as a
+// ggml_map_custom3 it was a host node on every backend, so a Vulkan run
+// downloaded A and B for it, and the kernel then uploaded them again into a
+// private dispatch and waited on a fence.
+//
+// The tables arrive as SOURCES, as for the conv: the scheduler places them
+// with the op, and nothing is copied into a userdata block that the run would
+// then have to own and free.
+
+struct ggml_tensor * ggml_qmatmul_i32(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,        // [K, M]
+        struct ggml_tensor  * b,        // [K, N]  (B transposed)
+        struct ggml_tensor  * b_scale,  // [1 or N], F32
+        struct ggml_tensor  * b_zp,     // [1 or N], F32 or I32, or NULL
+        float                 a_scale,
+        float                 y_scale,
+        int                   a_zp,
+        int                   y_zp,
+        int                   b_zp_any,
+        float                 out_lo,
+        float                 out_hi) {
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] == b->ne[0]);   // K agrees
+    // 2-D only, which is all the ONNX builder produces; a batch axis here
+    // would need its own stride arithmetic in both kernels.
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(b->ne[2] == 1 && b->ne[3] == 1);
+
+    const int64_t N = b->ne[1];
+    // Per column or shared -- anything else means the caller read the wrong
+    // initializer, and indexing it would mis-scale whole columns silently.
+    GGML_ASSERT(b_scale != NULL && b_scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(b_scale->ne[0] == 1 || b_scale->ne[0] == N);
+    // A zero point is INT8 in the file and widened to F32 on load; I32 is
+    // accepted too, and each kernel reads it at the type it carries.
+    GGML_ASSERT(b_zp == NULL || b_zp->type == GGML_TYPE_F32 ||
+                                b_zp->type == GGML_TYPE_I32);
+    GGML_ASSERT(b_zp == NULL || b_zp->ne[0] == 1 || b_zp->ne[0] == N);
+
+    struct ggml_tensor * result =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, a->ne[1]);
+
+    ggml_set_op_params_f32(result, 0, a_scale);
+    ggml_set_op_params_f32(result, 1, y_scale);
+    ggml_set_op_params_i32(result, 2, a_zp);
+    ggml_set_op_params_i32(result, 3, y_zp);
+    ggml_set_op_params_f32(result, 4, out_lo);
+    ggml_set_op_params_f32(result, 5, out_hi);
+    ggml_set_op_params_i32(result, 6, b_zp_any ? 1 : 0);
+
+    result->op     = GGML_OP_QMATMUL_I32;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = b_scale;
+    result->src[3] = b_zp;   // NULL is legal: every zero point is then zero
+
+    return result;
+}
+
 // ggml_conv_3d_direct
 
 struct ggml_tensor * ggml_conv_3d_direct(
@@ -3600,46 +3834,77 @@ void ggml_flash_attn_ext_add_sinks(
 
 // ggml_flash_attn_back
 
+// DIVERGENCE from upstream: upstream's ggml_flash_attn_back() is a stub -- its
+// first statement is GGML_ABORT("TODO: adapt to ggml_flash_attn_ext() changes"),
+// left behind when flash_attn was replaced by flash_attn_ext. The op, the enum
+// entry and a CPU kernel all existed, but the kernel spoke the OLD layout, so
+// flash attention had no usable backward at all and was never wired into
+// ggml-graph.c. Rewritten here against the flash_attn_ext contract:
+//
+//   q     [DK, N,  H,    B]
+//   k     [DK, M,  H_kv, B]
+//   v     [DV, M,  H_kv, B]      (NOT transposed, unlike the old flash_attn)
+//   mask  [M,  N,  H_m,  B_m]    F16, broadcast over heads/batch, or NULL
+//   d     [DV, H,  N,    B]      gradient of the forward result, same permuted
+//                                layout the forward writes: permute(0,2,1,3)
+//   scale                        taken from the forward node's op_params[0]
+//
+// The result packs grad_q | grad_k | grad_v as one contiguous 1D tensor, the
+// same trick ggml_ssm_conv_back() uses: one kernel pass yields every gradient,
+// and each src takes a view of its own slice in ggml-graph.c.
+//
+// Not supported (asserted, not silently ignored): max_bias/ALiBi slopes,
+// logit_softcap and attention sinks. Those forward features have no backward
+// here yet; a model training with them must lower attention to explicit ops.
 struct ggml_tensor * ggml_flash_attn_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
         struct ggml_tensor  * d,
-        bool                  masked) {
-    GGML_ABORT("TODO: adapt to ggml_flash_attn_ext() changes");
-
+        float                 scale) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
-    // TODO: check if vT can be multiplied by (k*qT)
 
-    // d shape [D,N,ne2,ne3]
-    // q shape [D,N,ne2,ne3]
-    // k shape [D,M,kvne2,ne3]
-    // v shape [M,D,kvne2,ne3]
+    const int64_t DK = q->ne[0];
+    const int64_t DV = v->ne[0];
+    const int64_t N  = q->ne[1];
+    const int64_t M  = k->ne[1];
+    const int64_t H  = q->ne[2];
+    const int64_t B  = q->ne[3];
 
-    const int64_t     D = q->ne[0];
-    const int64_t     N = q->ne[1];
-    const int64_t     M = k->ne[1];
-    const int64_t   ne2 = q->ne[2];
-    const int64_t   ne3 = q->ne[3];
-    const int64_t kvne2 = k->ne[2];
+    GGML_ASSERT(k->ne[0] == DK);
+    GGML_ASSERT(v->ne[1] == M);
 
-    GGML_ASSERT(k->ne[0] == D);
-    GGML_ASSERT(v->ne[0] == M);
-    GGML_ASSERT(v->ne[1] == D);
-    GGML_ASSERT(d->ne[0] == D);
-    GGML_ASSERT(d->ne[1] == N);
-    GGML_ASSERT(k->ne[2] == kvne2);
-    GGML_ASSERT(k->ne[3] == ne3);
-    GGML_ASSERT(v->ne[2] == kvne2);
-    GGML_ASSERT(v->ne[3] == ne3);
-    GGML_ASSERT(d->ne[2] == ne2);
-    GGML_ASSERT(d->ne[3] == ne3);
+    // grouped-query attention: q heads are a whole multiple of the kv heads
+    GGML_ASSERT(k->ne[2] == v->ne[2]);
+    GGML_ASSERT(H % k->ne[2] == 0);
+    GGML_ASSERT(k->ne[3] == v->ne[3]);
+    GGML_ASSERT(B % k->ne[3] == 0);
 
-    GGML_ASSERT(ne2 % kvne2 == 0);
+    // d carries the forward result's permuted shape [DV, H, N, B]
+    GGML_ASSERT(d->ne[0] == DV);
+    GGML_ASSERT(d->ne[1] == H);
+    GGML_ASSERT(d->ne[2] == N);
+    GGML_ASSERT(d->ne[3] == B);
 
-    // store gradients of q, k and v as continuous tensors concatenated in result.
-    // note: v and gradv are actually transposed, i.e. v->ne[0] != D.
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(mask->ne[0] == M);
+        GGML_ASSERT(mask->ne[1] == N);
+        GGML_ASSERT(H % mask->ne[2] == 0);
+        GGML_ASSERT(B % mask->ne[3] == 0);
+    }
+
+    // The kernel reads q/k/v/d as f32 directly; quantised or f16 sources would
+    // need per-type vec_dot plumbing that the backward pass does not have.
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(d->type == GGML_TYPE_F32);
+
+    // store gradients of q, k and v as continuous tensors concatenated in result
     const int64_t elem_q = ggml_nelements(q);
     const int64_t elem_k = ggml_nelements(k);
     const int64_t elem_v = ggml_nelements(v);
@@ -3657,14 +3922,14 @@ struct ggml_tensor * ggml_flash_attn_back(
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nelements);
 
-    int32_t masked_i = masked ? 1 : 0;
-    ggml_set_op_params(result, &masked_i, sizeof(masked_i));
+    ggml_set_op_params_f32(result, 0, scale);
 
     result->op     = GGML_OP_FLASH_ATTN_BACK;
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = v;
-    result->src[3] = d;
+    result->src[3] = mask;
+    result->src[4] = d;
 
     return result;
 }
@@ -4678,6 +4943,25 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggmlR-patch: ggml 0.27 signature; kernels only write the final state, so K must be 1
+struct ggml_tensor * ggml_gated_delta_net_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        int64_t               K) {
+    GGML_ASSERT(K == 1 && "ggml_gated_delta_net_ext: only K == 1 is supported");
+
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
 
     return result;
 }

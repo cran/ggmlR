@@ -838,13 +838,31 @@ ggml_l2_norm_inplace <- function(ctx, a, eps = 1e-5) {
 #' Used in training for computing gradients.
 #'
 #' @param ctx GGML context
-#' @param a Input tensor (x from forward pass)
-#' @param b Gradient tensor (dy)
+#' @param a Gradient tensor (dy from the forward output)
+#' @param b Input tensor (x from the forward pass)
 #' @param eps Epsilon for numerical stability (default 1e-5)
 #' @return Tensor representing the gradient with respect to input
 #' @export
 ggml_rms_norm_back <- function(ctx, a, b, eps = 1e-5) {
   .Call("R_ggml_rms_norm_back", ctx, a, b, as.numeric(eps), PACKAGE = "ggmlR")
+}
+
+#' Layer Norm Backward (Graph)
+#'
+#' Creates a graph node for the backward pass of \code{\link{ggml_norm}}, i.e.
+#' of LayerNorm without gamma/beta. Upstream ggml has no backward for
+#' \code{GGML_OP_NORM}; ggmlR adds it with CPU and Vulkan kernels, which is what
+#' makes \code{\link{ggml_layer_layer_norm}} trainable.
+#'
+#' @param ctx GGML context
+#' @param a Gradient tensor (dy from the forward output)
+#' @param b Input tensor (x from the forward pass)
+#' @param eps Epsilon for numerical stability (default 1e-5)
+#' @return Tensor representing the gradient with respect to input
+#' @seealso \code{\link{ggml_norm}}, \code{\link{ggml_rms_norm_back}}
+#' @export
+ggml_norm_back <- function(ctx, a, b, eps = 1e-5) {
+  .Call("R_ggml_norm_back", ctx, a, b, as.numeric(eps), PACKAGE = "ggmlR")
 }
 
 # ============================================================================
@@ -2111,6 +2129,40 @@ ggml_get_rows <- function(ctx, a, b) {
   .Call("R_ggml_get_rows", ctx, a, b, PACKAGE = "ggmlR")
 }
 
+#' Scatter elements into a copy of a tensor (ONNX ScatterElements)
+#'
+#' Copies `data`, then writes each element of `updates` into the copy at the
+#' position given by the matching element of `indices` along `axis`. Every
+#' other coordinate is the element's own, so `updates` and `indices` share a
+#' shape and only their position along `axis` is redirected.
+#'
+#' @param ctx A ggml context
+#' @param data Base tensor (F32); the result starts as a copy of it
+#' @param updates Values to write (F32), same shape as `indices`
+#' @param indices Destination positions along `axis` (I32)
+#' @param reduction 0 to overwrite, 1 to add
+#' @param axis Axis to scatter along, in ggml dim order (0 = ne[0])
+#' @return A new tensor with the shape of `data`
+#'
+#' @examples
+#' \donttest{
+#' ctx  <- ggml_init(16 * 1024 * 1024)
+#' base <- ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, 4)   # 4 rows of 3
+#' ggml_set_f32(base, rep(0, 12))
+#' upd  <- ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3, 2)
+#' ggml_set_f32(upd, c(1, 2, 3, 4, 5, 6))
+#' idx  <- ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, 2)
+#' ggml_set_i32(idx, c(3L, 3L, 3L, 0L, 0L, 0L))           # rows 3 and 0
+#' out  <- ggml_scatter_elements(ctx, base, upd, idx, 0L, 1L)
+#' ggml_free(ctx)
+#' }
+#' @export
+ggml_scatter_elements <- function(ctx, data, updates, indices,
+                                  reduction = 0L, axis = 0L) {
+  .Call("R_ggml_scatter_elements", ctx, data, updates, indices,
+        as.integer(reduction), as.integer(axis), PACKAGE = "ggmlR")
+}
+
 # ============================================================================
 # Diagonal Masking Operations (for Causal Attention)
 # ============================================================================
@@ -2799,6 +2851,29 @@ ggml_silu_back <- function(ctx, a, b) {
   .Call("R_ggml_silu_back", ctx, a, b, PACKAGE = "ggmlR")
 }
 
+#' GELU Backward (Graph)
+#'
+#' Gradient of the GELU activation: \code{dx = dy * dgelu(x)}. Wired into the
+#' autodiff engine, so \code{ggml_compile(activation = "gelu")} trains -- this
+#' is a ggmlR extension, upstream ggml has no GELU backward and aborts instead.
+#'
+#' The derivative is that of the tanh approximation \code{\link{ggml_gelu}}
+#' computes,
+#' \code{g(x) = 0.5x(1 + tanh(u))} with \code{u = c*x*(1 + a*x^2)}. The quick
+#' and erf variants (\code{\link{ggml_gelu_quick}}, \code{\link{ggml_gelu_erf}})
+#' are different functions with different derivatives and remain without a
+#' backward rule.
+#'
+#' @param ctx GGML context
+#' @param a Gradient tensor from upstream (\code{dy})
+#' @param b Forward input tensor (\code{x})
+#' @return Gradient tensor for the input
+#' @seealso \code{\link{ggml_gelu}}, \code{\link{ggml_silu_back}}
+#' @export
+ggml_gelu_back <- function(ctx, a, b) {
+  .Call("R_ggml_gelu_back", ctx, a, b, PACKAGE = "ggmlR")
+}
+
 #' Get Rows Backward (Graph)
 #'
 #' Backward pass for ggml_get_rows operation.
@@ -2865,19 +2940,35 @@ ggml_rope_ext_back <- function(ctx, a, b, c = NULL,
 
 #' Flash Attention Backward (Graph)
 #'
-#' Backward pass for Flash Attention.
-#' Used during training to compute gradients through attention.
+#' Backward pass for \code{\link{ggml_flash_attn_ext}}: given the gradient of
+#' the attention output, produces the gradients of Q, K and V in one pass.
+#'
+#' Upstream ggml ships this operation as a stub that aborts, left behind when
+#' \code{flash_attn} was replaced by \code{flash_attn_ext}; ggmlR implements it
+#' so attention can be trained through the fused op. It is also wired into the
+#' graph autodiff, so \code{\link{ggml_build_backward_expand}} reaches it on its
+#' own --- calling this directly is only needed when building a backward graph
+#' by hand.
+#'
+#' The three gradients come back packed head to tail in one contiguous 1D
+#' tensor: \code{grad_q}, then \code{grad_k}, then \code{grad_v}, each padded to
+#' \code{GGML_MEM_ALIGN}. Take a view of the slice you need.
+#'
+#' Not supported: \code{max_bias} (ALiBi), \code{logit_softcap} and attention
+#' sinks. Q, K, V and \code{d} must be F32.
 #'
 #' @param ctx GGML context
-#' @param q Query tensor (same as forward pass)
-#' @param k Key tensor (same as forward pass)
-#' @param v Value tensor (same as forward pass)
-#' @param d Gradient tensor from upstream (same shape as forward output)
-#' @param masked Logical: whether causal masking was used in forward pass
-#' @return Gradient tensor
+#' @param q Query tensor \code{[DK, N, H, B]}, as passed to the forward pass
+#' @param k Key tensor \code{[DK, M, H_kv, B]}, as passed to the forward pass
+#' @param v Value tensor \code{[DV, M, H_kv, B]}, as passed to the forward pass
+#' @param mask Attention mask \code{[M, N, H_m, B_m]} of type F16, or NULL
+#' @param d Gradient of the forward output, shape \code{[DV, H, N, B]}
+#' @param scale Softmax scale used in the forward pass (e.g. \code{1/sqrt(DK)})
+#' @return Tensor holding grad_q, grad_k and grad_v packed contiguously
+#' @seealso \code{\link{ggml_flash_attn_ext}} for the forward pass.
 #' @export
-ggml_flash_attn_back <- function(ctx, q, k, v, d, masked = TRUE) {
-  .Call("R_ggml_flash_attn_back", ctx, q, k, v, d, as.logical(masked),
+ggml_flash_attn_back <- function(ctx, q, k, v, mask, d, scale) {
+  .Call("R_ggml_flash_attn_back", ctx, q, k, v, mask, d, as.numeric(scale),
         PACKAGE = "ggmlR")
 }
 
@@ -2948,6 +3039,21 @@ ggml_mul_mat_id <- function(ctx, as, b, ids) {
 ggml_pad <- function(ctx, a, p0 = 0L, p1 = 0L, p2 = 0L, p3 = 0L) {
   .Call("R_ggml_pad", ctx, a, as.integer(p0), as.integer(p1),
         as.integer(p2), as.integer(p3), PACKAGE = "ggmlR")
+}
+
+#' Pad a tensor with zeros on both sides
+#'
+#' Like \code{\link{ggml_pad}}, but each dimension can also be padded before its
+#' first element.
+#'
+#' @param ctx GGML context
+#' @param a Input tensor to pad
+#' @param lp Integer vector of length 4: zeros added before dimensions 0..3
+#' @param rp Integer vector of length 4: zeros added after dimensions 0..3
+#' @return Padded tensor with shape [ne0+lp0+rp0, ne1+lp1+rp1, ...]
+#' @export
+ggml_pad_ext <- function(ctx, a, lp = c(0L, 0L, 0L, 0L), rp = c(0L, 0L, 0L, 0L)) {
+  .Call("R_ggml_pad_ext", ctx, a, as.integer(lp), as.integer(rp), PACKAGE = "ggmlR")
 }
 
 #' Sort Order Constants
@@ -3188,6 +3294,50 @@ ggml_set_name <- function(tensor, name) {
 #' @export
 ggml_set_param <- function(tensor) {
   .Call("R_ggml_set_param", tensor, PACKAGE = "ggmlR")
+}
+
+#' AdamW Optimizer Step (Graph Node)
+#'
+#' Builds a node that applies one AdamW step when the graph is computed:
+#' \preformatted{
+#' m <- beta1 * m + (1 - beta1) * grad
+#' v <- beta2 * v + (1 - beta2) * grad^2
+#' a <- a * (1 - alpha * wd) - alpha * (m * beta1h) / (sqrt(v * beta2h) + eps)
+#' }
+#' \code{a}, \code{m} and \code{v} are updated \emph{in place}; the returned
+#' tensor is a view of \code{a}. Because one kernel reads and writes each
+#' element, the update is free of the read-before-write ordering that a chain of
+#' separate ops would need. With \code{wd = 0} the decay factor is exactly 1.
+#'
+#' Precision: the kernel receives \code{beta2} as a float and forms
+#' \code{1 - beta2} itself, so the weight of \code{grad^2} in \code{v} is
+#' \code{1 - fl(beta2)}, not \code{1 - beta2}. Its relative error is
+#' 9.5e-7 for 0.99, 1.29e-5 for 0.999 and 1.66e-4 for 0.9999 -- the closer
+#' \code{beta2} is to 1, the larger. The effect on the weight is at most about
+#' half of that. Expect agreement with a double-precision Adam to that level,
+#' not to the last bit.
+#'
+#' Bias correction is passed in, not derived: for step \code{t},
+#' \code{beta1h = 1 / (1 - beta1^t)} and \code{beta2h = 1 / (1 - beta2^t)}.
+#'
+#' @param ctx GGML context
+#' @param a Weight tensor, F32, contiguous. It need not be marked with
+#'   \code{\link{ggml_set_param}}: the flag ggml asserts is set only while
+#'   the node is built, then the tensor's own flags are restored (a lasting
+#'   PARAM flag would turn the weight into a node of every later graph)
+#' @param grad Gradient, same shape as \code{a}, F32
+#' @param m First moment, same shape as \code{a}, F32
+#' @param v Second moment, same shape as \code{a}, F32
+#' @param adamw_params F32 tensor of 7 elements:
+#'   \code{alpha, beta1, beta2, eps, wd, beta1h, beta2h}
+#' @return A view of \code{a}; expand it into a graph to run the step
+#' @details Only F32 is supported (the CPU and Vulkan kernels are F32-only); any
+#'   other type or a shape mismatch is an R error.
+#' @seealso \code{\link{ggml_set_param}}, \code{\link{optimizer_adam}}
+#' @export
+ggml_opt_step_adamw <- function(ctx, a, grad, m, v, adamw_params) {
+  .Call("R_ggml_opt_step_adamw", ctx, a, grad, m, v, adamw_params,
+        PACKAGE = "ggmlR")
 }
 
 #' Mark a Tensor as the Loss

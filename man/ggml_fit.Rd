@@ -91,13 +91,30 @@ delegates to the low-level optimizer loop (\code{ggml_fit_opt}).
   \item{validation_split}{Fraction of data for validation (default: 0)}
   \item{validation_data}{Optional list(x_val, y_val) for validation. Overrides validation_split.}
   \item{class_weight}{Named vector of weights per class, e.g. c("0"=1, "1"=10). Cannot be used with sample_weight.}
-  \item{sample_weight}{Numeric vector of per-sample weights (length = nrow(x)). Cannot be used with class_weight.}
+  \item{sample_weight}{Per-sample weights: a numeric vector of length
+    \code{nrow(x)}, or -- for \code{mean_squared_error} only -- a
+    \code{nrow(x)} by \code{ncol(y)} matrix acting as a per-output loss mask.
+    A mask trains only the outputs whose weight is non-zero, which is what a
+    Q-model needs: 1 on the action that has a TD target, 0 elsewhere. The
+    denominator is unchanged (\code{sum(w*(pred-y)^2)/nelements}), so masking
+    does not renormalise over the active outputs. Cannot be used with
+    class_weight.}
   \item{verbose}{0 = silent, 1 = progress (default: 1)}
   \item{shuffle}{Shuffle the data (default: TRUE). Shuffled once before the
     train/validation split, then the training portion each epoch; the
     validation portion stays fixed. FALSE for time series or exactly
     reproducible runs.}
   \item{callbacks}{List of callback objects (early stopping, LR schedules)}
+  \item{generator}{Function of no arguments yielding \code{list(x, y)} for
+    one batch, or \code{NULL} when exhausted -- an alternative to \code{x}
+    and \code{y} that keeps only the current batch in memory. See
+    \code{\link{ggml_fit_generator}}, to which the call is forwarded along
+    with \code{steps_per_epoch}, \code{initial_epoch},
+    \code{validation_generator} and \code{validation_steps}. The arguments
+    that are defined in terms of a whole dataset --
+    \code{validation_split}, \code{validation_data}, \code{class_weight}
+    and \code{sample_weight} -- are rejected rather than ignored, and
+    \code{shuffle} is inert because the generator owns its own order.}
 }
 
 \strong{Low-level (optimizer loop):}

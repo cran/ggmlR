@@ -227,9 +227,11 @@
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
-#ifndef GGML_MAX_NAME
-#   define GGML_MAX_NAME        128
-#endif
+// ggmlR-patch: 160 (upstream 64) — stable-diffusion.cpp asserts GGML_MAX_NAME >= 160.
+// libggml.a is built with this value, so it is fixed here: a dependent passing its own
+// -DGGML_MAX_NAME (e.g. older sd2R with 128) still gets the same ggml_tensor layout.
+#undef  GGML_MAX_NAME
+#define GGML_MAX_NAME           160
 
 #define GGML_DEFAULT_N_THREADS  4
 #define GGML_DEFAULT_GRAPH_SIZE 8192
@@ -499,6 +501,7 @@ extern "C" {
         GGML_OP_REPEAT_BACK,
         GGML_OP_CONCAT,
         GGML_OP_SILU_BACK,
+        GGML_OP_GELU_BACK,
         GGML_OP_NORM, // normalize
         GGML_OP_RMS_NORM,
         GGML_OP_RMS_NORM_BACK,
@@ -593,6 +596,19 @@ extern "C" {
         GGML_OP_RWKV_WKV6_BACK,
         GGML_OP_RWKV_WKV7_BACK,
         GGML_OP_GATED_LINEAR_ATTN_BACK,
+        GGML_OP_NORM_BACK,
+
+        // ggmlR extension: QLinearConv with the int16 pair saturation ONNX
+        // Runtime's AVX2 kernel performs. A real op rather than a custom one
+        // so the scheduler can place it: GGML_OP_CUSTOM always reports
+        // unsupported, which pinned every quantised conv to the CPU and split
+        // the graph at each of them.
+        GGML_OP_QCONV_I32,
+        // ggmlR extension: ONNX QLinearMatMul with the same int16 pair saturation,
+        // see ggml_qmatmul_i32(). A real op for the same scheduling reason as
+        // QCONV_I32: as a ggml_map_custom3 it was a host node, so the GPU run
+        // downloaded A and B, re-uploaded them to a private dispatch, and waited.
+        GGML_OP_QMATMUL_I32,
 
         GGML_OP_COUNT,
     };
@@ -620,6 +636,14 @@ extern "C" {
         GGML_UNARY_OP_CEIL,
         GGML_UNARY_OP_ROUND,
         GGML_UNARY_OP_TRUNC,
+        // Round half to even ("banker's rounding"), as distinct from ROUND,
+        // which sends halfway cases away from zero the way roundf does.
+        // ONNX QuantizeLinear requires this rule specifically; ROUND cannot
+        // be reused for it, because ggml_round() is exported from this
+        // package with a test pinning 2.5 -> 3.
+        // Appended at the end on purpose: inserting it earlier would
+        // renumber every later op.
+        GGML_UNARY_OP_ROUND_EVEN,
 
         GGML_UNARY_OP_COUNT,
     };
@@ -1223,6 +1247,14 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // gelu backward: dx = dy * gelu'(x), for the tanh approximation ggml_gelu() uses
+    // a - dy (the incoming gradient)
+    // b - x  (the original input)
+    GGML_API struct ggml_tensor * ggml_gelu_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
     // hardswish(x) = x * relu6(x + 3) / 6
     GGML_API struct ggml_tensor * ggml_hardswish(
             struct ggml_context * ctx,
@@ -1262,6 +1294,21 @@ extern "C" {
             struct ggml_tensor  * a);
 
     GGML_API struct ggml_tensor * ggml_round_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    /**
+     * Rounds each element to the nearest integer, with halfway cases going to
+     * the nearest EVEN integer: 0.5 -> 0, 1.5 -> 2, 2.5 -> 2, -0.5 -> -0.
+     * Away from a halfway case this agrees with ggml_round; the two differ
+     * only on exact ties.
+     *
+     * This is what ONNX QuantizeLinear specifies ("it rounds to the nearest
+     * even"), which is why it exists separately: ggml_round follows roundf
+     * and sends ties away from zero, and that behaviour is part of this
+     * package's exported API.
+     */
+    GGML_API struct ggml_tensor * ggml_round_even(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
@@ -1430,9 +1477,20 @@ extern "C" {
             struct ggml_tensor  * a,
             float                 eps);
 
-    // a - x
-    // b - dy
+    // a - dy (gradient w.r.t. the forward output)
+    // b - x  (the forward input)
+    // NB: this is the order both ggml-graph.c and the CPU kernel use; the
+    // comment here used to say the opposite.
     GGML_API struct ggml_tensor * ggml_rms_norm_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 eps);
+
+    // Backward pass of ggml_norm (LayerNorm over ne0, no gamma/beta).
+    // a - dy (gradient w.r.t. the forward output)
+    // b - x  (the forward input)
+    GGML_API struct ggml_tensor * ggml_norm_back(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
@@ -1449,6 +1507,14 @@ extern "C" {
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_API void ggml_mul_mat_set_prec(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
+    // ggmlR-patch: backport from ggml 0.27 [TAG_GGML_PREC]
+    // set the minimum required accumulator type (MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT)
+    // same op_params slots as ggml_mul_mat_set_prec / ggml_flash_attn_ext_set_prec
+    // return false if the op does not support it
+    GGML_API bool ggml_prec_set_acc(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
 
@@ -2165,6 +2231,79 @@ extern "C" {
             int                   dilation0,
             int                   dilation1);
 
+    // ggmlR extension: ONNX QLinearConv, quantised values carried as f32.
+    //
+    // Reproduces ONNX Runtime's arithmetic rather than an exact integer sum:
+    // its AVX2 kernel multiplies with VPMADDUBSW, which adds ADJACENT PAIRS of
+    // products and saturates each pair to int16 before widening, and a pair
+    // genuinely reaches that limit. Matching ORT therefore means keeping the
+    // clip -- removing it makes the result more correct and less equal.
+    //
+    // w_scale and w_zp hold one entry per output channel, or one in total when
+    // the exporter quantised per tensor; bias is per output channel in i32
+    // quantised units and may be NULL.
+    //
+    // `mult` carries the requantisation multiplier, x_scale*w_scale[oc]/y_scale,
+    // PRECOMPUTED rather than derived in the kernel. It is passed in because
+    // the two backends do not agree on it otherwise: computing that expression
+    // in the shader differed from the C kernel by one ulp on 976 of 4096
+    // channels (measured, node 511_quantized of MaskRCNN), and against an
+    // accumulator of ~1e6 one ulp is enough to cross a rounding boundary and
+    // shift the output by a whole quantisation code -- 584 elements of that
+    // one node, and one detection instead of ten by the end of the graph.
+    // `precise` and splitting the expression did not make the two agree; the
+    // only way to be sure they use the same number is to hand them the same
+    // number.
+    GGML_API struct ggml_tensor * ggml_qconv_i32(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,        // [W_in, H_in, C_in, 1]
+            struct ggml_tensor  * w,        // [KW, KH, C_in, C_out]
+            struct ggml_tensor  * w_scale,  // [n_w_scale]
+            struct ggml_tensor  * w_zp,     // [n_w_zp], F32 or I32
+            struct ggml_tensor  * bias,     // [C_out], I32 or F32, or NULL
+            struct ggml_tensor  * mult,     // [C_out], F32: x_scale*w_scale[oc]/y_scale
+            int                   stride_w,
+            int                   stride_h,
+            int                   pad_w,
+            int                   pad_h,
+            int                   dil_w,
+            int                   dil_h,
+            float                 x_scale,
+            float                 y_scale,
+            int                   x_zp,
+            int                   y_zp,
+            float                 out_lo,
+            float                 out_hi);
+
+    // ggmlR extension: ONNX QLinearMatMul, dst[N, M] = requantise(a x b).
+    //
+    // Same arithmetic as ggml_qconv_i32(): adjacent pairs along K are summed
+    // and saturated to int16 exactly as ONNX Runtime's VPMADDUBSW kernel does,
+    // the accumulator is exact int32 otherwise, and requantisation is in float.
+    //
+    // `b` arrives TRANSPOSED, [K, N], so both operands walk K contiguously --
+    // the layout the CPU kernel and the shader both index.
+    //
+    // b_scale and b_zp are per output column (length N) or shared (length 1);
+    // b_zp may be NULL (symmetric export). b_zp_any says whether any b_zp is
+    // non-zero, decided by the caller from the initializer, so neither backend
+    // scans the table to learn whether the sum(a) term is needed.
+    //
+    // 2-D only: a and b must have ne[2] == ne[3] == 1.
+    GGML_API struct ggml_tensor * ggml_qmatmul_i32(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,        // [K, M], F32 holding integers
+            struct ggml_tensor  * b,        // [K, N], F32 holding integers
+            struct ggml_tensor  * b_scale,  // [1 or N], F32
+            struct ggml_tensor  * b_zp,     // [1 or N], F32 or I32, or NULL
+            float                 a_scale,
+            float                 y_scale,
+            int                   a_zp,
+            int                   y_zp,
+            int                   b_zp_any,
+            float                 out_lo,
+            float                 out_hi);
+
     GGML_API struct ggml_tensor * ggml_conv_transpose_2d_p0(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2432,14 +2571,20 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    // TODO: needs to be adapted to ggml_flash_attn_ext
+    // ggmlR extension: backward pass for ggml_flash_attn_ext.
+    // Upstream ships this as a GGML_ABORT stub speaking the pre-_ext layout;
+    // here it is a working op. mask may be NULL; scale must match the forward
+    // node. max_bias/logit_softcap/sinks are not supported (asserted).
+    // Returns grad_q, grad_k and grad_v packed in one contiguous 1D tensor;
+    // ggml-graph.c takes a view of each slice (see GGML_OP_FLASH_ATTN_EXT).
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
            struct ggml_tensor  * q,
            struct ggml_tensor  * k,
            struct ggml_tensor  * v,
+           struct ggml_tensor  * mask,
            struct ggml_tensor  * d,
-           bool                  masked);
+           float                 scale);
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
@@ -2622,6 +2767,19 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
+
+    // ggmlR-patch: ggml 0.27 signature with K (number of state snapshots in the output).
+    // Only K == 1 (final state only) is supported — identical to ggml_gated_delta_net().
+    // C++ callers can also use the 8-argument ggml_gated_delta_net() overload below.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            int64_t               K);
 
     /* 2D Relative Position Bias (BoTNet-style).
      * x:    [C, H*W, B]  — query/key features (col-major)
@@ -2921,5 +3079,21 @@ extern "C" {
     GGML_API bool                          ggml_threadpool_params_match  (const struct ggml_threadpool_params * p0, const struct ggml_threadpool_params * p1);
 
 #ifdef  __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+// ggmlR-patch: C++ overload with the ggml 0.27 signature (extra K). The 7-argument
+// extern "C" ggml_gated_delta_net() is unchanged, so existing callers keep compiling.
+inline struct ggml_tensor * ggml_gated_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        int64_t               K) {
+    return ggml_gated_delta_net_ext(ctx, q, k, v, g, beta, state, K);
 }
 #endif

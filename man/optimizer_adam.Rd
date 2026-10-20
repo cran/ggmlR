@@ -4,10 +4,19 @@
 \alias{optimizer_adam}
 \title{Create an Adam optimizer}
 \usage{
-optimizer_adam(params, lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-08)
+optimizer_adam(
+  params,
+  lr = 0.001,
+  beta1 = 0.9,
+  beta2 = 0.999,
+  eps = 1e-08,
+  accumulate_steps = 1L,
+  average = TRUE
+)
 }
 \arguments{
-\item{params}{Named list of ag_param tensors}
+\item{params}{List of ag_param tensors, named or not (names are used only
+for display). The same tensor listed twice is kept once, with a warning.}
 
 \item{lr}{Learning rate (default 1e-3)}
 
@@ -16,9 +25,28 @@ optimizer_adam(params, lr = 0.001, beta1 = 0.9, beta2 = 0.999, eps = 1e-08)
 \item{beta2}{Second moment decay (default 0.999)}
 
 \item{eps}{Stability constant (default 1e-8)}
+
+\item{accumulate_steps}{Number of \code{backward()} passes to accumulate
+before a call to \code{$step()} updates the weights (default 1, no
+accumulation).  The bias-correction counter advances only on a real
+update, so accumulating \code{k} micro-batches behaves like one step on
+the larger batch rather than like \code{k} steps.}
+
+\item{average}{When accumulating, divide the accumulated gradient by
+\code{accumulate_steps} (default \code{TRUE}).  See
+\code{\link{optimizer_sgd}}.}
 }
 \value{
-An optimizer environment
+An optimizer environment with \code{step(grads)}, \code{zero_grad()},
+  \code{state()} and \code{load_state(state)}. \code{state()} returns a
+  versioned list (moments as host double matrices, \code{t},
+  \code{accum_count}); \code{load_state()} checks the type, parameter
+  count, names (when both sides have them) and shapes before writing
+  anything, restores \code{t} and \code{accum_count}, and does NOT restore
+  hyperparameters (it warns when they differ). Exact continuation holds on
+  the same device and dtype; CPU <-> GPU in f32 continues within float
+  tolerance; across f16 and f32 it cannot be exact. Only read saved states
+  you trust (\code{readRDS}).
 }
 \description{
 Create an Adam optimizer

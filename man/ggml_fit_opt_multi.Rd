@@ -21,7 +21,8 @@ ggml_fit_opt_multi(
   shuffle = TRUE,
   shuffle_all = shuffle,
   callbacks = list(),
-  silent = FALSE
+  silent = FALSE,
+  weight_decay = 0
 )
 }
 \arguments{
@@ -78,6 +79,9 @@ validation keys are `NA` when `val_split` is 0, and accuracy keys are `NA`
 for heads whose loss is not cross-entropy.}
 
 \item{silent}{Whether to suppress per-epoch progress output}
+
+\item{weight_decay}{Decoupled weight decay in \code{[0, 1]}, as for
+\code{\link{ggml_opt_init_for_fit}}; 0 turns it off.}
 }
 \value{
 Data frame with columns epoch, train_loss, train_accuracy, val_loss,
@@ -113,6 +117,7 @@ attr(history, "head_loss")
 \seealso{
 Other optimization: 
 \code{\link{ggml_fit_opt}()},
+\code{\link{ggml_fit_opt_gen}()},
 \code{\link{ggml_opt_alloc}()},
 \code{\link{ggml_opt_context_optimizer_type}()},
 \code{\link{ggml_opt_dataset_data}()},
@@ -167,6 +172,8 @@ Other optimization:
 \code{\link{ggml_opt_result_pred}()},
 \code{\link{ggml_opt_result_reset}()},
 \code{\link{ggml_opt_set_lr}()},
-\code{\link{ggml_opt_static_graphs}()}
+\code{\link{ggml_opt_static_graphs}()},
+\code{\link{ggml_snapshot_free}()},
+\code{\link{ggml_trainer}()}
 }
 \concept{optimization}

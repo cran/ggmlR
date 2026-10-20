@@ -11,7 +11,9 @@ ggml_opt_init_for_fit(
   opt_period = 1L,
   ctx_compute = NULL,
   inputs = NULL,
-  outputs = NULL
+  outputs = NULL,
+  loss_mask_ne0 = NULL,
+  weight_decay = 0
 )
 }
 \arguments{
@@ -28,6 +30,13 @@ ggml_opt_init_for_fit(
 \item{inputs}{Input tensor (for static graphs)}
 
 \item{outputs}{Output tensor (for static graphs)}
+
+\item{loss_mask_ne0}{Width of the weighted-MSE weight tensor: \code{NULL} or
+1 for per-datapoint weights, or the output width for a per-output mask.
+Ignored by every other loss type.}
+
+\item{weight_decay}{Decoupled weight decay, in \code{[0, 1]}; 0 turns it off.
+Applied to trainable parameters only, so frozen weights are not decayed.}
 }
 \value{
 List with elements `opt_ctx` and `lr_ud`
@@ -40,6 +49,7 @@ The optimizer state (momentum) is preserved across epochs.
 \seealso{
 Other optimization: 
 \code{\link{ggml_fit_opt}()},
+\code{\link{ggml_fit_opt_gen}()},
 \code{\link{ggml_fit_opt_multi}()},
 \code{\link{ggml_opt_alloc}()},
 \code{\link{ggml_opt_context_optimizer_type}()},
@@ -94,6 +104,8 @@ Other optimization:
 \code{\link{ggml_opt_result_pred}()},
 \code{\link{ggml_opt_result_reset}()},
 \code{\link{ggml_opt_set_lr}()},
-\code{\link{ggml_opt_static_graphs}()}
+\code{\link{ggml_opt_static_graphs}()},
+\code{\link{ggml_snapshot_free}()},
+\code{\link{ggml_trainer}()}
 }
 \concept{optimization}

@@ -517,6 +517,21 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type 
 static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_context * ctx, ggml_type src0_type, ggml_type src1_type, ggml_prec prec, uint32_t ne11 = 0) {
     VK_LOG_DEBUG("ggml_vk_get_mul_mat_mat_pipeline(" << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ", " << prec << ")");
     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+        // ggmlR: honour GGML_PREC_F32 (see pipeline_matmul_f32_prec32). If no
+        // f32 tile fits in shared memory there is nothing exact to run -- say so
+        // once instead of silently accepting the flag and computing in f16.
+        if (prec == GGML_PREC_F32) {
+            if (ctx->device->pipeline_matmul_f32_prec32) {
+                return ctx->device->pipeline_matmul_f32_prec32;
+            }
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                GGML_LOG_WARN("ggml_vulkan: GGML_PREC_F32 requested for an f32 matmul, but no "
+                              "f32-tile matmul fits in shared memory on this device; "
+                              "computing with f16 tiles\n");
+            }
+        }
         return ctx->device->pipeline_matmul_f32;
     }
     if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F16) {
@@ -848,7 +863,7 @@ static void * ggml_vk_host_malloc(vk_device& device, size_t size) {
          vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
 
     if(!(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
-        fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned memory\n",
+        GGML_LOG_WARN("failed to allocate %.2f MB of pinned memory\n",
             size/1024.0/1024.0);
         device->device.freeMemory(buf->device_memory);
         device->device.destroyBuffer(buf->buffer);
@@ -880,7 +895,7 @@ static void ggml_vk_host_free(vk_device& device, void* ptr) {
         }
     }
     if (buf == nullptr) {
-        fprintf(stderr, "WARNING: failed to free pinned memory: memory not in map\n");
+        GGML_LOG_WARN("failed to free pinned memory: memory not in map\n");
         return;
     }
 
@@ -913,6 +928,34 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
         ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
     }
     if (!buffer) {
+        // A tensor reaching a Vulkan op without a Vulkan buffer is a scheduling
+        // error, not something to recover from: the cast below would reinterpret
+        // whatever ->context holds and the process would die on a bare address.
+        // Name the tensor and its op instead -- that is the difference between a
+        // reportable defect and a segfault somewhere in the backend.
+        //
+        // Two cases this does catch, both without touching bad memory: a null
+        // buffer (tested first, so the chain short-circuits), and a buffer that
+        // belongs to a different, live backend -- a CPU tensor handed to a
+        // Vulkan op, where the pointer is valid and only the type is wrong.
+        // The identity test is the one ggml_backend_buffer_is_vk() uses, spelled
+        // out because that helper is defined later in this translation unit.
+        //
+        // ⚠️ What it does NOT catch: a buffer pointer that is stale rather than
+        // null. Reading ->buft through it is itself the dereference that dies,
+        // so this cannot be turned into a guard against released pools -- on
+        // MaskRCNN-12-int8 the crash address (0x7679, 0x100000009) is a value
+        // read AS a field, meaning tensor->buffer already held garbage. Fixing
+        // that needs the stale pointer not to exist, not a test for it here.
+        if (tensor->buffer == nullptr ||
+            tensor->buffer->buft == nullptr ||
+            tensor->buffer->buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
+            GGML_ABORT("ggml_vk_tensor_subbuffer: tensor '%s' (op=%s) has no Vulkan buffer "
+                       "(buffer=%p) -- a Vulkan op was handed a source that lives on "
+                       "another backend, or one whose pool was released",
+                       tensor->name[0] ? tensor->name : "<unnamed>",
+                       ggml_op_name(tensor->op), (void *) tensor->buffer);
+        }
         auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
         buffer = buf_ctx->dev_buffer;
         offset = vk_tensor_offset(tensor) + tensor->view_offs;
@@ -1506,6 +1549,22 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
 }
 
 static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type, ggml_type src1_type) {
+    // ggmlR: the prec32 pipeline has its own (scalar) tile sizes and may lack
+    // some of them, so the device's per-type size flags -- and the coopmat2
+    // heuristic, which reads a_l unconditionally -- do not describe it. Same
+    // thresholds as the scalar path below, then the nearest size that exists.
+    if (mmp == ctx->device->pipeline_matmul_f32_prec32 && mmp != ctx->device->pipeline_matmul_f32) {
+        vk_pipeline by_size[3][2] = { { mmp->s, mmp->a_s }, { mmp->m, mmp->a_m }, { mmp->l, mmp->a_l } };
+        const int want = (m <= 32 || n <= 32) ? 0 : (m <= 64 || n <= 64) ? 1 : 2;
+        for (int d = 0; d < 3; ++d) {
+            for (int i : { want - d, want + d }) {
+                if (i >= 0 && i < 3 && by_size[i][0]) {
+                    return (aligned && by_size[i][1]) ? by_size[i][1] : by_size[i][0];
+                }
+            }
+        }
+    }
+
     VK_LOG_DEBUG("ggml_vk_guess_matmul_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ", " << ggml_type_name(src1_type) << ")");
 
     if (ctx->device->coopmat2) {

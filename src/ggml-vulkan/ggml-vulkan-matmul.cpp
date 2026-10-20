@@ -107,7 +107,20 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
     bool contig = ggml_is_contiguous(src) && (!dst || ggml_is_contiguous(dst));
 
     // Use optimized "transpose" shader if src dim1 is the innermost dimension.
-    bool transpose = dst && src->nb[1] == ggml_type_size(to) && ggml_are_same_shape(dst, src);
+    //
+    // Never when both sides are already contiguous: nb[1] == type_size is also
+    // true of a tensor whose ne[0] is 1, where the stride is trivial rather than
+    // transposed. Such a tensor is contiguous, and routing it here picks the
+    // 32x32 tiled shader, whose grid is sized from ne[0] and ne[1] -- both 1, so
+    // CEIL_DIV(1,32) = 1 -- leaving 1x1xN workgroups that each fill one element
+    // of a 1024-element tile. Measured on MaskRCNN: shapes of the form
+    // (1,1,N,M,1) cost ~4600-6100 us per million elements against ~300-660 for
+    // ordinary layouts, and made up two thirds of all CONT time (64 of 96.8 ms,
+    // ~30% of the model's whole GPU time) from a fifth of the dispatches.
+    // The contiguous copy shader below reads and writes linearly and needs no
+    // tiling, so preferring it costs a genuinely transposed tensor nothing --
+    // that one is not contiguous and still lands on the tiled path.
+    bool transpose = dst && !contig && src->nb[1] == ggml_type_size(to) && ggml_are_same_shape(dst, src);
 
     if (transpose && src->type == to) {
         if (ggml_type_size(to) == 4) {
@@ -252,6 +265,12 @@ static void ggml_vk_quantize_q8_1(ggml_backend_vk_context * ctx, vk_context& sub
     ggml_vk_sync_buffers(ctx, subctx);
 }
 
+// ggmlR: number of mat-mat dispatches that took the GGML_PREC_F32 f32-tile
+// path. Read from R (R_ggml_vk_prec32_count) so a test can tell that the flag
+// selected a different pipeline, not just that the numbers came out close.
+static uint64_t ggml_vk_prec32_dispatches = 0;
+extern "C" uint64_t ggml_vk_prec32_dispatch_count(void) { return ggml_vk_prec32_dispatches; }
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -303,12 +322,24 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
                               (src0->type == GGML_TYPE_BF16 && src1->type != GGML_TYPE_BF16) ||
                               !ggml_vk_dim01_contiguous(src1);
 
+    // ggmlR: f32 x f32 asking for GGML_PREC_F32 must not pass through f16 on the
+    // way in either -- a non-contiguous (e.g. transposed) operand is copied to a
+    // contiguous F32 buffer instead of being converted to F16, and y is not
+    // quantized to Q8_1. Everything below keys off f16_type, so this is the
+    // whole change on the dispatch side.
+    const bool prec32 = (ggml_prec)dst->op_params[0] == GGML_PREC_F32 &&
+                        src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                        ctx->device->pipeline_matmul_f32_prec32 != nullptr;
+
     // If src0 is BF16, try to use a BF16 x BF16 multiply
-    ggml_type f16_type = src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+    ggml_type f16_type = prec32 ? GGML_TYPE_F32 : src0->type == GGML_TYPE_BF16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    if (prec32) {
+        quantize_y = false;
+    }
 
     // Check for mmq first
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0], ne11) : nullptr;
@@ -335,6 +366,9 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const bool aligned = !quantize_y && ne10 == kpad && ne01 > 8 && ne11 > 8;
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_pipeline(ctx, mmp, ne01, ne11, aligned, qx_needs_dequant ? f16_type : src0->type, quantize_y ? GGML_TYPE_Q8_1 : (y_f32_kernel ? GGML_TYPE_F32 : src1->type));
+    if (prec32) {
+        ggml_vk_prec32_dispatches++;
+    }
 
     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
     uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) : ne11;
@@ -347,8 +381,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
-    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : sizeof(ggml_fp16_t) * x_ne;
-    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : sizeof(ggml_fp16_t) * y_ne);
+    const uint64_t x_sz = !qx_needs_dequant ? qx_sz : ggml_type_size(f16_type) * x_ne;
+    const uint64_t y_sz = quantize_y ? (ggml_vk_align_size(y_ne, 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1)) : (y_f32_kernel ? sizeof(float) * y_ne : ggml_type_size(f16_type) * y_ne);
     const uint64_t d_sz = sizeof(float) * d_ne;
 
     vk_pipeline to_fp16_vk_0 = nullptr;

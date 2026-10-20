@@ -138,9 +138,10 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
     do {                                                            \
         vk::Result err_ = (err);                                    \
         if (err_ != vk::Result::eSuccess) {                         \
-            fprintf(stderr, "ggml_vulkan: %s error %s at %s:%d\n",  \
-                #err, to_string(err_).c_str(), __FILE__, __LINE__); \
-            exit(1);                                                \
+            /* GGML_ABORT, not exit(1): both reach R as an error, but  \
+             * this one carries the Vulkan result into the message. */ \
+            GGML_ABORT("ggml_vulkan: %s error %s",                  \
+                #err, to_string(err_).c_str());                     \
         }                                                           \
     } while (0)
 
@@ -757,6 +758,12 @@ struct vk_device_struct {
     vk::DescriptorSetLayout dsl;
 
     vk_matmul_pipeline pipeline_matmul_f32 {};
+    // ggmlR: f32 x f32 with exact (f32) shared-memory tiles, used when the node
+    // asks for GGML_PREC_F32. On fp16/coopmat devices pipeline_matmul_f32 keeps
+    // its tiles in f16 (~4e-4 relative error for n > 8); this one is built from
+    // the _fp32 SPIR-V. Aliases pipeline_matmul_f32 on devices that are already
+    // fp32; null when no tile size fits in shared memory.
+    vk_matmul_pipeline pipeline_matmul_f32_prec32 {};
     vk_matmul_pipeline pipeline_matmul_f32_f16 {};
     vk_matmul_pipeline pipeline_matmul_bf16 {};
     vk_matmul_pipeline2 pipeline_matmul_f16;
@@ -843,6 +850,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f16;
     vk_pipeline pipeline_rms_norm_back_f32;
+    // DIVERGENCE from upstream: LayerNorm backward, see ggml_norm_back().
+    vk_pipeline pipeline_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
 
     // [src/dst 0=fp32,1=fp16]
@@ -863,6 +872,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_softplus[2];
     vk_pipeline pipeline_step[2];
     vk_pipeline pipeline_round[2];
+    vk_pipeline pipeline_round_even[2];
     vk_pipeline pipeline_ceil[2];
     vk_pipeline pipeline_floor[2];
     vk_pipeline pipeline_trunc[2];
@@ -878,6 +888,10 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_umap_sgd;
     vk_pipeline pipeline_pairwise_dist;
+    vk_pipeline pipeline_roi_align;
+    vk_pipeline pipeline_qmatmul_i32;
+    vk_pipeline pipeline_qconv_i32;
+    vk_pipeline pipeline_nms;
     vk_pipeline pipeline_knn_tiled;
     vk_pipeline pipeline_matmul_f64;
     vk_pipeline pipeline_sparse_lognorm;
@@ -894,6 +908,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_leaky_relu_f32;
     vk_pipeline pipeline_silu_back_f32;
+    vk_pipeline pipeline_gelu_back_f32;
     vk_pipeline pipeline_diag_mask_inf_f32;
     vk_pipeline pipeline_soft_max_f32, pipeline_soft_max_f32_f16;
     vk_pipeline pipeline_soft_max_f32_wg128, pipeline_soft_max_f32_f16_wg128;
@@ -939,6 +954,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_scan_back_f32_d256;
     vk_pipeline pipeline_out_prod_f32;   // ggmlR: backward of mul_mat
     vk_pipeline pipeline_cross_entropy_loss_back_f32;   // ggmlR
+    vk_pipeline pipeline_flash_attn_back_f32;   // ggmlR: backward of flash attention
+    vk_pipeline pipeline_im2col_back_f32;   // ggmlR: backward of convolution
+    vk_pipeline pipeline_get_rows_back_f32;   // ggmlR: backward of embedding lookup
+    // ggmlR: stage-truncated copies of the same shader, for profiling only.
+    // [0] is unused; [1..4] stop after phase 1..4. Built alongside the real
+    // pipeline so a profiling run needs no rebuild, and never used by the graph.
+    vk_pipeline pipeline_flash_attn_back_f32_prof[5];
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1454,6 +1476,101 @@ struct vk_op_pairwise_dist_push_constants {
 };
 static_assert(sizeof(vk_op_pairwise_dist_push_constants) <= 256, "sizeof(vk_op_pairwise_dist_push_constants) must be <= 256");
 
+// RoiAlign push constants. Must match the `parameter` block in
+// vulkan-shaders/roi_align.comp exactly: eight 4-byte scalars then one float.
+// sampling_ratio is SIGNED -- 0 means "adaptive" and the shader tests it with
+// `> 0`, which an unsigned copy would still pass but for the wrong reason if a
+// caller ever handed it a negative value.
+struct vk_op_roi_align_push_constants {
+    uint32_t W;
+    uint32_t H;
+    uint32_t C;
+    uint32_t num_rois;
+    uint32_t ow;
+    uint32_t oh;
+    int32_t  sampling_ratio;
+    uint32_t mode;
+    float    spatial_scale;
+};
+static_assert(sizeof(vk_op_roi_align_push_constants) <= 256, "sizeof(vk_op_roi_align_push_constants) must be <= 256");
+
+// QLinearMatMul (i32 accumulator) push constants. Must match the `parameter`
+// block in vulkan-shaders/qmatmul_i32.comp exactly. b_zp_any is computed on the
+// host so the shader does not scan the zero-point table in every thread.
+struct vk_op_qmatmul_i32_push_constants {
+    uint32_t M;
+    uint32_t N;
+    uint32_t K;
+    float    a_scale;
+    float    y_scale;
+    int32_t  a_zp;
+    int32_t  y_zp;
+    uint32_t n_b_scale;
+    uint32_t n_b_zp;
+    uint32_t b_zp_any;
+    float    out_lo;
+    float    out_hi;
+};
+static_assert(sizeof(vk_op_qmatmul_i32_push_constants) <= 256, "sizeof(vk_op_qmatmul_i32_push_constants) must be <= 256");
+
+// QLinearConv (i32 accumulator) push constants. Must match the `parameter`
+// block in vulkan-shaders/qconv_i32.comp exactly.
+struct vk_op_qconv_i32_push_constants {
+    uint32_t W_in;
+    uint32_t H_in;
+    uint32_t C_in;
+    uint32_t W_out;
+    uint32_t H_out;
+    uint32_t C_out;
+    uint32_t KW;
+    uint32_t KH;
+    int32_t  stride_w;
+    int32_t  stride_h;
+    int32_t  pad_w;
+    int32_t  pad_h;
+    int32_t  dil_w;
+    int32_t  dil_h;
+    float    x_scale;
+    float    y_scale;
+    int32_t  x_zp;
+    int32_t  y_zp;
+    uint32_t n_w_scale;
+    uint32_t n_w_zp;
+    uint32_t has_bias;
+    float    out_lo;
+    float    out_hi;
+    // w_zero_point is optional in the operator spec. Its binding is filled
+    // with another tensor when it is absent, because an unwritten descriptor
+    // is not a legal source -- so the shader needs to be told not to read it,
+    // rather than inferring absence from a length.
+    uint32_t has_w_zp;
+    // Diagnostic, GGMLR_QCONV_DEBUG_ACC=1: write the integer accumulator
+    // instead of the requantised value, so a per-node trace can tell a
+    // summation difference from a rounding one.
+    uint32_t debug_acc;
+    // Images in the batch (dst->ne[3]). Walked by the shader: a detector's mask
+    // head convolves one feature map PER DETECTION, so this is 51 rather than 1
+    // on MaskRCNN-12-int8. Leaving it out computed image 0 and left the rest of
+    // the output untouched -- masks summed 139.5 against ONNX Runtime's 7088.1.
+    uint32_t N_batch;
+};
+static_assert(sizeof(vk_op_qconv_i32_push_constants) <= 256, "sizeof(vk_op_qconv_i32_push_constants) must be <= 256");
+
+// NonMaxSuppression push constants. Must match the `parameter` block in
+// vulkan-shaders/nms.comp exactly.
+struct vk_op_nms_push_constants {
+    uint32_t num_boxes;
+    uint32_t num_classes;
+    uint32_t N;
+    uint32_t max_per_pair;
+    int32_t  max_output;
+    float    iou_thresh;
+    float    score_thresh;
+    uint32_t have_score_thresh;
+    uint32_t center_point_box;
+};
+static_assert(sizeof(vk_op_nms_push_constants) <= 256, "sizeof(vk_op_nms_push_constants) must be <= 256");
+
 // Tiled fused k-NN push constants. Must match the `parameter` block in
 // vulkan-shaders/knn_tiled.comp exactly (three uints). k must equal the K
 // specialization constant the pipeline was created with.
@@ -1510,11 +1627,11 @@ static vk_op_binary_push_constants vk_op_binary_push_constants_init(
     return p; // misalign_offsets set later in ggml_vk_op
 }
 
-struct vk_op_scatter_elements_push_constants {
-    uint32_t ne;        // row_size
-    uint32_t n_idx;     // number of indices
-    uint32_t reduction; // 0=overwrite, 1=add
-};
+/* No vk_op_scatter_elements_push_constants: SCATTER_ELEMENTS sends
+ * vk_op_binary_push_constants like the other binary ops, and the pipeline is
+ * declared with that size. A second, smaller struct for the same shader is
+ * what made the pipeline's push constant range too short to cover the fields
+ * the shader reads -- see the note at ggml_vk_create_pipeline for it. */
 
 struct vk_op_multi_add_push_constants {
     // shape for dst
@@ -1810,6 +1927,49 @@ struct vk_op_out_prod_push_constants {
     uint32_t nb10, nb11, nb12, nb13;
     uint32_t nb1, nb2, nb3;
     uint32_t dps2, dps3;
+};
+
+// ggmlR extension: GGML_OP_GET_ROWS_BACK on the GPU. Strides are element
+// counts, not bytes.
+struct vk_op_get_rows_back_push_constants {
+    uint32_t nc;
+    uint32_t nr;
+    uint32_t dst_row;
+    uint32_t src_row;
+    uint32_t ne_total;
+};
+
+// ggmlR extension: GGML_OP_IM2COL_BACK on the GPU. Mirrors the CPU kernel's
+// parameters; ne_total lets the shader bound-check without recomputing it.
+struct vk_op_im2col_back_push_constants {
+    uint32_t N;
+    uint32_t IC;
+    uint32_t IH; uint32_t IW;
+    uint32_t OH; uint32_t OW;
+    uint32_t KH; uint32_t KW;
+    int32_t  s0; int32_t  s1;
+    int32_t  p0; int32_t  p1;
+    int32_t  d0; int32_t  d1;
+    uint32_t is_2D;
+    uint32_t ne_total;
+};
+
+// ggmlR extension: GGML_OP_FLASH_ATTN_EXT backward on the GPU. Strides are
+// element counts, not bytes -- the host divides by sizeof(float) so the shader
+// can index directly. dq/dk/dv offsets locate each gradient inside the packed
+// output, and must match the arithmetic ggml-graph.c uses to view them.
+struct vk_op_flash_attn_back_push_constants {
+    uint32_t DK, DV, N, M, H, B;
+    uint32_t rk2, rk3;
+    uint32_t q_s1, q_s2, q_s3;
+    uint32_t k_s1, k_s2, k_s3;
+    uint32_t v_s1, v_s2, v_s3;
+    uint32_t d_s1, d_s2, d_s3;
+    uint32_t m_s1, m_s2, m_s3;
+    uint32_t m_ne2, m_ne3;
+    uint32_t dq_off, dk_off, dv_off;
+    float    scale;
+    uint32_t has_mask;
 };
 
 // ggmlR extension: GGML_OP_CROSS_ENTROPY_LOSS_BACK on the GPU (no upstream
@@ -2334,8 +2494,10 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     vk::Result result;
     while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
         if (result != vk::Result::eNotReady) {
-            fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
-            exit(1);
+            /* GGML_ABORT, not exit(1): both reach R as an error (exit is
+             * redirected to r_ggml_exit above), but only this one carries the
+             * fence status into the message and runs r_ggml_abort_hook. */
+            GGML_ABORT("ggml_vulkan: fence status %s", to_string(result).c_str());
         }
         for (uint32_t i = 0; i < 100; ++i) {
             YIELD();
@@ -3346,7 +3508,10 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
     return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
 }
 
-static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
+// scalar_f32: size for the _fp32 SPIR-V variant (f32 tiles, no coopmat staging)
+// instead of the variant the device loads by default. Element size depends on
+// the shader variant, not on the device -- ggmlR, for pipeline_matmul_f32_prec32.
+static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type, bool scalar_f32 = false) {
 
     uint32_t lut_size = 0;
     switch (src0_type) {
@@ -3379,13 +3544,14 @@ static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vec
     }
 
     // Needs to be kept up to date on shader changes
-    const uint32_t bank_conflict_offset = device->coopmat_support ? 8 : 1;
-    const uint32_t type_size = device->fp16 ? sizeof(ggml_fp16_t) : sizeof(float);
+    const bool coopmat_variant = device->coopmat_support && !scalar_f32;
+    const uint32_t bank_conflict_offset = coopmat_variant ? 8 : 1;
+    const uint32_t type_size = (device->fp16 && !scalar_f32) ? sizeof(ggml_fp16_t) : sizeof(float);
     const uint32_t warps = warptile[0] / warptile[10];
 
     const uint32_t load_bufs = (warptile[1] + warptile[2]) * (warptile[3] + bank_conflict_offset) * type_size;
     const uint32_t mmid_row_ids = mul_mat_id ? (warptile[2] * 2 * sizeof(uint16_t)) : 0;
-    const uint32_t coopmat_stage = device->coopmat_support ? warptile[7] * warptile[8] / warps * sizeof(float) : 0;
+    const uint32_t coopmat_stage = coopmat_variant ? warptile[7] * warptile[8] / warps * sizeof(float) : 0;
     const uint32_t ballots_sh = mul_mat_id ? (warps * 4 * sizeof(uint32_t)) : 0;
 
     const uint32_t total_size = load_bufs + mmid_row_ids + coopmat_stage + lut_size + ballots_sh;

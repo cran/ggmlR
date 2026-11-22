@@ -14,7 +14,7 @@ knitr::opts_chunk$set(collapse = TRUE, comment = "#>",
 # # llamaR — whole-LLM inference; the split happens inside the model loader
 # model <- llama_load_model("model.gguf", n_gpu_layers = -1L,
 #                           devices = c("Vulkan0", "Vulkan1"),
-#                           split_mode = "row")     # or "layer" for pipeline
+#                           split_mode = "layer")   # or "tensor"
 
 ## ----eval=FALSE---------------------------------------------------------------
 # # Loopback sanity check: does the transport work at all on device 0?
@@ -46,6 +46,37 @@ knitr::opts_chunk$set(collapse = TRUE, comment = "#>",
 # 
 # # Inspect the row ranges the split math will use (0-based, half-open):
 # ggml_vulkan_split_row_ranges(nrows = 2048, n_devices = 2)
+
+## ----eval=FALSE---------------------------------------------------------------
+# n_in <- 512L; n_hid <- 2048L; n_out <- 512L; batch <- 16L
+# W1 <- array(rnorm(n_in * n_hid),  c(n_in,  n_hid))
+# W2 <- array(rnorm(n_hid * n_out), c(n_hid, n_out))
+# X  <- array(rnorm(n_in * batch),  c(n_in,  batch))
+# 
+# mlp <- function(ctx, input, w)          # w: the weight tensors, by name
+#   ggml_mul_mat(ctx, w$w2, ggml_relu(ctx, ggml_mul_mat(ctx, w$w1, input)))
+# 
+# Y <- ggml_tp_forward(
+#   weights = list(w1 = W1, w2 = W2),            # names are what `split` refers to
+#   forward = mlp,
+#   x       = X,                                 # the input tensor is named "input"
+#   devices = c(0L, 1L),
+#   split   = list(w1 = "rows", w2 = "cols"))
+# 
+# max(abs(Y - t(W2) %*% pmax(t(W1) %*% X, 0)))
+
+## ----eval=FALSE---------------------------------------------------------------
+# Y <- ggml_tp_forward(list(w1 = W1, w2 = W2), mlp, X,
+#                      devices = c("CPU", "CPU"),
+#                      split = list(w1 = "rows", w2 = "cols"))
+
+## ----eval=FALSE---------------------------------------------------------------
+# meta  <- ggml_meta_backend(c(0L, 1L), split = list(w1 = "rows", w2 = "cols"))
+# sched <- ggml_backend_sched_new(list(meta, ggml_backend_cpu_init()))
+# # Weights (and inputs) in a context allocated on `meta`:
+# #   buf <- ggml_backend_alloc_ctx_tensors(ctx_w, meta)
+# # The graph in a SEPARATE context, allocated through the scheduler:
+# #   ggml_backend_sched_alloc_graph(sched, gf); ggml_backend_sched_graph_compute(sched, gf)
 
 ## ----eval=FALSE---------------------------------------------------------------
 # K <- 64L; M <- 8L

@@ -119,6 +119,19 @@ ag_device <- function(device) {
   device <- match.arg(device, c("cpu", "gpu"))
   prev   <- .ag_device_state$device
 
+  # A CPU backend left in $backend (by older code, or by a caller that put one
+  # there) must not stand in for the GPU: ops would run on the CPU while the
+  # device reads "gpu", silently. Release it, as the switch to "cpu" below
+  # releases a GPU one, and bring up Vulkan.
+  if (device == "gpu" && !is.null(.ag_device_state$backend) &&
+      identical(tryCatch(ggml_backend_name(.ag_device_state$backend),
+                         error = function(e) NA_character_), "CPU")) {
+    .ag_residency_reset()
+    tryCatch(ggml_backend_free(.ag_device_state$backend),
+             error = function(e) NULL)
+    .ag_device_state$backend <- NULL
+  }
+
   if (device == "gpu" && is.null(.ag_device_state$backend)) {
     .ag_init_gpu_backend()
   }
@@ -169,6 +182,12 @@ ag_default_device <- function() {
 #' give f32 accuracy (~\code{1e-7}). \code{"f32"} asks every \code{ag_matmul}
 #' (forward, and the input gradient of the graph backward) for the f32-tile
 #' kernel, so the result no longer depends on the batch size or the device.
+#' The same setting asks \code{\link{ag_flash_attention}} for f32 accumulation
+#' in its forward. That is a request, not a guarantee: on cooperative-matrix
+#' devices (e.g. RDNA4 under RADV) Vulkan multiplies the attention operands as
+#' f16 whatever the accumulator, and the forward stays about \code{3e-4} to
+#' \code{7e-4} off an f32 reference with or without it. The backward of
+#' \code{ag_flash_attention} is f32 regardless.
 #'
 #' Cost: none measurable on small layers (RL policies, tens to hundreds of
 #' units); 2-4x slower on large ones (1024 x 1024 and up). That is why the default
@@ -588,8 +607,34 @@ ag_to_device <- function(tensor, device) {
 # cgraph is allocated inside the context, so the context must be able to hold
 # ggml_graph_overhead() no matter how small the op is. Asking ggml for the
 # figure keeps this correct if the default or the struct layout changes.
-.ag_graph_ctx_bytes <- function() {
-  as.double(ggml_graph_overhead()) + 64 * 1024   # + slack for object headers
+.ag_graph_ctx_bytes <- function(size = NULL) {
+  oh <- if (is.null(size)) ggml_graph_overhead()
+        else .Call("R_ggml_graph_overhead_custom", as.double(size), FALSE, PACKAGE = "ggmlR")
+  as.double(oh) + 64 * 1024   # + slack for object headers
+}
+
+# A graph over `roots` (a list of tensor pointers) in a throwaway context sized
+# for it. ggml_new_graph() holds GGML_DEFAULT_GRAPH_SIZE = 8192 nodes; an
+# unrolled loop exceeds that (an LSTM over 128 steps with its backward: ~10k)
+# and the overflow is a GGML_ASSERT. Size = the distinct tensors reachable from
+# the roots (counted in C, iteratively), at least 8192 -- so small graphs are
+# built exactly as before. Used where graphs grow with the work: the deferred
+# graph, the graph backward and ag_capture recordings; a single op keeps the
+# default. Returns list(ctx, graph); the caller frees ctx.
+.ag_graph_build <- function(roots, what) {
+  n <- .Call("R_ggml_graph_count_reachable", roots, PACKAGE = "ggmlR")
+  size <- max(8192, n + 16)
+  ctx <- ggml_init(.ag_graph_ctx_bytes(size), no_alloc = TRUE)
+  if (is.null(ctx))
+    stop("ggmlR: failed to create a ggml context for the ", what, " (", size, " nodes)",
+         call. = FALSE)
+  graph <- tryCatch({
+    g <- .Call("R_ggml_build_forward_expand_sized", ctx, roots[[1L]], size,
+               PACKAGE = "ggmlR")
+    for (r in roots[-1L]) ggml_graph_expand(g, r)
+    g
+  }, error = function(e) { ggml_free(ctx); stop(e) })
+  list(ctx = ctx, graph = graph, size = size)
 }
 
 # Execute a ggml graph for a single result node and return its data as a matrix.
@@ -970,6 +1015,32 @@ GGML_PREC_F32 <- 10L
   )
 }
 
+# A [nr, nc] tensor of zeros made on the device (one ggml_fill node over a
+# shape-only leaf): nothing is uploaded, so it can be recorded by ag_capture.
+# The type is the compute dtype, as for every other op result.
+.ag_gpu_zeros <- function(nr, nc) {
+  nr <- as.integer(nr); nc <- as.integer(nc)
+  gt <- .ag_dtype_to_ggml(.ag_compute_dtype(.ag_device_state$dtype))
+  .ag_run_op(
+    op_fn    = function(ctx, ptrs) ggml_fill(ctx, ggml_new_tensor_2d(ctx, gt, nr, nc), 0),
+    inputs   = list(),
+    out_shape = c(nr, nc),
+    resident  = TRUE
+  )
+}
+
+# s * x + b with numbers s, b: one ggml_scale_bias node, nothing uploaded (so it
+# can be recorded by ag_capture).
+.ag_gpu_scale_bias <- function(x_data, s, b) {
+  s <- as.double(s); b <- as.double(b)
+  .ag_run_op(
+    op_fn    = function(ctx, ptrs) ggml_scale_bias(ctx, ptrs[[1L]], s, b),
+    inputs   = list(x_data),
+    out_shape = .ag_dim(x_data),
+    resident  = .ag_is_handle(x_data)
+  )
+}
+
 .ag_gpu_relu <- function(x_data) {
   .ag_run_op(
     op_fn    = function(ctx, ptrs) ggml_relu(ctx, ptrs[[1L]]),
@@ -1019,6 +1090,55 @@ GGML_PREC_F32 <- 10L
 .ag_gpu_exp <- function(x_data) {
   .ag_run_op(
     op_fn    = function(ctx, ptrs) ggml_exp(ctx, ptrs[[1L]]),
+    inputs   = list(x_data),
+    out_shape = .ag_dim(x_data),
+    resident  = .ag_is_handle(x_data)
+  )
+}
+
+.ag_gpu_sin <- function(x_data) {
+  .ag_run_op(
+    op_fn    = function(ctx, ptrs) ggml_sin(ctx, ptrs[[1L]]),
+    inputs   = list(x_data),
+    out_shape = .ag_dim(x_data),
+    resident  = .ag_is_handle(x_data)
+  )
+}
+
+.ag_gpu_cos <- function(x_data) {
+  .ag_run_op(
+    op_fn    = function(ctx, ptrs) ggml_cos(ctx, ptrs[[1L]]),
+    inputs   = list(x_data),
+    out_shape = .ag_dim(x_data),
+    resident  = .ag_is_handle(x_data)
+  )
+}
+
+.ag_gpu_silu <- function(x_data) {
+  .ag_run_op(
+    op_fn    = function(ctx, ptrs) ggml_silu(ctx, ptrs[[1L]]),
+    inputs   = list(x_data),
+    out_shape = .ag_dim(x_data),
+    resident  = .ag_is_handle(x_data)
+  )
+}
+
+# ggml_rms_norm normalises over ne0, which for an R [features, batch] matrix is
+# the feature axis of each column -- one example at a time, as ag_rms_norm
+# promises.
+.ag_gpu_rms_norm <- function(x_data, eps) {
+  .ag_run_op(
+    op_fn    = function(ctx, ptrs) ggml_rms_norm(ctx, ptrs[[1L]], eps = eps),
+    inputs   = list(x_data),
+    out_shape = .ag_dim(x_data),
+    resident  = .ag_is_handle(x_data)
+  )
+}
+
+# LayerNorm without affine: (x - mean) / sqrt(var + eps) per column (ne0).
+.ag_gpu_layer_norm <- function(x_data, eps) {
+  .ag_run_op(
+    op_fn    = function(ctx, ptrs) ggml_norm(ctx, ptrs[[1L]], eps = eps),
     inputs   = list(x_data),
     out_shape = .ag_dim(x_data),
     resident  = .ag_is_handle(x_data)
@@ -1287,6 +1407,7 @@ GGML_PREC_F32 <- 10L
   bc1 <- 1 - b1^env$t                     # bias correction, m
   bc2 <- 1 - b2^env$t                     # bias correction, v
   lr <- env$lr; eps <- env$eps
+  keep <- 1 - lr * (env$weight_decay %||% 0)   # AdamW decoupled decay; 1 for Adam
 
   # scope = "pass" and out = <persistent handle> is the combination that makes
   # this free of leaks: the intermediates are garbage the moment the step ends
@@ -1330,7 +1451,8 @@ GGML_PREC_F32 <- 10L
                num <- ggml_scale(ctx, ptrs[[2L]], lr / bc1)
                den <- ggml_scale_bias(ctx,
                         ggml_sqrt(ctx, ggml_scale(ctx, ptrs[[3L]], 1 / bc2)), 1, eps)
-               ggml_sub(ctx, ptrs[[1L]], ggml_div(ctx, num, den))
+               w <- if (keep != 1) ggml_scale(ctx, ptrs[[1L]], keep) else ptrs[[1L]]
+               ggml_sub(ctx, w, ggml_div(ctx, num, den))
              },
              inputs = list(mw, new_m, new_v), out_shape = sh, dtype = "f32",
              scope = "pass", resident = TRUE)
@@ -1374,7 +1496,7 @@ GGML_PREC_F32 <- 10L
 # backend may run them in any order.
 #
 # Same formula as .ag_adam_step_device_impl and the host step (eps outside the
-# square root, bias correction as 1/bc factors, no weight decay: wd = 0 makes
+# square root, bias correction as 1/bc factors, decoupled weight decay env$weight_decay -- 0 for Adam, which makes
 # the kernel's decay factor exactly 1.0f). Not bit-identical to the per-op path:
 # lr * (m * (1/bc1)) rounds differently from (lr / bc1) * m, about 1 ULP a step.
 # And one SYSTEMATIC difference: the kernel takes beta2 as float and forms
@@ -1432,7 +1554,7 @@ GGML_PREC_F32 <- 10L
 # The 7 values in the order the kernel reads them: alpha, beta1, beta2, eps,
 # weight decay, 1/(1 - beta1^t), 1/(1 - beta2^t).
 .ag_adam_hp_values <- function(env, t) {
-  c(env$lr, env$beta1, env$beta2, env$eps, 0,
+  c(env$lr, env$beta1, env$beta2, env$eps, env$weight_decay %||% 0,
     1 / (1 - env$beta1^t), 1 / (1 - env$beta2^t))
 }
 
@@ -1611,12 +1733,16 @@ GGML_PREC_F32 <- 10L
 # Reshape: ggml_reshape_2d + ggml_cont
 .ag_gpu_reshape <- function(x_data, new_nrow, new_ncol) {
   .ag_run_op(
-    op_fn    = function(ctx, ptrs)
-                 ggml_cont(ctx, ggml_reshape_2d(ctx, ptrs[[1L]],
-                                                as.integer(new_nrow),
-                                                as.integer(new_ncol))),
+    op_fn    = function(ctx, ptrs) {
+                 # reshape needs a contiguous source (a transpose is a view)
+                 src <- ptrs[[1L]]
+                 if (!ggml_is_contiguous(src)) src <- ggml_cont(ctx, src)
+                 ggml_cont(ctx, ggml_reshape_2d(ctx, src, as.integer(new_nrow),
+                                                as.integer(new_ncol)))
+               },
     inputs   = list(x_data),
-    out_shape = c(new_nrow, new_ncol)
+    out_shape = c(new_nrow, new_ncol),
+    resident = TRUE
   )
 }
 

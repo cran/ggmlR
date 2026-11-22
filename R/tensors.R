@@ -13,6 +13,9 @@
 #'   \item \code{GGML_TYPE_Q8_0}: 8-bit quantization type 0
 #'   \item \code{GGML_TYPE_I32}: 32-bit integer
 #'   \item \code{GGML_TYPE_BF16}: 16-bit brain float (bfloat16)
+#'   \item \code{GGML_TYPE_I64}: 64-bit integer (held in R as double, exact
+#'     for magnitudes up to 2^53)
+#'   \item \code{GGML_TYPE_F64}: 64-bit floating point
 #' }
 #' @export
 #' @examples
@@ -67,36 +70,45 @@ GGML_TYPE_I32  <- 26L
 #' @export
 GGML_TYPE_BF16 <- 30L
 
-#' Create 1D Tensor
-#' @param ctx GGML context
-#' @param type Data type
-#' @param ne0 Size
-#' @return Tensor pointer
+#' @rdname GGML_TYPE_F32
+#' @export
+GGML_TYPE_I64  <- 27L
+
+#' @rdname GGML_TYPE_F32
+#' @export
+GGML_TYPE_F64  <- 28L
+
+#' @rdname ggml_new_tensor
+#' @details \code{ggml_new_tensor_1d()}, \code{ggml_new_tensor_2d()},
+#' \code{ggml_new_tensor_3d()}, \code{ggml_new_tensor_4d()}: create a tensor
+#' with 1 to 4 dimensions of sizes \code{ne0} .. \code{ne3}.
+#' @param ne0 Size of dimension 0 (number of elements / rows)
+#' @examples
+#' \donttest{
+#' ctx <- ggml_init(1024 * 1024)
+#' tensor <- ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 10)
+#' ggml_nelements(tensor)
+#' tensor <- ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 10, 20)
+#' ggml_nelements(tensor)
+#' ggml_free(ctx)
+#' }
 #' @export
 ggml_new_tensor_1d <- function(ctx, type = GGML_TYPE_F32, ne0) {
   .Call("R_ggml_new_tensor_1d", ctx, as.integer(type), as.numeric(ne0))
 }
 
-#' Create 2D Tensor
-#' @param ctx GGML context
-#' @param type Data type
-#' @param ne0 Rows
-#' @param ne1 Columns
-#' @return Tensor pointer
+#' @rdname ggml_new_tensor
+#' @param ne1 Size of dimension 1 (number of columns)
 #' @export
 ggml_new_tensor_2d <- function(ctx, type = GGML_TYPE_F32, ne0, ne1) {
   .Call("R_ggml_new_tensor_2d", ctx, as.integer(type),
         as.numeric(ne0), as.numeric(ne1))
 }
 
-#' Create 3D Tensor
-#' @param ctx GGML context
-#' @param type Data type (default GGML_TYPE_F32)
-#' @param ne0 Size of dimension 0
-#' @param ne1 Size of dimension 1
+#' @rdname ggml_new_tensor
+#' @details \code{ggml_new_tensor_3d()}: 
+#' Returns: Tensor pointer
 #' @param ne2 Size of dimension 2
-#' @return Tensor pointer
-#' @export
 #' @examples
 #' \donttest{
 #' ctx <- ggml_init(1024 * 1024)
@@ -104,20 +116,16 @@ ggml_new_tensor_2d <- function(ctx, type = GGML_TYPE_F32, ne0, ne1) {
 #' ggml_nelements(t)
 #' ggml_free(ctx)
 #' }
+#' @export
 ggml_new_tensor_3d <- function(ctx, type = GGML_TYPE_F32, ne0, ne1, ne2) {
   .Call("R_ggml_new_tensor_3d", ctx, as.integer(type),
         as.numeric(ne0), as.numeric(ne1), as.numeric(ne2))
 }
 
-#' Create 4D Tensor
-#' @param ctx GGML context
-#' @param type Data type (default GGML_TYPE_F32)
-#' @param ne0 Size of dimension 0
-#' @param ne1 Size of dimension 1
-#' @param ne2 Size of dimension 2
+#' @rdname ggml_new_tensor
+#' @details \code{ggml_new_tensor_4d()}: 
+#' Returns: Tensor pointer
 #' @param ne3 Size of dimension 3
-#' @return Tensor pointer
-#' @export
 #' @examples
 #' \donttest{
 #' ctx <- ggml_init(1024 * 1024)
@@ -125,6 +133,7 @@ ggml_new_tensor_3d <- function(ctx, type = GGML_TYPE_F32, ne0, ne1, ne2) {
 #' ggml_nelements(t)
 #' ggml_free(ctx)
 #' }
+#' @export
 ggml_new_tensor_4d <- function(ctx, type = GGML_TYPE_F32, ne0, ne1, ne2, ne3) {
   .Call("R_ggml_new_tensor_4d", ctx, as.integer(type),
         as.numeric(ne0), as.numeric(ne1), as.numeric(ne2), as.numeric(ne3))
@@ -150,7 +159,7 @@ ggml_dup_tensor <- function(ctx, tensor) {
   .Call("R_ggml_dup_tensor", ctx, tensor)
 }
 
-#' Create Tensor with Arbitrary Dimensions
+#' Create New Tensors
 #'
 #' Generic tensor constructor for creating tensors with 1-4 dimensions.
 #' This is more flexible than the ggml_new_tensor_Nd functions.
@@ -321,7 +330,7 @@ ggml_n_dims <- function(tensor) {
   .Call("R_ggml_n_dims", tensor)
 }
 
-#' Check if Tensor is Contiguous
+#' Tensor Contiguity Checks
 #'
 #' Returns TRUE if tensor data is stored contiguously in memory
 #'

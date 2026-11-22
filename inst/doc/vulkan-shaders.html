@@ -1,0 +1,1337 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8" />
+<meta name="generator" content="pandoc" />
+<meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
+
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+
+
+<title>Writing Vulkan Shaders</title>
+
+<script>// Pandoc 2.9 adds attributes on both header and div. We remove the former (to
+// be compatible with the behavior of Pandoc < 2.8).
+document.addEventListener('DOMContentLoaded', function(e) {
+  var hs = document.querySelectorAll("div.section[class*='level'] > :first-child");
+  var i, h, a;
+  for (i = 0; i < hs.length; i++) {
+    h = hs[i];
+    if (!/^h[1-6]$/i.test(h.tagName)) continue;  // it should be a header h1-h6
+    a = h.attributes;
+    while (a.length > 0) h.removeAttribute(a[0].name);
+  }
+});
+</script>
+
+<style type="text/css">
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+span.underline{text-decoration: underline;}
+div.column{display: inline-block; vertical-align: top; width: 50%;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+</style>
+
+
+
+<style type="text/css">
+code {
+white-space: pre;
+}
+.sourceCode {
+overflow: visible;
+}
+</style>
+<style type="text/css" data-origin="pandoc">
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+color: #aaaaaa;
+}
+pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+code span.al { color: #ff0000; font-weight: bold; } 
+code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.at { color: #7d9029; } 
+code span.bn { color: #40a070; } 
+code span.bu { color: #008000; } 
+code span.cf { color: #007020; font-weight: bold; } 
+code span.ch { color: #4070a0; } 
+code span.cn { color: #880000; } 
+code span.co { color: #60a0b0; font-style: italic; } 
+code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.do { color: #ba2121; font-style: italic; } 
+code span.dt { color: #902000; } 
+code span.dv { color: #40a070; } 
+code span.er { color: #ff0000; font-weight: bold; } 
+code span.ex { } 
+code span.fl { color: #40a070; } 
+code span.fu { color: #06287e; } 
+code span.im { color: #008000; font-weight: bold; } 
+code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } 
+code span.kw { color: #007020; font-weight: bold; } 
+code span.op { color: #666666; } 
+code span.ot { color: #007020; } 
+code span.pp { color: #bc7a00; } 
+code span.sc { color: #4070a0; } 
+code span.ss { color: #bb6688; } 
+code span.st { color: #4070a0; } 
+code span.va { color: #19177c; } 
+code span.vs { color: #4070a0; } 
+code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } 
+</style>
+<script>
+// apply pandoc div.sourceCode style to pre.sourceCode instead
+(function() {
+  var sheets = document.styleSheets;
+  for (var i = 0; i < sheets.length; i++) {
+    if (sheets[i].ownerNode.dataset["origin"] !== "pandoc") continue;
+    try { var rules = sheets[i].cssRules; } catch (e) { continue; }
+    var j = 0;
+    while (j < rules.length) {
+      var rule = rules[j];
+      // check if there is a div.sourceCode rule
+      if (rule.type !== rule.STYLE_RULE || rule.selectorText !== "div.sourceCode") {
+        j++;
+        continue;
+      }
+      var style = rule.style.cssText;
+      // check if color or background-color is set
+      if (rule.style.color === '' && rule.style.backgroundColor === '') {
+        j++;
+        continue;
+      }
+      // replace div.sourceCode by a pre.sourceCode rule
+      sheets[i].deleteRule(j);
+      sheets[i].insertRule('pre.sourceCode{' + style + '}', j);
+    }
+  }
+})();
+</script>
+
+
+
+
+<style type="text/css">body {
+background-color: #fff;
+margin: 1em auto;
+max-width: 700px;
+overflow: visible;
+padding-left: 2em;
+padding-right: 2em;
+font-family: "Open Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+font-size: 14px;
+line-height: 1.35;
+}
+#TOC {
+clear: both;
+margin: 0 0 10px 10px;
+padding: 4px;
+width: 400px;
+border: 1px solid #CCCCCC;
+border-radius: 5px;
+background-color: #f6f6f6;
+font-size: 13px;
+line-height: 1.3;
+}
+#TOC .toctitle {
+font-weight: bold;
+font-size: 15px;
+margin-left: 5px;
+}
+#TOC ul {
+padding-left: 40px;
+margin-left: -1.5em;
+margin-top: 5px;
+margin-bottom: 5px;
+}
+#TOC ul ul {
+margin-left: -2em;
+}
+#TOC li {
+line-height: 16px;
+}
+table {
+margin: 1em auto;
+border-width: 1px;
+border-color: #DDDDDD;
+border-style: outset;
+border-collapse: collapse;
+}
+table th {
+border-width: 2px;
+padding: 5px;
+border-style: inset;
+}
+table td {
+border-width: 1px;
+border-style: inset;
+line-height: 18px;
+padding: 5px 5px;
+}
+table, table th, table td {
+border-left-style: none;
+border-right-style: none;
+}
+table thead, table tr.even {
+background-color: #f7f7f7;
+}
+p {
+margin: 0.5em 0;
+}
+blockquote {
+background-color: #f6f6f6;
+padding: 0.25em 0.75em;
+}
+hr {
+border-style: solid;
+border: none;
+border-top: 1px solid #777;
+margin: 28px 0;
+}
+dl {
+margin-left: 0;
+}
+dl dd {
+margin-bottom: 13px;
+margin-left: 13px;
+}
+dl dt {
+font-weight: bold;
+}
+ul {
+margin-top: 0;
+}
+ul li {
+list-style: circle outside;
+}
+ul ul {
+margin-bottom: 0;
+}
+pre, code {
+background-color: #f7f7f7;
+border-radius: 3px;
+color: #333;
+white-space: pre-wrap; 
+}
+pre {
+border-radius: 3px;
+margin: 5px 0px 10px 0px;
+padding: 10px;
+}
+pre:not([class]) {
+background-color: #f7f7f7;
+}
+code {
+font-family: Consolas, Monaco, 'Courier New', monospace;
+font-size: 85%;
+}
+p > code, li > code {
+padding: 2px 0px;
+}
+div.figure {
+text-align: center;
+}
+img {
+background-color: #FFFFFF;
+padding: 2px;
+border: 1px solid #DDDDDD;
+border-radius: 3px;
+border: 1px solid #CCCCCC;
+margin: 0 5px;
+}
+h1 {
+margin-top: 0;
+font-size: 35px;
+line-height: 40px;
+}
+h2 {
+border-bottom: 4px solid #f7f7f7;
+padding-top: 10px;
+padding-bottom: 2px;
+font-size: 145%;
+}
+h3 {
+border-bottom: 2px solid #f7f7f7;
+padding-top: 10px;
+font-size: 120%;
+}
+h4 {
+border-bottom: 1px solid #f7f7f7;
+margin-left: 8px;
+font-size: 105%;
+}
+h5, h6 {
+border-bottom: 1px solid #ccc;
+font-size: 105%;
+}
+a {
+color: #0033dd;
+text-decoration: none;
+}
+a:hover {
+color: #6666ff; }
+a:visited {
+color: #800080; }
+a:visited:hover {
+color: #BB00BB; }
+a[href^="http:"] {
+text-decoration: underline; }
+a[href^="https:"] {
+text-decoration: underline; }
+
+code > span.kw { color: #555; font-weight: bold; } 
+code > span.dt { color: #902000; } 
+code > span.dv { color: #40a070; } 
+code > span.bn { color: #d14; } 
+code > span.fl { color: #d14; } 
+code > span.ch { color: #d14; } 
+code > span.st { color: #d14; } 
+code > span.co { color: #888888; font-style: italic; } 
+code > span.ot { color: #007020; } 
+code > span.al { color: #ff0000; font-weight: bold; } 
+code > span.fu { color: #900; font-weight: bold; } 
+code > span.er { color: #a61717; background-color: #e3d2d2; } 
+</style>
+
+
+
+
+</head>
+
+<body>
+
+
+
+
+<h1 class="title toc-ignore">Writing Vulkan Shaders</h1>
+
+
+
+<p>This vignette is for contributors. It shows how a new GPU kernel is
+added to ggmlR’s Vulkan backend, walking through a real one, and lists
+the kernels ggmlR ships on top of upstream ggml, with where each of them
+runs.</p>
+<p>Every operation in ggmlR has a CPU kernel. A Vulkan shader is an
+optional second implementation: when the backend reports that it cannot
+run a node (<code>supports_op</code> returns <code>FALSE</code>), the
+scheduler runs that node on the CPU instead. So a new op can be added
+CPU-only first and get its shader later, without breaking anything in
+between.</p>
+<hr />
+<div id="before-the-shader-the-op-itself" class="section level2">
+<h2>1. Before the shader: the op itself</h2>
+<p>A shader computes an existing ggml op. The op has to exist first:</p>
+<ol style="list-style-type: decimal">
+<li><strong>enum</strong> <code>GGML_OP_&lt;NAME&gt;</code> in both
+<code>src/ggml.h</code> and <code>inst/include/ggml.h</code>, appended
+<strong>at the end</strong> of the enum: op numbers are stored in GGUF
+files and used by downstream packages (llamaR, sd2R), so inserting in
+the middle breaks them.</li>
+<li>Name and symbol tables in <code>src/ggml-core.c</code>, and the two
+<code>static_assert(GGML_OP_COUNT == N)</code> there.</li>
+<li>Constructor <code>ggml_&lt;name&gt;()</code> in
+<code>src/ggml-ops-builders.c</code>.</li>
+<li>CPU kernel in <code>src/ggml-cpu/ops-*.cpp</code>, declared in
+<code>ops.h</code> and dispatched from <code>ggml-cpu-backend.c</code>
+(compute and <code>n_tasks</code>).</li>
+<li>For a differentiable op, a <code>case</code> in
+<code>src/ggml-graph.c</code>; without it there is no gradient, however
+correct the kernel is.</li>
+<li>R wrapper and <code>.Call</code> registration in
+<code>src/r_interface.c</code>.</li>
+</ol>
+<p>At this point the op works everywhere; on a Vulkan device it simply
+runs on the CPU.</p>
+<hr />
+</div>
+<div id="worked-example-gelu_back" class="section level2">
+<h2>2. Worked example: <code>GELU_BACK</code></h2>
+<p><code>GGML_OP_GELU_BACK</code> is a ggmlR extension (upstream ggml
+has no GELU gradient). It takes the incoming gradient <code>g</code> and
+the forward input <code>x</code> and returns <code>g * gelu&#39;(x)</code>,
+element by element. It has its own <code>.comp</code> file and touches
+every place a standalone op needs. All paths below are relative to
+<code>src/ggml-vulkan/</code>.</p>
+<div id="step-1.-the-shader-vulkan-shadersgelu_back.comp" class="section level3">
+<h3>Step 1. The shader: <code>vulkan-shaders/gelu_back.comp</code></h3>
+<div class="sourceCode" id="cb1"><pre class="sourceCode glsl"><code class="sourceCode glsl"><span id="cb1-1"><a href="#cb1-1" tabindex="-1"></a><span class="pp">#version 450</span></span>
+<span id="cb1-2"><a href="#cb1-2" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" tabindex="-1"></a><span class="pp">#include &quot;generic_head.glsl&quot;</span></span>
+<span id="cb1-4"><a href="#cb1-4" tabindex="-1"></a><span class="pp">#include &quot;types.glsl&quot;</span></span>
+<span id="cb1-5"><a href="#cb1-5" tabindex="-1"></a></span>
+<span id="cb1-6"><a href="#cb1-6" tabindex="-1"></a><span class="pp">#extension GL_EXT_control_flow_attributes : enable</span></span>
+<span id="cb1-7"><a href="#cb1-7" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" tabindex="-1"></a><span class="kw">layout</span><span class="op">(</span>local_size_x <span class="op">=</span> <span class="dv">512</span><span class="op">,</span> local_size_y <span class="op">=</span> <span class="dv">1</span><span class="op">,</span> local_size_z <span class="op">=</span> <span class="dv">1</span><span class="op">)</span> <span class="dt">in</span><span class="op">;</span></span>
+<span id="cb1-9"><a href="#cb1-9" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" tabindex="-1"></a><span class="kw">layout</span> <span class="op">(</span><span class="dt">binding</span> <span class="op">=</span> <span class="dv">0</span><span class="op">)</span> <span class="dt">readonly</span> <span class="kw">buffer</span> G <span class="op">{</span>A_TYPE data_g<span class="op">[];};</span></span>
+<span id="cb1-11"><a href="#cb1-11" tabindex="-1"></a><span class="kw">layout</span> <span class="op">(</span><span class="dt">binding</span> <span class="op">=</span> <span class="dv">1</span><span class="op">)</span> <span class="dt">readonly</span> <span class="kw">buffer</span> X <span class="op">{</span>B_TYPE data_x<span class="op">[];};</span></span>
+<span id="cb1-12"><a href="#cb1-12" tabindex="-1"></a><span class="kw">layout</span> <span class="op">(</span><span class="dt">binding</span> <span class="op">=</span> <span class="dv">2</span><span class="op">)</span> <span class="dt">writeonly</span> <span class="kw">buffer</span> D <span class="op">{</span>D_TYPE data_d<span class="op">[];};</span></span>
+<span id="cb1-13"><a href="#cb1-13" tabindex="-1"></a></span>
+<span id="cb1-14"><a href="#cb1-14" tabindex="-1"></a><span class="dt">void</span> <span class="fu">main</span><span class="op">()</span> <span class="op">{</span></span>
+<span id="cb1-15"><a href="#cb1-15" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">float</span> GELU_COEF_A    <span class="op">=</span> <span class="fl">0.044715</span>f<span class="op">;</span></span>
+<span id="cb1-16"><a href="#cb1-16" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">float</span> SQRT_2_OVER_PI <span class="op">=</span> <span class="fl">0.79788456080286535587989211986876</span>f<span class="op">;</span></span>
+<span id="cb1-17"><a href="#cb1-17" tabindex="-1"></a></span>
+<span id="cb1-18"><a href="#cb1-18" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">uint</span> i <span class="op">=</span> <span class="bu">gl_GlobalInvocationID</span><span class="op">.</span><span class="fu">z</span> <span class="op">*</span> <span class="dv">262144</span> <span class="op">+</span> <span class="bu">gl_GlobalInvocationID</span><span class="op">.</span><span class="fu">y</span> <span class="op">*</span> <span class="dv">512</span> <span class="op">+</span> <span class="bu">gl_GlobalInvocationID</span><span class="op">.</span><span class="fu">x</span><span class="op">;</span></span>
+<span id="cb1-19"><a href="#cb1-19" tabindex="-1"></a></span>
+<span id="cb1-20"><a href="#cb1-20" tabindex="-1"></a>    <span class="kw">if</span> <span class="op">(</span>i <span class="op">&gt;=</span> p<span class="op">.</span><span class="fu">KX</span><span class="op">)</span> <span class="op">{</span></span>
+<span id="cb1-21"><a href="#cb1-21" tabindex="-1"></a>        <span class="kw">return</span><span class="op">;</span></span>
+<span id="cb1-22"><a href="#cb1-22" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-23"><a href="#cb1-23" tabindex="-1"></a></span>
+<span id="cb1-24"><a href="#cb1-24" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">float</span> xi <span class="op">=</span> <span class="dt">float</span><span class="op">(</span>data_x<span class="op">[</span>i<span class="op">]);</span></span>
+<span id="cb1-25"><a href="#cb1-25" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">float</span> u  <span class="op">=</span> SQRT_2_OVER_PI<span class="op">*</span>xi<span class="op">*(</span><span class="fl">1.0</span>f <span class="op">+</span> GELU_COEF_A<span class="op">*</span>xi<span class="op">*</span>xi<span class="op">);</span></span>
+<span id="cb1-26"><a href="#cb1-26" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">float</span> th <span class="op">=</span> <span class="fl">1.0</span>f <span class="op">-</span> <span class="fl">2.0</span>f <span class="op">/</span> <span class="op">(</span><span class="bu">exp</span><span class="op">(</span><span class="fl">2.0</span>f<span class="op">*</span>u<span class="op">)</span> <span class="op">+</span> <span class="fl">1.0</span>f<span class="op">);</span></span>
+<span id="cb1-27"><a href="#cb1-27" tabindex="-1"></a></span>
+<span id="cb1-28"><a href="#cb1-28" tabindex="-1"></a>    <span class="dt">const</span> <span class="dt">float</span> dg <span class="op">=</span> <span class="fl">0.5</span>f<span class="op">*(</span><span class="fl">1.0</span>f <span class="op">+</span> th<span class="op">)</span> <span class="op">+</span></span>
+<span id="cb1-29"><a href="#cb1-29" tabindex="-1"></a>                     <span class="fl">0.5</span>f<span class="op">*</span>xi<span class="op">*(</span><span class="fl">1.0</span>f <span class="op">-</span> th<span class="op">*</span>th<span class="op">)*</span>SQRT_2_OVER_PI<span class="op">*(</span><span class="fl">1.0</span>f <span class="op">+</span> <span class="fl">3.0</span>f<span class="op">*</span>GELU_COEF_A<span class="op">*</span>xi<span class="op">*</span>xi<span class="op">);</span></span>
+<span id="cb1-30"><a href="#cb1-30" tabindex="-1"></a></span>
+<span id="cb1-31"><a href="#cb1-31" tabindex="-1"></a>    data_d<span class="op">[</span>i<span class="op">]</span> <span class="op">=</span> <span class="fu">D_TYPE</span><span class="op">(</span><span class="dt">float</span><span class="op">(</span>data_g<span class="op">[</span>i<span class="op">])</span> <span class="op">*</span> dg<span class="op">);</span></span>
+<span id="cb1-32"><a href="#cb1-32" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<ul>
+<li><code>generic_head.glsl</code> declares the push constants
+<code>p.KX</code>, <code>p.KY</code>, <code>p.param1</code> …
+<code>p.param4</code>. Here <code>p.KX</code> is the element count.</li>
+<li><code>A_TYPE</code>, <code>B_TYPE</code>, <code>D_TYPE</code> are
+not GLSL types: the generator substitutes them per variant (step
+2).</li>
+<li>Bindings are numbered in the order of the sources, destination last:
+<code>src0</code> → 0, <code>src1</code> → 1, <code>dst</code> → 2.</li>
+<li>The index <code>z*262144 + y*512 + x</code> matches a dispatch grid
+of 512 × 512 × N, which keeps each grid dimension under the 65
+535-workgroup limit of NVIDIA drivers. A grid over the limit stops the
+computation: <code>ggml_vk_dispatch_pipeline()</code> checks it with
+<code>GGML_ASSERT</code>.</li>
+</ul>
+</div>
+<div id="step-2.-generator-vulkan-shadersvulkan-shaders-gen.cpp" class="section level3">
+<h3>Step 2. Generator:
+<code>vulkan-shaders/vulkan-shaders-gen.cpp</code></h3>
+<p>One <code>string_to_spv()</code> line per type variant:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a>string_to_spv<span class="op">(</span><span class="st">&quot;gelu_back_f32&quot;</span><span class="op">,</span>  <span class="st">&quot;gelu_back.comp&quot;</span><span class="op">,</span>   <span class="op">{{</span><span class="st">&quot;A_TYPE&quot;</span><span class="op">,</span> <span class="st">&quot;float&quot;</span><span class="op">},</span> <span class="op">{</span><span class="st">&quot;B_TYPE&quot;</span><span class="op">,</span> <span class="st">&quot;float&quot;</span><span class="op">},</span> <span class="op">{</span><span class="st">&quot;D_TYPE&quot;</span><span class="op">,</span> <span class="st">&quot;float&quot;</span><span class="op">}});</span></span></code></pre></div>
+<p>Shaders are compiled to SPIR-V by <code>R CMD INSTALL</code>:
+<code>configure</code> builds <code>vulkan-shaders-gen</code>, which
+runs <code>glslc</code> on every <code>.comp</code> file and writes the
+bytecode into <code>generated/</code>. A <code>glslc</code> from the
+Vulkan SDK is recommended; older distribution packages may not support
+every extension the shaders use.</p>
+</div>
+<div id="step-3.-pipeline-field-ggml-vulkan-device.cpp" class="section level3">
+<h3>Step 3. Pipeline field: <code>ggml-vulkan-device.cpp</code></h3>
+<p>In <code>struct vk_device_struct</code>:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" tabindex="-1"></a>vk_pipeline pipeline_gelu_back_f32<span class="op">;</span></span></code></pre></div>
+</div>
+<div id="step-4.-pipeline-creation-ggml-vulkan-shaders.cpp" class="section level3">
+<h3>Step 4. Pipeline creation: <code>ggml-vulkan-shaders.cpp</code></h3>
+<p>In <code>ggml_vk_load_shaders()</code>:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" tabindex="-1"></a>ggml_vk_create_pipeline<span class="op">(</span>device<span class="op">,</span> device<span class="op">-&gt;</span>pipeline_gelu_back_f32<span class="op">,</span> <span class="st">&quot;gelu_back_f32&quot;</span><span class="op">,</span></span>
+<span id="cb4-2"><a href="#cb4-2" tabindex="-1"></a>                        gelu_back_f32_len<span class="op">,</span> gelu_back_f32_data<span class="op">,</span> <span class="st">&quot;main&quot;</span><span class="op">,</span></span>
+<span id="cb4-3"><a href="#cb4-3" tabindex="-1"></a>                        <span class="dv">3</span><span class="op">,</span>                              <span class="co">// number of bindings</span></span>
+<span id="cb4-4"><a href="#cb4-4" tabindex="-1"></a>                        <span class="kw">sizeof</span><span class="op">(</span>vk_op_push_constants<span class="op">),</span>   <span class="co">// push-constant size</span></span>
+<span id="cb4-5"><a href="#cb4-5" tabindex="-1"></a>                        <span class="op">{</span><span class="dv">512</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="dv">1</span><span class="op">},</span>                    <span class="co">// workgroup denominators</span></span>
+<span id="cb4-6"><a href="#cb4-6" tabindex="-1"></a>                        <span class="op">{},</span> <span class="dv">1</span><span class="op">);</span></span></code></pre></div>
+<p>The binding count must match the shader, and the push-constant size
+must match the struct the dispatcher fills in (step 6). Push constants
+are limited to 256 bytes.</p>
+</div>
+<div id="step-5.-pipeline-selection-ggml-vulkan-attn.cpp" class="section level3">
+<h3>Step 5. Pipeline selection: <code>ggml-vulkan-attn.cpp</code></h3>
+<p>In <code>ggml_vk_op_get_pipeline()</code>, return the pipeline for
+the types you support and <code>nullptr</code> for everything else:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" tabindex="-1"></a><span class="cf">case</span> GGML_OP_GELU_BACK<span class="op">:</span></span>
+<span id="cb5-2"><a href="#cb5-2" tabindex="-1"></a>    <span class="cf">if</span> <span class="op">(</span>src0<span class="op">-&gt;</span>type <span class="op">==</span> GGML_TYPE_F32 <span class="op">&amp;&amp;</span> src1<span class="op">-&gt;</span>type <span class="op">==</span> GGML_TYPE_F32 <span class="op">&amp;&amp;</span> dst<span class="op">-&gt;</span>type <span class="op">==</span> GGML_TYPE_F32<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" tabindex="-1"></a>        <span class="cf">return</span> ctx<span class="op">-&gt;</span>device<span class="op">-&gt;</span>pipeline_gelu_back_f32<span class="op">;</span></span>
+<span id="cb5-4"><a href="#cb5-4" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-5"><a href="#cb5-5" tabindex="-1"></a>    <span class="cf">return</span> <span class="kw">nullptr</span><span class="op">;</span></span></code></pre></div>
+</div>
+<div id="step-6.-dispatcher-ggml-vulkan-elemwise.cpp" class="section level3">
+<h3>Step 6. Dispatcher: <code>ggml-vulkan-elemwise.cpp</code></h3>
+<p>A small function fills the push constants and hands off to the
+generic <code>ggml_vk_op_f32()</code>:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a><span class="at">static</span> <span class="dt">void</span> ggml_vk_gelu_back<span class="op">(</span>ggml_backend_vk_context <span class="op">*</span> ctx<span class="op">,</span> vk_context<span class="op">&amp;</span> subctx<span class="op">,</span></span>
+<span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a>                              <span class="at">const</span> ggml_tensor <span class="op">*</span> src0<span class="op">,</span> <span class="at">const</span> ggml_tensor <span class="op">*</span> src1<span class="op">,</span> ggml_tensor <span class="op">*</span> dst<span class="op">)</span> <span class="op">{</span></span>
+<span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a>    ggml_vk_op_f32<span class="op">&lt;</span>vk_op_push_constants<span class="op">&gt;(</span>ctx<span class="op">,</span> subctx<span class="op">,</span> src0<span class="op">,</span> src1<span class="op">,</span> <span class="kw">nullptr</span><span class="op">,</span> <span class="kw">nullptr</span><span class="op">,</span> dst<span class="op">,</span></span>
+<span id="cb6-4"><a href="#cb6-4" tabindex="-1"></a>        GGML_OP_GELU_BACK<span class="op">,</span> <span class="op">{</span> <span class="op">(</span><span class="dt">uint32_t</span><span class="op">)</span>ggml_nelements<span class="op">(</span>src0<span class="op">),</span> <span class="dv">0</span><span class="op">,</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">,</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">,</span> <span class="fl">0.0</span><span class="bu">f</span><span class="op">,</span> <span class="fl">0.0</span><span class="bu">f</span> <span class="op">});</span></span>
+<span id="cb6-5"><a href="#cb6-5" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><code>ggml_vk_op_f32()</code> also decides the dispatch grid in a
+<code>switch (op)</code>. The <code>default</code> branch launches
+<code>ggml_nelements(src0)</code> invocations along x only. For an
+element-wise shader that indexes with <code>z*262144 + y*512 + x</code>,
+add the op to the element-wise case list there (next to
+<code>GGML_OP_UNARY</code>), which builds the 512 × 512 × N grid;
+otherwise tensors above 512 × 65 535 elements exceed the x limit.</p>
+</div>
+<div id="step-7.-graph-dispatch-ggml-vulkan-graph.cpp-ggml_vk_build_graph" class="section level3">
+<h3>Step 7. Graph dispatch: <code>ggml-vulkan-graph.cpp</code>,
+<code>ggml_vk_build_graph()</code></h3>
+<div class="sourceCode" id="cb7"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a><span class="cf">case</span> GGML_OP_GELU_BACK<span class="op">:</span></span>
+<span id="cb7-2"><a href="#cb7-2" tabindex="-1"></a>    ggml_vk_gelu_back<span class="op">(</span>ctx<span class="op">,</span> compute_ctx<span class="op">,</span> src0<span class="op">,</span> src1<span class="op">,</span> node<span class="op">);</span></span>
+<span id="cb7-3"><a href="#cb7-3" tabindex="-1"></a>    <span class="cf">break</span><span class="op">;</span></span></code></pre></div>
+</div>
+<div id="step-8.-supports_op-ggml-vulkan-graph.cpp" class="section level3">
+<h3>Step 8. <code>supports_op</code>:
+<code>ggml-vulkan-graph.cpp</code></h3>
+<p>In <code>ggml_backend_vk_device_supports_op_impl()</code> (the public
+<code>supports_op</code> is a thin wrapper around it):</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb8-1"><a href="#cb8-1" tabindex="-1"></a><span class="cf">case</span> GGML_OP_GELU_BACK<span class="op">:</span></span>
+<span id="cb8-2"><a href="#cb8-2" tabindex="-1"></a>    <span class="cf">return</span> ggml_is_contiguous<span class="op">(</span>op<span class="op">-&gt;</span>src<span class="op">[</span><span class="dv">0</span><span class="op">])</span> <span class="op">&amp;&amp;</span> op<span class="op">-&gt;</span>src<span class="op">[</span><span class="dv">0</span><span class="op">]-&gt;</span>type <span class="op">==</span> GGML_TYPE_F32<span class="op">;</span></span></code></pre></div>
+<p>This is the most important step. Return <code>true</code> only for
+inputs the shader really handles: types, contiguity, and dimension 4
+(ggmlR tensors are 5D, upstream shaders index only four dimensions, so
+many cases add <code>op-&gt;ne[4] == 1</code>). Anything rejected here
+runs on the CPU and stays correct; anything accepted wrongly produces
+wrong numbers without an error.</p>
+</div>
+<div id="step-9.-check-it-against-the-cpu" class="section level3">
+<h3>Step 9. Check it against the CPU</h3>
+<p>Build the same graph on both backends and compare. The tensors are
+allocated on the backend and filled with
+<code>ggml_backend_tensor_set_data()</code>; <code>ggml_set_f32()</code>
+would write into host memory that a GPU buffer never sees.</p>
+<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a><span class="fu">library</span>(ggmlR)</span>
+<span id="cb9-2"><a href="#cb9-2" tabindex="-1"></a></span>
+<span id="cb9-3"><a href="#cb9-3" tabindex="-1"></a>run_gelu_back <span class="ot">&lt;-</span> <span class="cf">function</span>(x, dy, <span class="at">backend =</span> <span class="fu">c</span>(<span class="st">&quot;cpu&quot;</span>, <span class="st">&quot;vulkan&quot;</span>)) {</span>
+<span id="cb9-4"><a href="#cb9-4" tabindex="-1"></a>  backend <span class="ot">&lt;-</span> <span class="fu">match.arg</span>(backend)</span>
+<span id="cb9-5"><a href="#cb9-5" tabindex="-1"></a></span>
+<span id="cb9-6"><a href="#cb9-6" tabindex="-1"></a>  ctx <span class="ot">&lt;-</span> <span class="fu">ggml_init</span>(<span class="dv">16</span> <span class="sc">*</span> <span class="dv">1024</span> <span class="sc">*</span> <span class="dv">1024</span>)</span>
+<span id="cb9-7"><a href="#cb9-7" tabindex="-1"></a>  <span class="fu">ggml_set_no_alloc</span>(ctx, <span class="cn">TRUE</span>)</span>
+<span id="cb9-8"><a href="#cb9-8" tabindex="-1"></a>  <span class="fu">on.exit</span>(<span class="fu">ggml_free</span>(ctx), <span class="at">add =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb9-9"><a href="#cb9-9" tabindex="-1"></a></span>
+<span id="cb9-10"><a href="#cb9-10" tabindex="-1"></a>  <span class="cf">if</span> (backend <span class="sc">==</span> <span class="st">&quot;vulkan&quot;</span>) {</span>
+<span id="cb9-11"><a href="#cb9-11" tabindex="-1"></a>    b <span class="ot">&lt;-</span> <span class="fu">ggml_vulkan_init</span>(<span class="dv">0</span><span class="dt">L</span>)</span>
+<span id="cb9-12"><a href="#cb9-12" tabindex="-1"></a>  } <span class="cf">else</span> {</span>
+<span id="cb9-13"><a href="#cb9-13" tabindex="-1"></a>    b <span class="ot">&lt;-</span> <span class="fu">ggml_backend_cpu_init</span>()</span>
+<span id="cb9-14"><a href="#cb9-14" tabindex="-1"></a>    <span class="fu">ggml_backend_cpu_set_n_threads</span>(b, <span class="dv">2</span><span class="dt">L</span>)</span>
+<span id="cb9-15"><a href="#cb9-15" tabindex="-1"></a>  }</span>
+<span id="cb9-16"><a href="#cb9-16" tabindex="-1"></a>  <span class="fu">on.exit</span>(<span class="fu">ggml_backend_free</span>(b), <span class="at">add =</span> <span class="cn">TRUE</span>)</span>
+<span id="cb9-17"><a href="#cb9-17" tabindex="-1"></a></span>
+<span id="cb9-18"><a href="#cb9-18" tabindex="-1"></a>  g <span class="ot">&lt;-</span> <span class="fu">ggml_new_tensor_1d</span>(ctx, GGML_TYPE_F32, <span class="fu">length</span>(dy))</span>
+<span id="cb9-19"><a href="#cb9-19" tabindex="-1"></a>  x_t <span class="ot">&lt;-</span> <span class="fu">ggml_new_tensor_1d</span>(ctx, GGML_TYPE_F32, <span class="fu">length</span>(x))</span>
+<span id="cb9-20"><a href="#cb9-20" tabindex="-1"></a>  <span class="fu">ggml_set_input</span>(g)</span>
+<span id="cb9-21"><a href="#cb9-21" tabindex="-1"></a>  <span class="fu">ggml_set_input</span>(x_t)</span>
+<span id="cb9-22"><a href="#cb9-22" tabindex="-1"></a></span>
+<span id="cb9-23"><a href="#cb9-23" tabindex="-1"></a>  out <span class="ot">&lt;-</span> <span class="fu">ggml_gelu_back</span>(ctx, g, x_t)</span>
+<span id="cb9-24"><a href="#cb9-24" tabindex="-1"></a>  <span class="fu">ggml_set_output</span>(out)</span>
+<span id="cb9-25"><a href="#cb9-25" tabindex="-1"></a></span>
+<span id="cb9-26"><a href="#cb9-26" tabindex="-1"></a>  <span class="co"># Does this device run the node itself, or would it fall back to the CPU?</span></span>
+<span id="cb9-27"><a href="#cb9-27" tabindex="-1"></a>  on_device <span class="ot">&lt;-</span> <span class="fu">ggml_backend_dev_supports_op</span>(<span class="fu">ggml_backend_get_device</span>(b), out)</span>
+<span id="cb9-28"><a href="#cb9-28" tabindex="-1"></a></span>
+<span id="cb9-29"><a href="#cb9-29" tabindex="-1"></a>  buf <span class="ot">&lt;-</span> <span class="fu">ggml_backend_alloc_ctx_tensors</span>(ctx, b)</span>
+<span id="cb9-30"><a href="#cb9-30" tabindex="-1"></a>  <span class="fu">ggml_backend_tensor_set_data</span>(g, dy)</span>
+<span id="cb9-31"><a href="#cb9-31" tabindex="-1"></a>  <span class="fu">ggml_backend_tensor_set_data</span>(x_t, x)</span>
+<span id="cb9-32"><a href="#cb9-32" tabindex="-1"></a>  <span class="fu">ggml_backend_graph_compute</span>(b, <span class="fu">ggml_build_forward_expand</span>(ctx, out))</span>
+<span id="cb9-33"><a href="#cb9-33" tabindex="-1"></a></span>
+<span id="cb9-34"><a href="#cb9-34" tabindex="-1"></a>  <span class="fu">list</span>(<span class="at">value =</span> <span class="fu">ggml_backend_tensor_get_data</span>(out), <span class="at">on_device =</span> on_device)</span>
+<span id="cb9-35"><a href="#cb9-35" tabindex="-1"></a>}</span>
+<span id="cb9-36"><a href="#cb9-36" tabindex="-1"></a></span>
+<span id="cb9-37"><a href="#cb9-37" tabindex="-1"></a><span class="fu">set.seed</span>(<span class="dv">1</span>)</span>
+<span id="cb9-38"><a href="#cb9-38" tabindex="-1"></a>x  <span class="ot">&lt;-</span> <span class="fu">rnorm</span>(<span class="dv">10000</span>, <span class="at">sd =</span> <span class="dv">3</span>)</span>
+<span id="cb9-39"><a href="#cb9-39" tabindex="-1"></a>dy <span class="ot">&lt;-</span> <span class="fu">rnorm</span>(<span class="dv">10000</span>)</span>
+<span id="cb9-40"><a href="#cb9-40" tabindex="-1"></a></span>
+<span id="cb9-41"><a href="#cb9-41" tabindex="-1"></a>cpu <span class="ot">&lt;-</span> <span class="fu">run_gelu_back</span>(x, dy, <span class="st">&quot;cpu&quot;</span>)</span>
+<span id="cb9-42"><a href="#cb9-42" tabindex="-1"></a>cpu<span class="sc">$</span>on_device</span>
+<span id="cb9-43"><a href="#cb9-43" tabindex="-1"></a></span>
+<span id="cb9-44"><a href="#cb9-44" tabindex="-1"></a><span class="cf">if</span> (<span class="fu">ggml_vulkan_available</span>()) {</span>
+<span id="cb9-45"><a href="#cb9-45" tabindex="-1"></a>  gpu <span class="ot">&lt;-</span> <span class="fu">run_gelu_back</span>(x, dy, <span class="st">&quot;vulkan&quot;</span>)</span>
+<span id="cb9-46"><a href="#cb9-46" tabindex="-1"></a>  <span class="fu">print</span>(gpu<span class="sc">$</span>on_device)                <span class="co"># TRUE: the shader runs, not a fallback</span></span>
+<span id="cb9-47"><a href="#cb9-47" tabindex="-1"></a>  <span class="fu">max</span>(<span class="fu">abs</span>(gpu<span class="sc">$</span>value <span class="sc">-</span> cpu<span class="sc">$</span>value))     <span class="co"># float32 rounding only</span></span>
+<span id="cb9-48"><a href="#cb9-48" tabindex="-1"></a>}</span></code></pre></div>
+<p>Test with several sizes, including one above 512 × 65 535 elements
+for an element-wise shader, and with non-contiguous inputs (a
+<code>ggml_view</code> or <code>ggml_permute</code>) if
+<code>supports_op</code> accepts them.
+<code>tests/testthat/test-gelu-backward.R</code> is the full version of
+this check.</p>
+<hr />
+</div>
+</div>
+<div id="kernels-that-are-not-graph-ops" class="section level2">
+<h2>3. Kernels that are not graph ops</h2>
+<p>Some ggmlR kernels are not ggml ops at all. They are dispatched
+directly from C (<code>ggml-vulkan-umap.cpp</code>,
+<code>ggml-vulkan-sparse.cpp</code>) through a
+<code>ggml_vk_&lt;name&gt;_run()</code> function, called from an R entry
+point in <code>src/r_interface_vulkan.c</code> or from the ONNX loader.
+The shader, generator line, pipeline field and pipeline creation are the
+same as steps 1–4; steps 5–8 are replaced by the <code>_run()</code>
+function, which requests descriptor sets, uploads the buffers,
+dispatches and reads back. Such a kernel has no automatic CPU fallback:
+the R or C caller decides what to do when the <code>_run()</code>
+function returns <code>false</code>.</p>
+<hr />
+</div>
+<div id="every-op-cpu-and-vulkan" class="section level2">
+<h2>4. Every op: CPU and Vulkan</h2>
+<p><strong>Every op below has a CPU kernel</strong>, so every op runs on
+a machine without a GPU. The “Vulkan” column says when the node runs on
+the GPU instead; when the condition does not hold, the scheduler runs
+that node on the CPU. Shader names are files in
+<code>src/ggml-vulkan/vulkan-shaders/</code> without <code>.comp</code>.
+Kernels marked ★ are ggmlR’s own (upstream ggml has no Vulkan kernel for
+them, or ggmlR replaces upstream’s).</p>
+<p>The conditions are a summary of
+<code>ggml_backend_vk_device_supports_op_impl()</code>; the source is
+the authority. “F32” means the inputs and output are float32;
+“contiguous” means no strides other than the packed ones.</p>
+<div id="element-wise-arithmetic-and-copies" class="section level3">
+<h3>Element-wise arithmetic and copies</h3>
+<table>
+<colgroup>
+<col width="33%" />
+<col width="33%" />
+<col width="33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Op</th>
+<th>Shader(s)</th>
+<th>Vulkan</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>ADD</code>, <code>SUB</code>, <code>MUL</code>,
+<code>DIV</code></td>
+<td><code>add</code>, <code>sub</code>, <code>mul</code>,
+<code>div</code>; <code>multi_add</code> for fused chains</td>
+<td>F32/F16 in any mix; 5D</td>
+</tr>
+<tr class="even">
+<td><code>ADD1</code></td>
+<td><code>add1</code></td>
+<td>F32+F32, F16+F32, F16+F16</td>
+</tr>
+<tr class="odd">
+<td><code>ADD_ID</code></td>
+<td><code>add_id</code></td>
+<td>F32 with I32 ids</td>
+</tr>
+<tr class="even">
+<td><code>ACC</code></td>
+<td><code>acc</code></td>
+<td>F32</td>
+</tr>
+<tr class="odd">
+<td><code>SET</code></td>
+<td><code>acc</code></td>
+<td>F32 or I32, all types equal</td>
+</tr>
+<tr class="even">
+<td><code>SCALE</code></td>
+<td><code>scale</code></td>
+<td>F32, contiguous</td>
+</tr>
+<tr class="odd">
+<td><code>SQR</code>, <code>SQRT</code>, <code>SIN</code>,
+<code>COS</code>, <code>CLAMP</code>, <code>LEAKY_RELU</code></td>
+<td><code>unary</code></td>
+<td>F32 or F16, output type = input type</td>
+</tr>
+<tr class="even">
+<td><code>LOG</code></td>
+<td><code>log</code></td>
+<td>F32 or F16, output type = input type</td>
+</tr>
+<tr class="odd">
+<td><code>DUP</code>, <code>CPY</code>, <code>CONT</code></td>
+<td><code>copy</code>, <code>contig_copy</code>,
+<code>copy_transpose</code>, <code>copy_transpose_02</code>,
+<code>copy_to_quant</code>, <code>copy_from_quant</code></td>
+<td>F32/F16/BF16 and most quant types (Q1_0, Q2_0, Q4_0–Q8_0,
+IQ4_NL)</td>
+</tr>
+<tr class="even">
+<td><code>CAST_NUMERIC</code> ★</td>
+<td><code>copy</code> (via the CPY path)</td>
+<td>contiguous; F32↔︎I32, F32↔︎F16, F32↔︎BF16</td>
+</tr>
+<tr class="odd">
+<td><code>REPEAT</code></td>
+<td><code>repeat</code></td>
+<td>2- or 4-byte types</td>
+</tr>
+<tr class="even">
+<td><code>REPEAT_BACK</code></td>
+<td><code>repeat_back</code></td>
+<td>F32</td>
+</tr>
+<tr class="odd">
+<td><code>CONCAT</code></td>
+<td><code>concat</code></td>
+<td>all inputs one type: 1-, 2-, 4- or 8-byte types, or a quant type
+with packed rows</td>
+</tr>
+<tr class="even">
+<td><code>FILL</code></td>
+<td><code>fill</code></td>
+<td>F32 or F16</td>
+</tr>
+<tr class="odd">
+<td><code>ARANGE</code></td>
+<td><code>arange</code></td>
+<td>F32</td>
+</tr>
+<tr class="even">
+<td><code>TRI</code></td>
+<td><code>tri</code></td>
+<td>F32 or F16</td>
+</tr>
+<tr class="odd">
+<td><code>DIAG</code></td>
+<td><code>diag</code></td>
+<td>F32 or F16</td>
+</tr>
+<tr class="even">
+<td><code>DIAG_MASK_INF</code></td>
+<td><code>diag_mask_inf</code></td>
+<td>F32, contiguous</td>
+</tr>
+<tr class="odd">
+<td><code>ROLL</code></td>
+<td><code>roll</code></td>
+<td>F32</td>
+</tr>
+<tr class="even">
+<td><code>PAD</code></td>
+<td><code>pad</code></td>
+<td>F32; <code>ne[4] == 1</code></td>
+</tr>
+<tr class="odd">
+<td><code>PAD_REFLECT_1D</code></td>
+<td><code>pad_reflect_1d</code></td>
+<td>F32; <code>ne[4] == 1</code></td>
+</tr>
+<tr class="even">
+<td><code>UPSCALE</code></td>
+<td><code>upscale</code></td>
+<td>F32; antialias only with bilinear</td>
+</tr>
+<tr class="odd">
+<td><code>NONE</code>, <code>RESHAPE</code>, <code>VIEW</code>,
+<code>PERMUTE</code>, <code>TRANSPOSE</code></td>
+<td>none (metadata only)</td>
+<td>always</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="activations" class="section level3">
+<h3>Activations</h3>
+<table>
+<colgroup>
+<col width="33%" />
+<col width="33%" />
+<col width="33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Op</th>
+<th>Shader(s)</th>
+<th>Vulkan</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>UNARY</code>: <code>ABS</code>, <code>SGN</code>,
+<code>NEG</code>, <code>STEP</code>, <code>TANH</code>,
+<code>ELU</code>, <code>RELU</code>, <code>SIGMOID</code>,
+<code>GELU</code>, <code>GELU_ERF</code>, <code>GELU_QUICK</code>,
+<code>SILU</code>, <code>HARDSWISH</code>, <code>HARDSIGMOID</code>,
+<code>EXP</code>, <code>EXPM1</code>, <code>SOFTPLUS</code>,
+<code>XIELU</code>, <code>FLOOR</code>, <code>CEIL</code>,
+<code>ROUND</code>, <code>ROUND_EVEN</code> ★, <code>TRUNC</code></td>
+<td><code>unary</code>; <code>snake</code> for the fused snake
+activation</td>
+<td>all 23: F32 or F16, output type = input type; strided views
+supported</td>
+</tr>
+<tr class="even">
+<td><code>GLU</code>: <code>REGLU</code>, <code>GEGLU</code>,
+<code>SWIGLU</code>, <code>SWIGLU_OAI</code>, <code>GEGLU_ERF</code>,
+<code>GEGLU_QUICK</code>, <code>SWIGLU_CLAMP</code></td>
+<td><code>reglu</code>, <code>geglu</code>, <code>swiglu</code>,
+<code>swiglu_oai</code>, <code>geglu_erf</code>,
+<code>geglu_quick</code>, <code>swiglu_clamp</code></td>
+<td>all 7; dimension 4 must fold into dimension 3</td>
+</tr>
+<tr class="odd">
+<td><code>SILU_BACK</code></td>
+<td><code>silu_back</code></td>
+<td>F32, contiguous</td>
+</tr>
+<tr class="even">
+<td><code>GELU_BACK</code> ★</td>
+<td><code>gelu_back</code></td>
+<td>F32, contiguous</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="reductions-normalisation-sorting" class="section level3">
+<h3>Reductions, normalisation, sorting</h3>
+<table>
+<colgroup>
+<col width="33%" />
+<col width="33%" />
+<col width="33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Op</th>
+<th>Shader(s)</th>
+<th>Vulkan</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>SUM</code>, <code>SUM_ROWS</code>, <code>MEAN</code></td>
+<td><code>sum_rows</code></td>
+<td>F32, rows contiguous</td>
+</tr>
+<tr class="even">
+<td><code>CUMSUM</code></td>
+<td><code>cumsum</code>, <code>cumsum_multipass1</code>,
+<code>cumsum_multipass2</code></td>
+<td>F32, rows contiguous; device with full subgroup arithmetic</td>
+</tr>
+<tr class="odd">
+<td><code>ARGMAX</code></td>
+<td><code>argmax</code></td>
+<td>F32, contiguous</td>
+</tr>
+<tr class="even">
+<td><code>COUNT_EQUAL</code></td>
+<td><code>count_equal</code></td>
+<td>I32, contiguous</td>
+</tr>
+<tr class="odd">
+<td><code>ARGSORT</code></td>
+<td><code>argsort</code>, <code>argsort_large</code></td>
+<td>contiguous; row length limited without the Vulkan memory model</td>
+</tr>
+<tr class="even">
+<td><code>TOP_K</code></td>
+<td><code>topk_argsort</code>, <code>topk_nary_search</code>,
+<code>topk_radix_select</code>; <code>topk_moe</code> when fused</td>
+<td>contiguous; row length within the available pipelines</td>
+</tr>
+<tr class="odd">
+<td><code>NORM</code></td>
+<td><code>norm</code></td>
+<td>F32, rows contiguous</td>
+</tr>
+<tr class="even">
+<td><code>NORM_BACK</code> ★</td>
+<td><code>norm_back</code></td>
+<td>F32, contiguous</td>
+</tr>
+<tr class="odd">
+<td><code>RMS_NORM</code></td>
+<td><code>rms_norm</code>, <code>rms_norm_partials</code></td>
+<td>always</td>
+</tr>
+<tr class="even">
+<td><code>RMS_NORM_BACK</code></td>
+<td><code>rms_norm_back</code></td>
+<td>F32, contiguous</td>
+</tr>
+<tr class="odd">
+<td><code>L2_NORM</code></td>
+<td><code>l2_norm</code></td>
+<td>F32, rows contiguous</td>
+</tr>
+<tr class="even">
+<td><code>GROUP_NORM</code></td>
+<td><code>group_norm</code></td>
+<td>contiguous</td>
+</tr>
+<tr class="odd">
+<td><code>SOFT_MAX</code></td>
+<td><code>soft_max</code>, <code>soft_max_large1/2/3</code></td>
+<td>F32, contiguous; mask F32 or F16</td>
+</tr>
+<tr class="even">
+<td><code>SOFT_MAX_BACK</code></td>
+<td><code>soft_max_back</code></td>
+<td>F32, contiguous</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="matrix-multiplication-and-attention" class="section level3">
+<h3>Matrix multiplication and attention</h3>
+<table>
+<colgroup>
+<col width="33%" />
+<col width="33%" />
+<col width="33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Op</th>
+<th>Shader(s)</th>
+<th>Vulkan</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>MUL_MAT</code></td>
+<td><code>mul_mm</code>, <code>mul_mm_cm2</code>, <code>mul_mmq</code>,
+<code>mul_mat_vec</code>, <code>mul_mat_vecq</code>,
+<code>mul_mat_vec_&lt;quant&gt;</code>, <code>mul_mat_vec_nc</code>,
+<code>mul_mat_vec_p021</code>, <code>mul_mat_split_k_reduce</code>,
+<code>quantize_q8_1</code>, <code>dequant_&lt;quant&gt;</code>,
+<code>fwht</code> (Hadamard hint)</td>
+<td>F32/F16/BF16 and all quant types the device has pipelines for</td>
+</tr>
+<tr class="even">
+<td><code>MUL_MAT_ID</code></td>
+<td>as <code>MUL_MAT</code>, plus <code>count_experts</code></td>
+<td>as <code>MUL_MAT</code>; id tensor ≤ 65 536 per dimension</td>
+</tr>
+<tr class="odd">
+<td><code>OUT_PROD</code> ★</td>
+<td><code>out_prod</code> (tiled)</td>
+<td>F32, rows contiguous</td>
+</tr>
+<tr class="even">
+<td><code>GET_ROWS</code></td>
+<td><code>get_rows</code>, <code>get_rows_quant</code></td>
+<td>F32/F16/BF16 and all quant types; 5D</td>
+</tr>
+<tr class="odd">
+<td><code>GET_ROWS_BACK</code> ★</td>
+<td><code>get_rows_back</code></td>
+<td>F32 with I32 indices, contiguous; float atomics</td>
+</tr>
+<tr class="even">
+<td><code>SET_ROWS</code></td>
+<td><code>copy_to_quant</code> (set-rows variants)</td>
+<td>source F32/F16, I32 or I64 indices;
+F32/F16/BF16/Q1_0/Q2_0/Q4_0–Q8_0/IQ4_NL destination</td>
+</tr>
+<tr class="odd">
+<td><code>FLASH_ATTN_EXT</code></td>
+<td><code>flash_attn</code>, <code>flash_attn_cm1</code>,
+<code>flash_attn_cm2</code>, <code>flash_attn_split_k_reduce</code>,
+<code>flash_attn_mask_opt</code>,
+<code>flash_attn_sparse_compact</code>,
+<code>flash_attn_decode_phase_1/2</code></td>
+<td>Q F32; head sizes multiple of 8; K/V F32, F16, Q4_0, Q8_0 and
+others, plus Q4_K ★ (not on coopmat2)</td>
+</tr>
+<tr class="even">
+<td><code>FLASH_ATTN_BACK</code> ★</td>
+<td><code>flash_attn_back</code></td>
+<td>F32, contiguous; K/V length ≤ 1024; float atomics</td>
+</tr>
+<tr class="odd">
+<td><code>ROPE</code></td>
+<td><code>rope_norm</code>, <code>rope_neox</code>,
+<code>rope_multi</code>, <code>rope_vision</code></td>
+<td>rows contiguous; <code>ne[4] == 1</code></td>
+</tr>
+<tr class="even">
+<td><code>ROPE_BACK</code></td>
+<td>same as <code>ROPE</code></td>
+<td>always</td>
+</tr>
+<tr class="odd">
+<td><code>LIGHTNING_INDEXER</code></td>
+<td><code>lightning_indexer</code></td>
+<td>F16-capable device; Q head size 128; supported K types</td>
+</tr>
+<tr class="even">
+<td><code>DSV4_HC_PRE</code>, <code>DSV4_HC_POST</code>,
+<code>DSV4_HC_COMB</code></td>
+<td><code>dsv4_hc_pre</code>, <code>dsv4_hc_post</code>,
+<code>dsv4_hc_comb</code></td>
+<td>F32; 4 hyper-connections</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="convolution-and-pooling" class="section level3">
+<h3>Convolution and pooling</h3>
+<table>
+<colgroup>
+<col width="33%" />
+<col width="33%" />
+<col width="33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Op</th>
+<th>Shader(s)</th>
+<th>Vulkan</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>IM2COL</code></td>
+<td><code>im2col</code></td>
+<td>F32 input; F32 or F16 output</td>
+</tr>
+<tr class="even">
+<td><code>IM2COL_3D</code></td>
+<td><code>im2col_3d</code></td>
+<td>F32 input; F32 or F16 output</td>
+</tr>
+<tr class="odd">
+<td><code>IM2COL_BACK</code> ★</td>
+<td><code>im2col_back</code></td>
+<td>F32, contiguous</td>
+</tr>
+<tr class="even">
+<td><code>COL2IM_1D</code></td>
+<td><code>col2im_1d</code></td>
+<td>F32/F16/BF16, contiguous; <code>ne[4] == 1</code></td>
+</tr>
+<tr class="odd">
+<td><code>CONV_2D</code>, <code>CONV_TRANSPOSE_2D</code></td>
+<td><code>conv2d_mm</code></td>
+<td>F32 or F16 kernel, F32 input, packed rows, channels matching</td>
+</tr>
+<tr class="even">
+<td><code>CONV_3D</code></td>
+<td><code>conv3d_mm</code></td>
+<td>F32 or F16 kernel, contiguous; <code>ne[4] == 1</code></td>
+</tr>
+<tr class="odd">
+<td><code>CONV_2D_DW</code></td>
+<td><code>conv2d_dw</code></td>
+<td>F32 or F16 kernel, F32 input</td>
+</tr>
+<tr class="even">
+<td><code>CONV_TRANSPOSE_1D</code></td>
+<td><code>conv_transpose_1d</code></td>
+<td>F32</td>
+</tr>
+<tr class="odd">
+<td><code>POOL_1D</code></td>
+<td><code>pool1d</code></td>
+<td>F32, contiguous; <code>ne[4] == 1</code></td>
+</tr>
+<tr class="even">
+<td><code>POOL_2D</code></td>
+<td><code>pool2d</code></td>
+<td>F32, contiguous</td>
+</tr>
+<tr class="odd">
+<td><code>TIMESTEP_EMBEDDING</code></td>
+<td><code>timestep_embedding</code></td>
+<td>F32</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="sequence-models" class="section level3">
+<h3>Sequence models</h3>
+<table>
+<colgroup>
+<col width="33%" />
+<col width="33%" />
+<col width="33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Op</th>
+<th>Shader(s)</th>
+<th>Vulkan</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>SSM_CONV</code></td>
+<td><code>ssm_conv</code></td>
+<td>F32</td>
+</tr>
+<tr class="even">
+<td><code>SSM_SCAN</code></td>
+<td><code>ssm_scan</code></td>
+<td>F32, not quantized; supported state sizes</td>
+</tr>
+<tr class="odd">
+<td><code>SSM_CONV_BACK</code> ★</td>
+<td><code>ssm_conv_back</code></td>
+<td>F32, rows contiguous; kernel width ≤ 8</td>
+</tr>
+<tr class="even">
+<td><code>SSM_SCAN_BACK</code> ★</td>
+<td><code>ssm_scan_back</code></td>
+<td>Mamba-2 layout; <code>d_state</code> 128 or 256; float atomics;
+scratch ≤ ¼ of VRAM</td>
+</tr>
+<tr class="odd">
+<td><code>RWKV_WKV6</code>, <code>RWKV_WKV7</code></td>
+<td><code>wkv6</code>, <code>wkv7</code></td>
+<td>always</td>
+</tr>
+<tr class="even">
+<td><code>GATED_LINEAR_ATTN</code></td>
+<td><code>gla</code></td>
+<td>F32, head size 64; <code>ne[4] == 1</code></td>
+</tr>
+<tr class="odd">
+<td><code>GATED_DELTA_NET</code></td>
+<td><code>gated_delta_net</code></td>
+<td>F32; state size 16, 32, 64 or 128</td>
+</tr>
+<tr class="even">
+<td><code>SOLVE_TRI</code></td>
+<td><code>solve_tri</code></td>
+<td>F32; size limited by shared memory</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="training" class="section level3">
+<h3>Training</h3>
+<table>
+<colgroup>
+<col width="33%" />
+<col width="33%" />
+<col width="33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Op</th>
+<th>Shader(s)</th>
+<th>Vulkan</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>CROSS_ENTROPY_LOSS</code></td>
+<td><code>cross_entropy_loss</code></td>
+<td>F32, contiguous, scalar result</td>
+</tr>
+<tr class="even">
+<td><code>CROSS_ENTROPY_LOSS_BACK</code> ★</td>
+<td><code>cross_entropy_loss_back</code></td>
+<td>F32, contiguous, matching shapes</td>
+</tr>
+<tr class="odd">
+<td><code>OPT_STEP_ADAMW</code></td>
+<td><code>opt_step_adamw</code></td>
+<td>F32, contiguous</td>
+</tr>
+<tr class="even">
+<td><code>OPT_STEP_SGD</code></td>
+<td><code>opt_step_sgd</code></td>
+<td>F32, contiguous</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="onnx" class="section level3">
+<h3>ONNX</h3>
+<table>
+<colgroup>
+<col width="33%" />
+<col width="33%" />
+<col width="33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Op</th>
+<th>Shader(s)</th>
+<th>Vulkan</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>SCATTER_ELEMENTS</code> ★</td>
+<td><code>scatter_elements</code></td>
+<td>F32 output; <code>reduction = add</code> needs float atomics</td>
+</tr>
+<tr class="even">
+<td><code>REL_POS_BIAS</code> ★</td>
+<td><code>rel_pos_bias</code></td>
+<td>F32, contiguous</td>
+</tr>
+<tr class="odd">
+<td><code>QCONV_I32</code> ★</td>
+<td><code>qconv_i32</code></td>
+<td>int8 <code>QLinearConv</code>: contiguous, I32 bias, output grid
+within workgroup limits</td>
+</tr>
+<tr class="even">
+<td><code>QMATMUL_I32</code> ★</td>
+<td><code>qmatmul_i32</code></td>
+<td>int8 <code>QLinearMatMul</code>, 2-D, contiguous; <code>M·N·K</code>
+≤ <code>GGMLR_QI32_MAX_WORK</code>; off with
+<code>GGMLR_ONNX_GPU_QMATMUL=0</code></td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="cpu-only" class="section level3">
+<h3>CPU only</h3>
+<p>No Vulkan kernel; these always run on the CPU, also when a GPU is
+present: <code>DIAG_MASK_ZERO</code>, <code>POOL_2D_BACK</code>,
+<code>WIN_PART</code>, <code>WIN_UNPART</code>,
+<code>GET_REL_POS</code>, <code>ADD_REL_POS</code>,
+<code>RWKV_WKV6_BACK</code>, <code>RWKV_WKV7_BACK</code>,
+<code>GATED_LINEAR_ATTN_BACK</code>, and the user callbacks
+<code>MAP_CUSTOM1/2/3</code> and <code>CUSTOM</code>.</p>
+</div>
+<div id="additions-inside-shared-shaders" class="section level3">
+<h3>Additions inside shared shaders</h3>
+<table>
+<colgroup>
+<col width="33%" />
+<col width="33%" />
+<col width="33%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Feature</th>
+<th>Shader</th>
+<th>Runs on Vulkan when</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>ROUND_EVEN</code> unary (ONNX <code>QuantizeLinear</code>
+rounding)</td>
+<td><code>unary.comp</code></td>
+<td>as other unary ops</td>
+</tr>
+<tr class="even">
+<td>NaN-preserving <code>CLAMP</code></td>
+<td><code>unary.comp</code></td>
+<td>as other unary ops</td>
+</tr>
+<tr class="odd">
+<td>Q4_K keys/values in flash attention</td>
+<td><code>flash_attn_dequant.glsl</code>,
+<code>fa_types.glsl</code></td>
+<td>scalar and coopmat1 paths; not on coopmat2</td>
+</tr>
+<tr class="even">
+<td>5D indexing (<code>ne[4]</code>) in binary ops,
+<code>get_rows</code>, <code>rms_norm</code>, unary × mul fusion</td>
+<td>several</td>
+<td>always</td>
+</tr>
+<tr class="odd">
+<td>Subgroup-shuffle Q4_K/Q5_K/Q6_K matmul</td>
+<td><code>mul_mmq</code> variants</td>
+<td>wavefront-64 GPUs (RDNA), large batches</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="direct-dispatch-kernels" class="section level3">
+<h3>Direct-dispatch kernels</h3>
+<table>
+<colgroup>
+<col width="25%" />
+<col width="25%" />
+<col width="25%" />
+<col width="25%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Kernel</th>
+<th>Shader</th>
+<th>Used by</th>
+<th>CPU alternative</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>UMAP SGD</td>
+<td><code>umap_sgd.comp</code></td>
+<td>single-cell UMAP, <code>sgd_backend = &quot;gpu&quot;</code></td>
+<td>C SGD (the default, <code>sgd_backend = &quot;cpu&quot;</code>)</td>
+</tr>
+<tr class="even">
+<td>k-nearest neighbours</td>
+<td><code>knn_tiled.comp</code>, <code>pairwise_dist.comp</code></td>
+<td>single-cell UMAP graph</td>
+<td>kd-tree on the CPU</td>
+</tr>
+<tr class="odd">
+<td>Sparse log-normalisation</td>
+<td><code>sparse_lognorm.comp</code></td>
+<td>single-cell normalisation (sparse <code>dgCMatrix</code>)</td>
+<td>CPU path</td>
+</tr>
+<tr class="even">
+<td>Double-precision matmul</td>
+<td><code>matmul_f64.comp</code></td>
+<td><code>ggml_matmul_f64()</code></td>
+<td>R’s <code>%*%</code> (also used when the GPU has no FP64)</td>
+</tr>
+<tr class="odd">
+<td>RoIAlign</td>
+<td><code>roi_align.comp</code></td>
+<td>ONNX <code>RoiAlign</code> (Mask R-CNN)</td>
+<td>C implementation</td>
+</tr>
+<tr class="even">
+<td>Non-max suppression</td>
+<td><code>nms.comp</code></td>
+<td>ONNX <code>NonMaxSuppression</code></td>
+<td>C implementation</td>
+</tr>
+</tbody>
+</table>
+<p>See <code>vignette(&quot;single-cell-seurat&quot;, package = &quot;ggmlR&quot;)</code>
+(temporarily disabled) and
+<code>vignette(&quot;onnx-import&quot;, package = &quot;ggmlR&quot;)</code> for the
+user-facing side of the last two tables.</p>
+</div>
+</div>
+
+
+
+<!-- code folding -->
+
+
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+  (function () {
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    script.src  = "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML";
+    document.getElementsByTagName("head")[0].appendChild(script);
+  })();
+</script>
+
+</body>
+</html>

@@ -122,7 +122,7 @@
 #' @param on `TRUE` to use the graph path where possible, `FALSE` to always use
 #'   closures, `NA` to only query the current state.
 #' @return The previous state, invisibly.
-#' @keywords internal
+#' @noRd
 ag_backward_graph <- function(on = TRUE) {
   # isTRUE(), not the raw field: $enabled starts NULL when the setting has only
   # ever come from the environment variable, and returning NULL breaks the
@@ -133,7 +133,7 @@ ag_backward_graph <- function(on = TRUE) {
   invisible(old)
 }
 
-#' @rdname ag_backward_graph
+#' @noRd
 #' @keywords internal
 ag_backward_path <- function() .ag_bwd$last_path
 
@@ -171,7 +171,7 @@ ag_backward_path <- function() .ag_bwd$last_path
 #'
 #' @param reset \code{TRUE} to clear the counts after reading them.
 #' @return A named numeric vector: reason -> number of backward() calls.
-#' @keywords internal
+#' @noRd
 ag_backward_fallbacks <- function(reset = FALSE) {
   v <- unlist(.ag_bwd$fallbacks)
   if (is.null(v)) v <- numeric(0)
@@ -220,7 +220,7 @@ ag_backward_fallbacks <- function(reset = FALSE) {
 #' @param on `TRUE` to keep gradients resident, `FALSE` to download them as
 #'   before, `NA` to only query the current state.
 #' @return The previous state, invisibly.
-#' @keywords internal
+#' @noRd
 ag_backward_resident <- function(on = TRUE) {
   # Always a length-1 logical, never NULL: the value is meant to be handed
   # straight back to restore the setting, and a NULL round-trip fails inside
@@ -272,7 +272,8 @@ ag_backward_resident <- function(on = TRUE) {
 .AG_BWD_GRAPH_OPS <- c("matmul", "add", "loss_const", "elemwise_mul",
                        "transpose", "softmax", "scale", "mul", "flash_attn",
                        "sub", "log", "sum", "log_softmax", "slice_rows",
-                       "concat_rows")
+                       "concat_rows", "silu", "rms_norm", "conv2d", "reshape", "conv_transpose2d",
+                       "layer_norm")
 
 # Can this tape run as one graph?
 #
@@ -330,7 +331,7 @@ ag_backward_resident <- function(on = TRUE) {
 #' @param on `TRUE` to record per-stage timings on every graph backward,
 #'   `FALSE` to stop, `NA` to query.
 #' @return The previous state, invisibly.
-#' @keywords internal
+#' @noRd
 ag_backward_profile <- function(on = TRUE) {
   old <- .ag_bwd$prof
   if (!is.na(on)) {
@@ -340,7 +341,7 @@ ag_backward_profile <- function(on = TRUE) {
   invisible(old)
 }
 
-#' @rdname ag_backward_profile
+#' @noRd
 #' @keywords internal
 ag_backward_profile_reset <- function() {
   .ag_bwd$prof_totals <- NULL
@@ -348,7 +349,7 @@ ag_backward_profile_reset <- function() {
   invisible(NULL)
 }
 
-#' @rdname ag_backward_profile
+#' @noRd
 #' @keywords internal
 ag_backward_profile_report <- function() {
   if (is.null(.ag_bwd$prof_totals) || .ag_bwd$prof_n == 0L) {
@@ -442,7 +443,11 @@ ag_backward_profile_report <- function() {
   # backward() repeatedly OUTSIDE a tape does accumulate, which is why the
   # budget check in .ag_ctx_ensure exists; it grows contexts rather than
   # overflowing one.
-  ctx <- .ag_ctx_ensure(8L * length(nodes) + 16L)
+  # A conv2d rule emits ~20 tensors (reshapes, permute, im2col, im2col_back,
+  # two reductions), well above the per-node 8: each gets 24 more.
+  n_conv <- sum(vapply(nodes, function(nd) isTRUE(nd$op %in% c("conv2d", "conv_transpose2d")),
+                      logical(1L)))
+  ctx <- .ag_ctx_ensure(8L * length(nodes) + 24L * n_conv + 16L)
 
   # Host matrices that must reach the device, collected while emitting and
   # uploaded in one pass after allocation: ggml_backend_alloc_ctx_tensors has to
@@ -492,12 +497,21 @@ ag_backward_profile_report <- function() {
     if (is.null(bdim)) return(g)
     if (bdim[2L] == 1L && out_nc > 1L) {
       # b was [m,1] broadcast across columns -> db = rowSums(g), [m,1].
-      # Reducing ne[1] is not something sum_rows does, so transpose to
-      # [n,m] and reduce ne[0] instead, then reshape [1,m] back to [m,1].
-      # ggml_cont before the reduction: sum_rows over a transposed VIEW is
-      # a different (and here wrong) memory walk.
-      gt <- ggml_cont(ctx, ggml_transpose(ctx, g))
-      g <- ggml_reshape_2d(ctx, ggml_sum_rows(ctx, gt), out_nr, 1L)
+      # sum_rows reduces ne[0] only, so through it this took cont(transpose)
+      # + sum_rows + reshape -- a full copy of g. One out_prod against a row
+      # of ones does it in a single node:
+      #   out_prod(a [m,n], b [1,n])[i,0] = sum_k a[i,k] * 1 = rowSums(g).
+      # The ones are data-independent, so a recording may freeze them.
+      # TEMPORARY (benchmark of TODO item 3A): option ggmlR.bias_grad_outprod
+      # = FALSE restores the old path; remove once measured.
+      if (isTRUE(getOption("ggmlR.bias_grad_outprod", TRUE))) {
+        ones <- const(matrix(1, 1L, out_nc))
+        uploads[[length(uploads)]]$const <<- TRUE
+        g <- ggml_out_prod(ctx, g, ones)
+      } else {
+        gt <- ggml_cont(ctx, ggml_transpose(ctx, g))
+        g <- ggml_reshape_2d(ctx, ggml_sum_rows(ctx, gt), out_nr, 1L)
+      }
     }
     if (bdim[1L] == 1L && out_nr > 1L) {
       # b was [1,n] broadcast down rows -> db = colSums(g), [1,n], which
@@ -505,6 +519,44 @@ ag_backward_profile_report <- function() {
       g <- ggml_sum_rows(ctx, g)
     }
     g
+  }
+
+  # Fused bias gradient (GGML_OP_OUT_PROD_ROWSUM). A dense layer is recorded
+  # as add(matmul(W, x), b) with b [m,1] broadcast over the columns; its dW is
+  # out_prod(g, x) and its db the row sums of the same g. When the matmul's
+  # output feeds nothing but that add, g is the same tensor at both nodes, and
+  # one ggml_out_prod_rowsum(g, x) gives [dW | db] in one pass over g. The add
+  # comes first in this reverse walk, so it leaves db to the matmul
+  # (fused_bias[matmul output id] = what the matmul needs for it), and the
+  # matmul splits the result into two views. options(ggmlR.bias_grad_fuse =
+  # FALSE) turns it off.
+  consumers <- new.env(hash = TRUE, parent = emptyenv())
+  producer  <- new.env(hash = TRUE, parent = emptyenv())
+  for (nd0 in nodes) {
+    assign(as.character(nd0$output_id), nd0, envir = producer)
+    for (t0 in nd0$inputs) if (is_ag_tensor(t0)) {
+      k0 <- as.character(t0$id)
+      assign(k0, get0(k0, envir = consumers, inherits = FALSE, ifnotfound = 0L) + 1L,
+             envir = consumers)
+    }
+  }
+  fused_bias <- new.env(hash = TRUE, parent = emptyenv())
+  # Measured 2026-11-18 (RX 9070, PPO captured update, one process,
+  # interleaved): the separate db node was 0.4-5% of the update; fusing takes
+  # ~1.5% off pendulum and is within noise on tic-tac-toe -- kept for wider
+  # reductions (long K, convolutions) where the separate node costs more.
+  fuse_on <- isTRUE(getOption("ggmlR.bias_grad_fuse", TRUE))
+  # The add node `nd` with bias B: can its db come from the matmul below it?
+  can_fuse_bias <- function(nd, A, B) {
+    if (!fuse_on || !is_ag_tensor(A) || !is_ag_tensor(B)) return(FALSE)
+    bdim <- .ag_dim(nd$b_orig)
+    if (is.null(bdim) || bdim[2L] != 1L || nd$out_nc <= 1L || bdim[1L] != nd$out_nr)
+      return(FALSE)
+    mm <- get0(as.character(A$id), envir = producer, inherits = FALSE)
+    if (is.null(mm) || !identical(mm$op, "matmul")) return(FALSE)
+    W <- mm$inputs$A
+    is_ag_tensor(W) && isTRUE(W$requires_grad) &&
+      identical(get0(as.character(A$id), envir = consumers, inherits = FALSE), 1L)
   }
 
   # Seed: dL/dL = 1. A 1x1 tensor, so the scalar rules below can multiply by it
@@ -530,7 +582,24 @@ ag_backward_profile_report <- function() {
       # shapes -- and passes silently on square ones, which is exactly how it
       # first slipped through (the PoC chain was 512x512 throughout). Both
       # rules below are verified against R on m=5, k=4, n=3, all distinct.
-      if (is_ag_tensor(A) && isTRUE(A$requires_grad))
+      fb <- get0(as.character(nd$output_id), envir = fused_bias, inherits = FALSE)
+      if (!is.null(fb)) {
+        # dW and db of a dense layer in one node: [m, k + 1], dW the first k
+        # columns, db the last; both contiguous, so plain views. F32 only --
+        # with an f16/bf16 compute dtype the two take the separate path.
+        xs <- const(nd$b_snap)
+        if (ggml_tensor_type(g) == GGML_TYPE_F32 && ggml_tensor_type(xs) == GGML_TYPE_F32) {
+          r   <- ggml_out_prod_rowsum(ctx, g, xs)
+          .ag_bwd$fused_bias <- (.ag_bwd$fused_bias %||% 0L) + 1L   # for tests
+          sh  <- ggml_tensor_shape(r)
+          nb1 <- ggml_tensor_nb(r)[2L]
+          accumulate(as.character(A$id), ggml_view_2d(ctx, r, sh[1L], sh[2L] - 1L, nb1, 0))
+          accumulate(fb$b_id, ggml_view_2d(ctx, r, sh[1L], 1L, nb1, (sh[2L] - 1L) * nb1))
+        } else {
+          accumulate(as.character(A$id), ggml_out_prod(ctx, g, xs))
+          accumulate(fb$b_id, reduce_b(g, fb$b_orig, fb$out_nr, fb$out_nc))
+        }
+      } else if (is_ag_tensor(A) && isTRUE(A$requires_grad))
         accumulate(as.character(A$id), ggml_out_prod(ctx, g, const(nd$b_snap)))
       # dB = t(A) %*% g, shapes [k,m]x[m,n] -> [k,n]. Shared axis m sits in
       # ne[0] of both A[m,k] and g[m,n], so this one IS mul_mat -- and needs no
@@ -543,12 +612,21 @@ ag_backward_profile_report <- function() {
       if (is_ag_tensor(A) && isTRUE(A$requires_grad))
         accumulate(as.character(A$id), g)
       if (is_ag_tensor(B) && isTRUE(B$requires_grad)) {
+        if (can_fuse_bias(nd, A, B)) {
+          # db comes with dW from the matmul (see fused_bias above); what it
+          # needs if it has to fall back to reduce_b goes along
+          assign(as.character(A$id),
+                 list(b_id = as.character(B$id), b_orig = nd$b_orig,
+                      out_nr = nd$out_nr, out_nc = nd$out_nc),
+                 envir = fused_bias)
+        } else {
         # B may have been broadcast over A in the forward pass -- the bias case
         # of ag_linear -- and then its gradient is g summed over the axis that
         # was broadcast. Both directions are emitted here; neither needs a
         # download (reduce_b above).
         accumulate(as.character(B$id),
                    reduce_b(g, nd$b_orig, nd$out_nr, nd$out_nc))
+        }
       }
 
     } else if (identical(nd$op, "sub")) {
@@ -577,6 +655,113 @@ ag_backward_profile_report <- function() {
       x <- inp$x
       if (is_ag_tensor(x) && isTRUE(x$requires_grad))
         accumulate(as.character(x$id), ggml_div(ctx, g, const(nd$x_snap)))
+
+    } else if (identical(nd$op, "silu")) {
+      # dx = g * s * (1 + x * (1 - s)), s = sigmoid(x): one ggml_silu_back
+      # node. Argument order is (dy, x), as ggml-graph.c's own SILU rule calls it.
+      x <- inp$x
+      if (is_ag_tensor(x) && isTRUE(x$requires_grad))
+        accumulate(as.character(x$id), ggml_silu_back(ctx, g, const(nd$x_snap)))
+
+    } else if (identical(nd$op, "rms_norm")) {
+      # dx = (g - y * mean(g * y)) / rms(x) per column: one ggml_rms_norm_back
+      # node, (dy, x, eps) as in ggml-graph.c's RMS_NORM rule. ne0 is the R
+      # matrix's row axis, the axis the forward normalised over.
+      x <- inp$x
+      if (is_ag_tensor(x) && isTRUE(x$requires_grad))
+        accumulate(as.character(x$id),
+                   ggml_rms_norm_back(ctx, g, const(nd$x_snap), nd$eps))
+
+    } else if (identical(nd$op, "layer_norm")) {
+      # dx = (g - mean(g) - y * mean(g * y)) / s per column: one
+      # ggml_norm_back node, (dy, x, eps) -- NORM_BACK is ggmlR's own op
+      # (CPU ops-elemwise.cpp, Vulkan norm_back), absent upstream.
+      x <- inp$x
+      if (is_ag_tensor(x) && isTRUE(x$requires_grad))
+        accumulate(as.character(x$id),
+                   ggml_norm_back(ctx, g, const(nd$x_snap), nd$eps))
+
+    } else if (identical(nd$op, "conv2d")) {
+      # ag_conv2d (R/ag_conv.R). g is [OC*OH*OW, B] (W fastest, then H, C).
+      # With gt = g as [OC, P*B] (P = OW*OH) and cols = im2col(x) [K, P*B]:
+      #   dW = gt %*% t(cols)       out_prod (shared ne1 = P*B)  -> [OC, K]
+      #   dx = im2col_back(t(W) %*% gt)   mul_mat (shared ne0 = OC)
+      #   db = per-channel sum over P and B
+      # cols is recomputed from the x snapshot rather than kept from the
+      # forward: it is KH*KW/stride^2 times the input (4x on Nature-CNN conv1,
+      # 9x on a 3x3 stride-1 layer) and costs one im2col dispatch. All shapes
+      # are fixed by the recording, so ag_capture_step can freeze the graph.
+      cf <- nd$conf; B <- nd$batch; P <- cf$OW * cf$OH
+      X <- inp$x; Wt <- inp$weight; Bs <- inp$bias
+      need <- function(t) is_ag_tensor(t) && isTRUE(t$requires_grad)
+      gc <- if (ggml_is_contiguous(g)) g else ggml_cont(ctx, g)
+      kshape <- ggml_new_tensor_4d(ctx, GGML_TYPE_F32, cf$KW, cf$KH, cf$IC, 1L)
+      if (need(X) || need(Wt)) {
+        g4 <- ggml_reshape_4d(ctx, gc, cf$OW, cf$OH, cf$OC, B)
+        gt <- ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, g4, 1L, 2L, 0L, 3L)),
+                              cf$OC, P * B)                         # [OC, OW, OH, B]
+      }
+      if (need(Wt)) {
+        x4 <- ggml_reshape_4d(ctx, const(nd$x_snap), cf$IW, cf$IH, cf$IC, B)
+        cols <- ggml_im2col(ctx, kshape, x4, cf$sW, cf$sH, cf$pW, cf$pH, cf$dW, cf$dH,
+                            TRUE, GGML_TYPE_F32)
+        cols <- ggml_reshape_2d(ctx, cols, cf$K, P * B)
+        accumulate(as.character(Wt$id), ggml_out_prod(ctx, gt, cols))
+      }
+      if (need(X)) {
+        dcols <- .ag_mul_mat(ctx, const(nd$w_snap), gt)            # [K, P*B]
+        dx <- ggml_im2col_back(ctx, ggml_reshape_4d(ctx, dcols, cf$K, cf$OW, cf$OH, B),
+                               kshape, c(cf$IW, cf$IH, cf$IC, B),
+                               cf$sW, cf$sH, cf$pW, cf$pH, cf$dW, cf$dH)
+        accumulate(as.character(X$id),
+                   ggml_reshape_2d(ctx, dx, cf$IW * cf$IH * cf$IC, B))
+      }
+      if (isTRUE(nd$has_bias) && need(Bs)) {
+        # sum over P (ne0 of g as [P, OC*B]), then over B on the small [OC, B]
+        s <- ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_reshape_2d(ctx, gc, P, cf$OC * B)),
+                             cf$OC, B)
+        s <- ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, s)))   # [1, OC]
+        accumulate(as.character(Bs$id), ggml_reshape_2d(ctx, s, cf$OC, 1L))
+      }
+
+    } else if (identical(nd$op, "conv_transpose2d")) {
+      # ag_conv_transpose2d (R/ag_conv.R), cf = the DUAL conv2d: its input is
+      # the transpose's output (g), its output the transpose's input (x).
+      #   cols = im2col(g)                    [K, P*B], P = IW_t*IH_t
+      #   dx   = forward of the dual conv2d:  t(W) %*% cols, permuted back
+      #   dW   = x_t %*% t(cols)              out_prod (shared ne1 = P*B)
+      #   db   = per-channel sum of g
+      cf <- nd$conf; B <- nd$batch; P <- cf$OW * cf$OH
+      X <- inp$x; Wt <- inp$weight; Bs <- inp$bias
+      need <- function(t) is_ag_tensor(t) && isTRUE(t$requires_grad)
+      gc <- if (ggml_is_contiguous(g)) g else ggml_cont(ctx, g)
+      if (need(X) || need(Wt)) {
+        kshape <- ggml_new_tensor_4d(ctx, GGML_TYPE_F32, cf$KW, cf$KH, cf$IC, 1L)
+        g4 <- ggml_reshape_4d(ctx, gc, cf$IW, cf$IH, cf$IC, B)
+        cols <- ggml_im2col(ctx, kshape, g4, cf$sW, cf$sH, cf$pW, cf$pH, cf$dW, cf$dH,
+                            TRUE, GGML_TYPE_F32)
+        cols <- ggml_reshape_2d(ctx, cols, cf$K, P * B)
+      }
+      if (need(X)) {
+        wt <- ggml_cont(ctx, ggml_transpose(ctx, const(nd$w_snap)))   # [K, IC_t]
+        y  <- .ag_mul_mat(ctx, wt, cols)                              # [IC_t, P*B]
+        y  <- ggml_reshape_4d(ctx, y, cf$OC, cf$OW, cf$OH, B)
+        y  <- ggml_cont(ctx, ggml_permute(ctx, y, 2L, 0L, 1L, 3L))     # [OW, OH, IC_t, B]
+        accumulate(as.character(X$id), ggml_reshape_2d(ctx, y, cf$OW * cf$OH * cf$OC, B))
+      }
+      if (need(Wt)) {
+        x4 <- ggml_reshape_4d(ctx, const(nd$x_snap), cf$OW, cf$OH, cf$OC, B)
+        xt <- ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, x4, 1L, 2L, 0L, 3L)),
+                              cf$OC, P * B)                           # [IC_t, P*B]
+        accumulate(as.character(Wt$id), ggml_out_prod(ctx, xt, cols))
+      }
+      if (isTRUE(nd$has_bias) && need(Bs)) {
+        Q <- cf$IW * cf$IH
+        s <- ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_reshape_2d(ctx, gc, Q, cf$IC * B)),
+                             cf$IC, B)
+        s <- ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, s)))   # [1, OC_t]
+        accumulate(as.character(Bs$id), ggml_reshape_2d(ctx, s, cf$IC, 1L))
+      }
 
     } else if (identical(nd$op, "log_softmax")) {
       # dx = g - p * colSums(g), p = exp(logp). Rebuilt from the logp snapshot
@@ -663,6 +848,17 @@ ag_backward_profile_report <- function() {
       x <- inp$x
       if (is_ag_tensor(x) && isTRUE(x$requires_grad))
         accumulate(as.character(x$id), ggml_cont(ctx, ggml_transpose(ctx, g)))
+
+    } else if (identical(nd$op, "reshape")) {
+      # dx = g reshaped back to x's [nrow_x, ncol_x]: column-major order is
+      # kept, so it is the same data under the old shape. reshape needs a
+      # contiguous source; the result is made contiguous as in the forward.
+      x <- inp$x
+      if (is_ag_tensor(x) && isTRUE(x$requires_grad)) {
+        src <- if (ggml_is_contiguous(g)) g else ggml_cont(ctx, g)
+        accumulate(as.character(x$id),
+                   ggml_cont(ctx, ggml_reshape_2d(ctx, src, nd$nrow_x, nd$ncol_x)))
+      }
 
     } else if (identical(nd$op, "slice_rows")) {
       # dx = g in rows from+1..from+n, zero elsewhere: one pad node with zero
@@ -808,17 +1004,12 @@ ag_backward_profile_report <- function() {
   # The graph gets a throwaway context of its own: it holds pointers to tensors
   # that outlive it, and ggml_free releases only the context's own mem_buffer
   # (same ownership rule .ag_run_op relies on, R/ag_device.R:406-421).
-  ctx_graph <- ggml_init(.ag_graph_ctx_bytes(), no_alloc = TRUE)
-  if (is.null(ctx_graph)) {
-    .ag_bwd$last_path <- "closures (no graph context)"
-    return(NULL)
-  }
-  on.exit(ggml_free(ctx_graph), add = TRUE)
-
-  # Each gradient is a separate output, unreachable from the others, so each
-  # needs its own expand or it would be pruned.
-  graph <- ggml_build_forward_expand(ctx_graph, outs[[1L]])
-  for (i in seq_along(outs)[-1L]) ggml_graph_expand(graph, outs[[i]])
+  # Sized for the tape (.ag_graph_build): an unrolled loop outgrows ggml's
+  # default 8192 nodes. Each gradient is a separate output, unreachable from
+  # the others, so each is a root of its own or it would be pruned.
+  gb <- .ag_graph_build(outs, "backward graph")
+  on.exit(ggml_free(gb$ctx), add = TRUE)
+  graph <- gb$graph
   if (prof) { acc <- .ag_bwd_prof_add(acc, "build", tk); tk <- Sys.time() }
 
   .ag_graph_compute(backend, graph, "graph backward")

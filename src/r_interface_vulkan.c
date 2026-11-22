@@ -44,6 +44,77 @@ SEXP R_ggml_vk_prec32_count(void) {
 #endif
 }
 
+// Number of HC_POST_GATE fusions (scale->sigmoid->scale->DSV4_HC_POST) dispatched
+// (ggml-vulkan-graph.cpp). Test hook. 0 without Vulkan.
+#ifdef GGML_USE_VULKAN
+extern uint64_t ggml_vk_hc_post_gate_fusion_count(void);
+extern int ggml_vk_test_fused_output_overlaps(struct ggml_cgraph * cgraph, int node_idx, int n_nodes, int mode);
+#endif
+SEXP R_ggml_vk_hc_post_gate_count(void) {
+#ifdef GGML_USE_VULKAN
+    return ScalarReal((double) ggml_vk_hc_post_gate_fusion_count());
+#else
+    return ScalarReal(0.0);
+#endif
+}
+
+// Number of SSM_CONV(+ADD)+SILU fusions dispatched. Test hook. 0 without Vulkan.
+#ifdef GGML_USE_VULKAN
+extern uint64_t ggml_vk_ssm_conv_fusion_count(void);
+#endif
+SEXP R_ggml_vk_ssm_conv_fusion_count(void) {
+#ifdef GGML_USE_VULKAN
+    return ScalarReal((double) ggml_vk_ssm_conv_fusion_count());
+#else
+    return ScalarReal(0.0);
+#endif
+}
+
+// Number of UNARY+MUL fusions (gelu/sigmoid/silu/softplus_mul) dispatched. Test hook. 0 without Vulkan.
+#ifdef GGML_USE_VULKAN
+extern uint64_t ggml_vk_unary_mul_fusion_count(void);
+#endif
+SEXP R_ggml_vk_unary_mul_fusion_count(void) {
+#ifdef GGML_USE_VULKAN
+    return ScalarReal((double) ggml_vk_unary_mul_fusion_count());
+#else
+    return ScalarReal(0.0);
+#endif
+}
+
+// Number of fused TOPK_MOE dispatches for one mode (0 early_softmax,
+// 1 early_softmax_norm, 2 late_softmax, 3 sigmoid_norm_bias,
+// 4 sqrt_softplus_norm_bias, 5 = with the extra SCALE fused). Test hook. 0 without Vulkan.
+#ifdef GGML_USE_VULKAN
+extern uint64_t ggml_vk_topk_moe_fusion_count(int mode);
+#endif
+SEXP R_ggml_vk_topk_moe_fusion_count(SEXP mode) {
+#ifdef GGML_USE_VULKAN
+    return ScalarReal((double) ggml_vk_topk_moe_fusion_count(asInteger(mode)));
+#else
+    (void) mode;
+    return ScalarReal(0.0);
+#endif
+}
+
+// Test hook: does a fused pattern's output overlap one of its external inputs?
+// node_idx is 0-based; mode (see ggml_vk_test_fused_output_overlaps) moves the
+// output onto an input for the call. NA without Vulkan.
+SEXP R_ggml_vk_test_fused_overlap(SEXP graph_ptr, SEXP node_idx, SEXP n_nodes, SEXP mode) {
+    struct ggml_cgraph * graph = (struct ggml_cgraph *) r_ptr_required(graph_ptr, "graph");
+    const int i = asInteger(node_idx);
+    const int n = asInteger(n_nodes);
+    if (i < 0 || n < 1 || i + n > ggml_graph_n_nodes(graph)) {
+        Rf_error("node range [%d, %d) is outside the graph", i, i + n);
+    }
+#ifdef GGML_USE_VULKAN
+    return ScalarLogical(ggml_vk_test_fused_output_overlaps(graph, i, n, asInteger(mode)));
+#else
+    (void) mode;
+    return ScalarLogical(NA_LOGICAL);
+#endif
+}
+
 SEXP R_ggml_vk_hard_exit_available(void) {
 #if defined(GGML_USE_VULKAN) && defined(GGML_VK_HARD_EXIT)
     return ScalarLogical(TRUE);
@@ -94,16 +165,21 @@ SEXP R_ggml_vulkan_device_memory(SEXP device_idx) {
 
     size_t free_mem = 0, total_mem = 0;
     ggml_backend_vk_get_device_memory(device, &free_mem, &total_mem);
+    // Same value the backend's supports_op size refusal uses; 0 would read as
+    // "nothing fits", so an unknown limit is reported as NA instead.
+    const size_t max_tensor = ggml_backend_vk_get_device_max_tensor_size(device);
 
-    // Return named list with free and total memory
-    SEXP result = PROTECT(allocVector(VECSXP, 2));
-    SEXP names = PROTECT(allocVector(STRSXP, 2));
+    // Return named list with free/total memory and the per-tensor limit
+    SEXP result = PROTECT(allocVector(VECSXP, 3));
+    SEXP names = PROTECT(allocVector(STRSXP, 3));
 
     SET_VECTOR_ELT(result, 0, ScalarReal((double)free_mem));
     SET_VECTOR_ELT(result, 1, ScalarReal((double)total_mem));
+    SET_VECTOR_ELT(result, 2, ScalarReal(max_tensor > 0 ? (double)max_tensor : NA_REAL));
 
     SET_STRING_ELT(names, 0, mkChar("free"));
     SET_STRING_ELT(names, 1, mkChar("total"));
+    SET_STRING_ELT(names, 2, mkChar("max_tensor_size"));
     setAttrib(result, R_NamesSymbol, names);
 
     UNPROTECT(2);
@@ -543,6 +619,61 @@ SEXP R_ggml_vulkan_is_backend(SEXP backend_ptr) {
 #else
     return ScalarLogical(FALSE);
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Recorded graphs (ggml_backend_vk_graph_record / _replay): the command
+// buffers of a graph recorded once and submitted many times.
+
+#ifdef GGML_USE_VULKAN
+static void r_vk_graph_rec_finalizer(SEXP ptr) {
+    void * rec = R_ExternalPtrAddr(ptr);
+    if (rec != NULL) {
+        ggml_backend_vk_graph_record_free(rec);
+        R_ClearExternalPtr(ptr);
+    }
+}
+#endif
+
+// External pointer to the recording, or NULL when the graph cannot be
+// recorded (not a Vulkan backend, no push descriptors, host-side copies, ...).
+SEXP R_ggml_vk_graph_record(SEXP backend_ptr, SEXP graph_ptr) {
+#ifdef GGML_USE_VULKAN
+    ggml_backend_t backend = (ggml_backend_t) R_ExternalPtrAddr(backend_ptr);
+    struct ggml_cgraph * graph = (struct ggml_cgraph *) R_ExternalPtrAddr(graph_ptr);
+    if (backend == NULL || graph == NULL) return R_NilValue;
+    void * rec = ggml_backend_vk_graph_record(backend, graph);
+    if (rec == NULL) return R_NilValue;
+    SEXP ptr = PROTECT(R_MakeExternalPtr(rec, R_NilValue, R_NilValue));
+    R_RegisterCFinalizerEx(ptr, r_vk_graph_rec_finalizer, FALSE);
+    UNPROTECT(1);
+    return ptr;
+#else
+    (void) backend_ptr; (void) graph_ptr;
+    return R_NilValue;
+#endif
+}
+
+// 0 done, 1 stale (record again), -1 wrong backend or freed recording.
+SEXP R_ggml_vk_graph_replay(SEXP backend_ptr, SEXP rec_ptr, SEXP n) {
+#ifdef GGML_USE_VULKAN
+    ggml_backend_t backend = (ggml_backend_t) R_ExternalPtrAddr(backend_ptr);
+    void * rec = R_ExternalPtrAddr(rec_ptr);
+    if (backend == NULL || rec == NULL) return ScalarInteger(-1);
+    return ScalarInteger(ggml_backend_vk_graph_replay(backend, rec, asInteger(n)));
+#else
+    (void) backend_ptr; (void) rec_ptr; (void) n;
+    return ScalarInteger(-1);
+#endif
+}
+
+SEXP R_ggml_vk_graph_record_free(SEXP rec_ptr) {
+#ifdef GGML_USE_VULKAN
+    r_vk_graph_rec_finalizer(rec_ptr);
+#else
+    (void) rec_ptr;
+#endif
+    return R_NilValue;
 }
 
 // Get backend name

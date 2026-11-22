@@ -153,7 +153,7 @@ ag_param <- function(data, device = .ag_device_state$device,
 #' Check if object is an ag_tensor
 #' @param x Any R object to test.
 #' @return \code{TRUE} if \code{x} is an \code{ag_tensor} object, \code{FALSE} otherwise.
-#' @keywords internal
+#' @noRd
 is_ag_tensor <- function(x) inherits(x, "ag_tensor")
 
 #' Extract the value of an ag_tensor as an R matrix
@@ -370,19 +370,71 @@ ag_matmul <- function(A, B) {
   out
 }
 
+# Host broadcast of b over a for add / sub, as ggml_add does on the device:
+# each axis of size 1 in b is repeated to a's size, both at once for [1, 1].
+.ag_bcast_b <- function(a_data, b_data) {
+  if (is.null(dim(b_data)) || is.null(dim(a_data))) return(b_data)
+  nr <- nrow(a_data); nc <- ncol(a_data)
+  if (nrow(b_data) == 1L && nr > 1L) b_data <- b_data[rep(1L, nr), , drop = FALSE]
+  if (ncol(b_data) == 1L && nc > 1L) b_data <- b_data[, rep(1L, nc), drop = FALSE]
+  b_data
+}
+
+# A plain number (not an ag_tensor): a length-1 numeric, with or without dim.
+.ag_num_scalar <- function(v)
+  !is_ag_tensor(v) && is.numeric(v) && length(v) == 1L && !is.na(v)
+
+# On the GPU an operand must be an ag_tensor, a matrix or one number: a bare
+# vector has no shape to broadcast by, and used to die in .ag_run_op's vapply.
+.ag_check_no_bare_vector <- function(A, B, fn) {
+  for (v in list(A, B))
+    if (!is_ag_tensor(v) && is.numeric(v) && is.null(dim(v)) && length(v) > 1L)
+      stop(sprintf(paste0("%s: an operand is a vector of length %d; on the GPU pass a ",
+                          "matrix (e.g. [%d, 1] or [1, %d]), an ag_tensor or one number"),
+                   fn, length(v), length(v), length(v)), call. = FALSE)
+  invisible(NULL)
+}
+
+# s * x + b with numbers s and b, x an ag_tensor or matrix. Recorded as the
+# "scale" op (dx = g * s): the shift has no gradient.
+.ag_affine_scalar <- function(x, s, b) {
+  s <- as.double(s); b <- as.double(b)
+  device <- if (is_ag_tensor(x)) x$device else "cpu"
+  if (device == "gpu") {
+    out <- .ag_wrap_result(.ag_gpu_scale_bias(.ag_operand(x), s, b), device)
+  } else {
+    out <- ag_tensor(.ag_data(x) * s + b, device = device)
+  }
+  out$requires_grad <- is_ag_tensor(x) && isTRUE(x$requires_grad)
+  if (out$requires_grad) {
+    grad_fn <- function(grad_out) list(x = grad_out * s)
+    out$grad_fn <- grad_fn
+    ag_record(out, grad_fn, list(x = x), op = "scale", scalar = s)
+  }
+  out
+}
+
 #' Element-wise addition with broadcasting
 #'
 #' Computes \code{A + B}. If \code{B} is \code{[m, 1]} and \code{A} is
 #' \code{[m, n]}, \code{B} is broadcast across columns (useful for bias
-#' vectors).
+#' vectors). Either operand may be a plain number; on the GPU that is one
+#' \code{ggml_scale_bias} node with nothing uploaded, so it can be recorded by
+#' \code{\link{ag_capture}}.
 #'
 #' @param A ag_tensor or numeric matrix
-#' @param B ag_tensor or numeric matrix (may be \code{[m,1]} or \code{[1,n]}
-#'   for broadcasting)
+#' @param B ag_tensor or numeric matrix (may be \code{[m,1]}, \code{[1,n]} or
+#'   \code{[1,1]} for broadcasting)
 #' @return ag_tensor
 #' @export
 ag_add <- function(A, B) {
   device <- .ag_result_device(A, B)
+  if (device == "gpu") {
+    # A plain number: s * x + b in one node, no [1, 1] upload.
+    .ag_check_no_bare_vector(A, B, "ag_add")
+    if (.ag_num_scalar(B)) return(.ag_affine_scalar(A, 1, B))
+    if (.ag_num_scalar(A)) return(.ag_affine_scalar(B, 1, A))
+  }
 
   if (device == "gpu") {
     # Operands, not numbers -- and no manual broadcast.
@@ -406,18 +458,7 @@ ag_add <- function(A, B) {
     b_data <- .ag_data(B)
     b_orig <- b_data
 
-    # Broadcasting: if b is [m, 1] and a is [m, n], broadcast
-    needs_broadcast <- !is.null(dim(b_data)) && !is.null(dim(a_data)) &&
-      ((ncol(b_data) == 1L && ncol(a_data) > 1L) ||
-       (nrow(b_data) == 1L && nrow(a_data) > 1L))
-
-    if (needs_broadcast) {
-      if (ncol(b_data) == 1L && ncol(a_data) > 1L) {
-        b_data <- matrix(b_data[, 1L], nrow = nrow(b_data), ncol = ncol(a_data))
-      } else {
-        b_data <- matrix(b_data[1L, ], nrow = nrow(a_data), ncol = ncol(b_data), byrow = TRUE)
-      }
-    }
+    b_data <- .ag_bcast_b(a_data, b_data)
     out    <- ag_tensor(a_data + b_data, device = device)
     out_sh <- c(nrow(a_data), ncol(a_data))
   }
@@ -434,14 +475,13 @@ ag_add <- function(A, B) {
         # Shapes through the accessors: b_orig may be a device handle, and
         # nrow()/ncol() on one return NULL. Only the SHAPE is needed to pick the
         # reduction, so nothing is materialised here.
+        # Each broadcast axis is reduced, [1, 1] on both.
         b_dim <- .ag_dim(b_orig)
-        if (!is.null(b_dim) && b_dim[2L] == 1L && ncol(grad_out) > 1L) {
-          gb <- matrix(rowSums(grad_out), ncol = 1L)
-        } else if (!is.null(b_dim) && b_dim[1L] == 1L && nrow(grad_out) > 1L) {
-          gb <- matrix(colSums(grad_out), nrow = 1L)
-        } else {
-          gb <- grad_out
-        }
+        gb <- grad_out
+        if (!is.null(b_dim) && b_dim[1L] == 1L && nrow(gb) > 1L)
+          gb <- matrix(colSums(gb), nrow = 1L)
+        if (!is.null(b_dim) && b_dim[2L] == 1L && ncol(gb) > 1L)
+          gb <- matrix(rowSums(gb), ncol = 1L)
       }
       list(A = ga, B = gb)
     }
@@ -460,12 +500,21 @@ ag_add <- function(A, B) {
 
 #' Element-wise subtraction
 #'
+#' Computes \code{A - B}. Either operand may be a plain number, as in
+#' \code{\link{ag_add}}.
+#'
 #' @param A ag_tensor or numeric matrix
 #' @param B ag_tensor or numeric matrix
 #' @return ag_tensor
 #' @export
 ag_sub <- function(A, B) {
   device <- .ag_result_device(A, B)
+  if (device == "gpu") {
+    # A plain number: s * x + b in one node, no [1, 1] upload.
+    .ag_check_no_bare_vector(A, B, "ag_sub")
+    if (.ag_num_scalar(B)) return(.ag_affine_scalar(A, 1, -B))
+    if (.ag_num_scalar(A)) return(.ag_affine_scalar(B, -1, A))
+  }
 
   if (device == "gpu") {
     # Operands stay on the device (a pending node in graph mode); ggml_sub
@@ -479,17 +528,7 @@ ag_sub <- function(A, B) {
     b_data <- .ag_data(B)
     b_orig <- b_data
 
-    # Broadcasting: expand b to match a shape for elementwise computation
-    needs_broadcast <- !is.null(dim(b_data)) && !is.null(dim(a_data)) &&
-      ((ncol(b_data) == 1L && ncol(a_data) > 1L) ||
-       (nrow(b_data) == 1L && nrow(a_data) > 1L))
-    if (needs_broadcast) {
-      if (ncol(b_data) == 1L && ncol(a_data) > 1L) {
-        b_data <- matrix(b_data[, 1L], nrow = nrow(b_data), ncol = ncol(a_data))
-      } else {
-        b_data <- matrix(b_data[1L, ], nrow = nrow(a_data), ncol = ncol(b_data), byrow = TRUE)
-      }
-    }
+    b_data <- .ag_bcast_b(a_data, b_data)
     out <- ag_tensor(a_data - b_data, device = device)
   }
   out$requires_grad <- (is_ag_tensor(A) && A$requires_grad) ||
@@ -623,12 +662,9 @@ ag_scale <- function(x, scalar) {
   out
 }
 
-#' ReLU activation
-#'
-#' Applies the rectified linear unit: \eqn{\max(0, x)}.
-#'
-#' @param x ag_tensor
-#' @return ag_tensor
+#' @rdname ag_exp
+#' @details \code{ag_relu()}: Applies the rectified linear unit: \eqn{\max(0, x)}.
+#' Returns: ag_tensor
 #' @export
 ag_relu <- function(x) {
   device <- if (is_ag_tensor(x)) x$device else "cpu"
@@ -657,12 +693,9 @@ ag_relu <- function(x) {
   out
 }
 
-#' Sigmoid activation
-#'
-#' Applies \eqn{1 / (1 + e^{-x})}.
-#'
-#' @param x ag_tensor
-#' @return ag_tensor
+#' @rdname ag_exp
+#' @details \code{ag_sigmoid()}: Applies \eqn{1 / (1 + e^{-x})}.
+#' Returns: ag_tensor
 #' @export
 ag_sigmoid <- function(x) {
   device <- if (is_ag_tensor(x)) x$device else "cpu"
@@ -688,10 +721,44 @@ ag_sigmoid <- function(x) {
   out
 }
 
-#' Tanh activation
-#'
-#' @param x ag_tensor
-#' @return ag_tensor
+#' @rdname ag_exp
+#' @details \code{ag_silu()}: Applies \eqn{x / (1 + e^{-x})}, the activation of the feed-forward half of
+#' \code{\link{ggml_layer_transformer_block}}. One node on the tape (forward
+#' \code{ggml_silu}, backward \code{ggml_silu_back}) rather than the three of
+#' \code{ag_mul(x, ag_sigmoid(x))}, and it runs in the graph backward, so it can
+#' be part of an \code{\link{ag_capture_step}} recording.
+#' Returns: ag_tensor of the same shape as \code{x}
+#' @examples
+#' ag_silu(ag_tensor(matrix(c(-2, 0, 2), 3, 1)))
+#' @export
+ag_silu <- function(x) {
+  device <- if (is_ag_tensor(x)) x$device else "cpu"
+  if (device == "gpu") {
+    x_data <- .ag_operand(x)
+    out    <- .ag_wrap_result(.ag_gpu_silu(x_data), device)
+  } else {
+    x_data <- .ag_data(x)
+    out    <- ag_tensor(x_data / (1.0 + exp(-x_data)), device = device)
+  }
+  out$requires_grad <- is_ag_tensor(x) && x$requires_grad
+  if (out$requires_grad) {
+    # d silu(x) = s * (1 + x * (1 - s)), s = sigmoid(x). The snapshot is x, as
+    # ggml_silu_back wants it; a resident x stays a handle.
+    x_snap <- x_data
+    grad_fn <- function(grad_out) {
+      xm <- .ag_as_matrix(x_snap)
+      s  <- 1.0 / (1.0 + exp(-xm))
+      list(x = grad_out * s * (1.0 + xm * (1.0 - s)))
+    }
+    out$grad_fn <- grad_fn
+    ag_record(out, grad_fn, list(x = x), op = "silu", x_snap = x_snap)
+  }
+  out
+}
+
+#' @rdname ag_exp
+#' @details \code{ag_tanh()}: 
+#' Returns: ag_tensor
 #' @export
 ag_tanh <- function(x) {
   device <- if (is_ag_tensor(x)) x$device else "cpu"
@@ -1354,33 +1421,10 @@ AG_OPT_STATE_VERSION <- 1L
   params
 }
 
-#' Create an SGD optimizer
-#'
-#' @param params List of ag_param tensors, named or not (names are used only
-#'   for display). The same tensor listed twice is kept once, with a warning.
-#' @param lr Learning rate (default 0.01)
+#' @rdname optimizer_adam
+#' @details \code{optimizer_sgd()}: 
+#' Returns: An optimizer environment with \code{step(grads)}, \code{zero_grad()}, \code{state()} and \code{load_state(state)}. \code{state()} returns a versioned list (moments as host double matrices, \code{t}, \code{accum_count}); \code{load_state()} checks the type, parameter count, names (when both sides have them) and shapes before writing anything, restores \code{t} and \code{accum_count}, and does NOT restore hyperparameters (it warns when they differ). Exact continuation holds on the same device and dtype; CPU <-> GPU in f32 continues within float tolerance; across f16 and f32 it cannot be exact. Only read saved states you trust (\code{readRDS}).
 #' @param momentum Momentum factor (default 0)
-#' @param accumulate_steps Number of \code{backward()} passes to accumulate
-#'   before a call to \code{$step()} updates the weights (default 1, no
-#'   accumulation).  With \code{k > 1} the first \code{k - 1} calls to
-#'   \code{$step()} only count, and the \code{k}-th applies the update and
-#'   resets the counter, so a micro-batch loop needs no bookkeeping of its own.
-#' @param average When accumulating, divide the accumulated gradient by
-#'   \code{accumulate_steps} (default \code{TRUE}).  That is what makes
-#'   \code{k} micro-batches equivalent to one batch of \code{k} times the size
-#'   for an averaging loss such as \code{\link{ag_mse_loss}}; set it to
-#'   \code{FALSE} for a summing loss, where the plain sum is already right.
-#' @return An optimizer environment with \code{step(grads)}, \code{zero_grad()},
-#'   \code{state()} and \code{load_state(state)}. \code{state()} returns a
-#'   versioned list (moments as host double matrices, \code{t},
-#'   \code{accum_count}); \code{load_state()} checks the type, parameter
-#'   count, names (when both sides have them) and shapes before writing
-#'   anything, restores \code{t} and \code{accum_count}, and does NOT restore
-#'   hyperparameters (it warns when they differ). Exact continuation holds on
-#'   the same device and dtype; CPU <-> GPU in f32 continues within float
-#'   tolerance; across f16 and f32 it cannot be exact. Only read saved states
-#'   you trust (\code{readRDS}).
-#' @export
 #' @examples
 #' \donttest{
 #' w <- ag_param(matrix(runif(4), 2, 2))
@@ -1389,6 +1433,7 @@ AG_OPT_STATE_VERSION <- 1L
 #' # accumulate 4 micro-batches per update
 #' opt4 <- optimizer_sgd(list(w = w), lr = 0.01, accumulate_steps = 4L)
 #' }
+#' @export
 optimizer_sgd <- function(params, lr = 0.01, momentum = 0.0,
                           accumulate_steps = 1L, average = TRUE) {
   stopifnot(is.list(params))
@@ -1456,7 +1501,7 @@ optimizer_sgd <- function(params, lr = 0.01, momentum = 0.0,
   env
 }
 
-#' Create an Adam optimizer
+#' Autograd Optimizers
 #'
 #' @param params List of ag_param tensors, named or not (names are used only
 #'   for display). The same tensor listed twice is kept once, with a warning.
@@ -1490,6 +1535,8 @@ optimizer_sgd <- function(params, lr = 0.01, momentum = 0.0,
 #'   f16 spacing still accumulate. \code{state()} includes these master
 #'   weights, and \code{load_state()} installs them as the parameter values;
 #'   load the optimizer state after the model's own weights.
+#'
+#'   No weight decay: for decoupled decay use \code{\link{optimizer_adamw}}.
 #' @export
 #' @examples
 #' \donttest{
@@ -1498,6 +1545,50 @@ optimizer_sgd <- function(params, lr = 0.01, momentum = 0.0,
 #' }
 optimizer_adam <- function(params, lr = 1e-3, beta1 = 0.9, beta2 = 0.999,
                            eps = 1e-8, accumulate_steps = 1L, average = TRUE) {
+  .ag_optimizer_adam_impl(params, lr, beta1, beta2, eps, accumulate_steps,
+                          average, weight_decay = 0, type = "adam")
+}
+
+#' @rdname optimizer_adam
+#' @details \code{optimizer_adamw()}: Adam with decoupled weight decay (Loshchilov & Hutter), as
+#' \code{torch.optim.AdamW}: every step first shrinks the weight,
+#' \code{w <- w * (1 - lr * weight_decay)}, then applies the Adam update. The
+#' decay is not added to the gradient, so it does not enter the moments (that
+#' would be L2 regularisation). It scales with the current \code{lr}, so a
+#' learning-rate schedule changes it too.
+#'
+#' Everything else -- device step, F32 master weights, accumulation,
+#' \code{state()} / \code{load_state()}, \code{\link{ag_capture_step}} -- is
+#' as for \code{\link{optimizer_adam}}; the object inherits from
+#' \code{ag_optimizer_adam}.
+#' Returns: An optimizer environment, class \code{c("ag_optimizer_adamw", "ag_optimizer_adam")}.
+#' @param weight_decay Decoupled weight decay factor (default 0.01), \code{>= 0}.
+#' @examples
+#' \donttest{
+#' w <- ag_param(matrix(runif(4), 2, 2))
+#' opt <- optimizer_adamw(list(w = w), lr = 1e-3, weight_decay = 0.01)
+#' }
+#' @export
+optimizer_adamw <- function(params, lr = 1e-3, beta1 = 0.9, beta2 = 0.999,
+                            eps = 1e-8, weight_decay = 0.01,
+                            accumulate_steps = 1L, average = TRUE) {
+  if (!is.numeric(weight_decay) || length(weight_decay) != 1L || !(weight_decay >= 0))
+    stop("optimizer_adamw: weight_decay must be a non-negative number", call. = FALSE)
+  .ag_optimizer_adam_impl(params, lr, beta1, beta2, eps, accumulate_steps,
+                          average, weight_decay = weight_decay, type = "adamw")
+}
+
+# Hyperparameters recorded in state(). weight_decay only when non-zero, so a
+# state saved before AdamW existed loads into optimizer_adam without a warning.
+.ag_adam_hyper <- function(env) {
+  h <- list(lr = env$lr, beta1 = env$beta1, beta2 = env$beta2, eps = env$eps)
+  if (env$weight_decay != 0) h$weight_decay <- env$weight_decay
+  h
+}
+
+.ag_optimizer_adam_impl <- function(params, lr, beta1, beta2, eps,
+                                    accumulate_steps, average,
+                                    weight_decay, type) {
   stopifnot(is.list(params))
   accumulate_steps <- as.integer(accumulate_steps)
   if (is.na(accumulate_steps) || accumulate_steps < 1L) {
@@ -1510,6 +1601,8 @@ optimizer_adam <- function(params, lr = 1e-3, beta1 = 0.9, beta2 = 0.999,
   env$beta1  <- beta1
   env$beta2  <- beta2
   env$eps    <- eps
+  env$weight_decay <- weight_decay   # decoupled (AdamW); 0 for optimizer_adam
+  env$type   <- type
   env$t      <- 0L
   env$accumulate_steps <- accumulate_steps
   env$average          <- isTRUE(average)
@@ -1590,7 +1683,9 @@ optimizer_adam <- function(params, lr = 1e-3, beta1 = 0.9, beta2 = 0.999,
       # Read-modify-write on the parameter: see the SGD step above and
       # inst/docs/ag_data_contract.md.
       w <- .ag_data_mut(p)
-      .ag_opt_store_weight(p, w - env$lr * m_hat / (sqrt(v_hat) + env$eps))
+      # Decoupled decay first (AdamW), as the native kernel: w*(1 - lr*wd) - ...
+      .ag_opt_store_weight(p, w * (1 - env$lr * env$weight_decay) -
+                              env$lr * m_hat / (sqrt(v_hat) + env$eps))
     }
 
     # Fused when enabled and every item is eligible (F32, live handles); the
@@ -1615,14 +1710,24 @@ optimizer_adam <- function(params, lr = 1e-3, beta1 = 0.9, beta2 = 0.999,
   }
 
   # Checkpoint support (see .ag_opt_state): m, v, t and accum_count.
-  env$state <- function() .ag_opt_state(env, "adam", c("m", "v"),
-    list(lr = env$lr, beta1 = env$beta1, beta2 = env$beta2, eps = env$eps),
-    master = TRUE)
-  env$load_state <- function(state) .ag_opt_load_state(env, state, "adam", c("m", "v"),
-    list(lr = env$lr, beta1 = env$beta1, beta2 = env$beta2, eps = env$eps))
+  env$state <- function() .ag_opt_state(env, env$type, c("m", "v"),
+    .ag_adam_hyper(env), master = TRUE)
+  env$load_state <- function(state) .ag_opt_load_state(env, state, env$type, c("m", "v"),
+    .ag_adam_hyper(env))
 
-  class(env) <- "ag_optimizer_adam"
+  class(env) <- if (identical(type, "adamw")) c("ag_optimizer_adamw", "ag_optimizer_adam")
+                else "ag_optimizer_adam"
   env
+}
+
+#' @export
+print.ag_optimizer_adamw <- function(x, ...) {
+  cat("AdamW optimizer | lr =", x$lr,
+      "| beta1 =", x$beta1, "| beta2 =", x$beta2,
+      "| weight_decay =", x$weight_decay,
+      "| step =", x$t,
+      "| params:", length(x$params), "\n")
+  invisible(x)
 }
 
 #' @export
@@ -1671,7 +1776,8 @@ print.ag_optimizer_adam <- function(x, ...) {
 #' @param gain Multiplier for the string initialisations (e.g. \code{sqrt(2)}
 #'   for tanh/ReLU layers, \code{0.01} for a policy head). A function or matrix
 #'   \code{init} carries its own scale, so \code{gain} must stay 1 with them.
-#' @return List with \code{W}, \code{b}, \code{forward(x)}, \code{params()}
+#' @return List with \code{W}, \code{b}, \code{forward(x)}, \code{parameters()}
+#'   (and \code{params()}, the same function, kept for compatibility)
 #' @export
 #' @examples
 #' \donttest{
@@ -1697,8 +1803,12 @@ ag_linear <- function(in_features, out_features, activation = NULL,
     )
   }
 
-  list(W = W, b = b, forward = forward,
-       params = function() list(W = W, b = b))
+  # $parameters() is the method (as every other layer and torch); $params() is
+  # an alias kept for existing code -- the same function, so the same list in
+  # the same order (save / load and the optimizers depend on it).
+  parameters <- function() list(W = W, b = b)
+  list(W = W, b = b, forward = forward, parameters = parameters,
+       params = parameters)
 }
 
 # Initial weight matrix [out, in] for ag_linear(). Validation first, so a bad
@@ -1870,10 +1980,9 @@ ag_mean <- function(x, dim = NULL, keepdim = FALSE) {
   out
 }
 
-#' Element-wise natural logarithm
-#'
-#' @param x ag_tensor
-#' @return ag_tensor
+#' @rdname ag_exp
+#' @details \code{ag_log()}: 
+#' Returns: ag_tensor
 #' @export
 ag_log <- function(x) {
   device <- if (is_ag_tensor(x)) x$device else "cpu"
@@ -1894,7 +2003,7 @@ ag_log <- function(x) {
   out
 }
 
-#' Element-wise exponential
+#' Element-wise Unary Operations (autograd)
 #'
 #' @param x ag_tensor
 #' @return ag_tensor
@@ -1919,6 +2028,41 @@ ag_exp <- function(x) {
   out
 }
 
+# sin / cos share one body: `f` the R function, `gpu` the device op, `df` the
+# derivative as a function of x (on the same device as the forward).
+.ag_trig <- function(x, f, gpu, df) {
+  device <- if (is_ag_tensor(x)) x$device else "cpu"
+  out <- if (device == "gpu") .ag_wrap_result(gpu(.ag_operand(x)), device) else
+    ag_tensor(f(.ag_data(x)), device = device, dtype = .ag_device_state$dtype)
+  out$requires_grad <- is_ag_tensor(x) && x$requires_grad
+  if (out$requires_grad) {
+    d_snap <- df(x)
+    grad_fn <- function(grad_out) list(x = grad_out * .ag_as_matrix(d_snap))
+    out$grad_fn <- grad_fn
+    ag_record(out, grad_fn, list(x = x), op = "elemwise_mul", mult = d_snap)
+  }
+  out
+}
+
+#' @rdname ag_exp
+#' @details \code{ag_sin()}: 
+#' Returns: ag_tensor
+#' @export
+ag_sin <- function(x) {
+  .ag_trig(x, sin, .ag_gpu_sin, function(x) {
+    if (is_ag_tensor(x) && x$device == "gpu") .ag_gpu_cos(.ag_operand(x)) else cos(.ag_data(x))
+  })
+}
+
+#' @rdname ag_exp
+#' @export
+ag_cos <- function(x) {
+  .ag_trig(x, cos, .ag_gpu_cos, function(x) {
+    if (is_ag_tensor(x) && x$device == "gpu") .ag_gpu_scale(.ag_gpu_sin(.ag_operand(x)), -1) else
+      -sin(.ag_data(x))
+  })
+}
+
 #' Reshape tensor
 #'
 #' @param x ag_tensor
@@ -1927,14 +2071,19 @@ ag_exp <- function(x) {
 #' @return ag_tensor with new shape, same data
 #' @export
 ag_reshape <- function(x, nrow, ncol) {
-  x_data     <- .ag_data(x)
   device     <- if (is_ag_tensor(x)) x$device else "cpu"
-  orig_shape <- dim(x_data)
-  n          <- length(x_data)
+  # On the GPU the operand stays on the device (a handle inside a recording or
+  # in graph mode): its shape from the accessor, no download.
+  x_data     <- if (device == "gpu") .ag_operand(x) else .ag_data(x)
+  orig_shape <- if (device == "gpu") as.integer(.ag_dim(x_data)) else dim(x_data)
+  n          <- if (device == "gpu") prod(orig_shape) else length(x_data)
   nrow       <- if (nrow == -1L) n %/% ncol else as.integer(nrow)
   ncol       <- if (ncol == -1L) n %/% nrow else as.integer(ncol)
   if (device == "gpu") {
-    out <- ag_tensor(.ag_gpu_reshape(x_data, nrow, ncol), device = "gpu", dtype = .ag_device_state$dtype)
+    if (nrow * ncol != n)
+      stop(sprintf("ag_reshape: %d x %d does not hold the %d elements of x",
+                   nrow, ncol, n), call. = FALSE)
+    out <- .ag_wrap_result(.ag_gpu_reshape(x_data, nrow, ncol), device)
   } else {
     out <- ag_tensor(matrix(x_data, nrow, ncol), device = device)
   }
@@ -1944,7 +2093,10 @@ ag_reshape <- function(x, nrow, ncol) {
       list(x = matrix(grad_out, orig_shape[1L], orig_shape[2L]))
     }
     out$grad_fn <- grad_fn
-    ag_record(out, grad_fn, list(x = x))
+    # op record: the graph backward (ag_capture_step) reshapes g back to
+    # [nrow_x, ncol_x] in one node instead of falling back to the closures.
+    ag_record(out, grad_fn, list(x = x), op = "reshape",
+              nrow_x = as.integer(orig_shape[1L]), ncol_x = as.integer(orig_shape[2L]))
   }
   out
 }

@@ -3,6 +3,7 @@
 
 #include <R.h>
 #include <Rinternals.h>
+#include <string.h>
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
@@ -593,11 +594,16 @@ SEXP R_ggml_backend_tensor_get_async(SEXP backend_ptr, SEXP tensor_ptr, SEXP off
     size_t off = (size_t)asReal(offset);
     size_t sz = (size_t)asReal(size);
 
-    // Allocate R vector to receive data
-    size_t n_floats = sz / sizeof(float);
-    SEXP result = PROTECT(allocVector(REALSXP, n_floats));
-
-    ggml_backend_tensor_get_async(backend, tensor, REAL(result), off, sz);
+    // Raw bytes land in a double vector: ceil(sz/8) elements hold all sz bytes.
+    // (Was sz/sizeof(float) doubles: twice the length, the second half never
+    // written, and for sz < 4 a zero-length vector that the copy overran.)
+    // The tail past sz is zeroed so no uninitialised bytes reach R.
+    size_t n_doubles = (sz + sizeof(double) - 1) / sizeof(double);
+    SEXP result = PROTECT(allocVector(REALSXP, (R_xlen_t)n_doubles));
+    if (n_doubles > 0) {
+        memset(REAL(result), 0, n_doubles * sizeof(double));
+        ggml_backend_tensor_get_async(backend, tensor, REAL(result), off, sz);
+    }
 
     UNPROTECT(1);
     return result;
@@ -617,6 +623,107 @@ SEXP R_ggml_backend_tensor_copy_async(SEXP backend_src_ptr, SEXP backend_dst_ptr
     }
 
     ggml_backend_tensor_copy_async(backend_src, backend_dst, src, dst);
+    return R_NilValue;
+}
+
+// ag_buffer_copy_from(): copy a device tensor of k columns (2-d [rows, k], or
+// N-d with the leading axes making up a column) into columns
+// col_offset..col_offset+k-1 of a buffer tensor [rows, capacity], device to
+// device. Every precondition is an R error here: ggml_backend_tensor_copy*()
+// GGML_ASSERTs on a layout mismatch, which would take the R session down.
+// A tensor in host memory or on another device is not copied: the call returns
+// the reason as a string (NULL after a copy), and the R side decides -- an
+// error, or the host path when via_host = "allow".
+//
+// Two backends on one Vulkan device: cpy_tensor_async declines (see the
+// DIVERGENCE note there), so ggml synchronizes both and does a blocking
+// buffer-to-buffer copy. One backend: the copy is queued, hence the final
+// synchronize -- the write is synchronous either way, like ag_buffer_write().
+SEXP R_ag_buffer_copy_cols(SEXP backend_src_ptr, SEXP backend_dst_ptr,
+                           SEXP src_ptr, SEXP dst_ptr, SEXP col_offset_sexp) {
+    ggml_backend_t backend_src = (ggml_backend_t) r_ptr_required(backend_src_ptr, "source backend");
+    ggml_backend_t backend_dst = (ggml_backend_t) r_ptr_required(backend_dst_ptr, "buffer backend");
+    struct ggml_tensor * src = (struct ggml_tensor *) r_ptr_required(src_ptr, "source tensor");
+    struct ggml_tensor * dst = (struct ggml_tensor *) r_ptr_required(dst_ptr, "buffer tensor");
+    const double off_d = asReal(col_offset_sexp);
+
+    if (src->type != GGML_TYPE_F32) {
+        error("ag_buffer_copy_from: tensor must be f32, got %s", ggml_type_name(src->type));
+    }
+    if (!ggml_is_contiguous(src)) {
+        error("ag_buffer_copy_from: tensor must be contiguous");
+    }
+    // N-d: the leading axes of the tensor make up one column of the buffer and
+    // the rest count the columns, so the buffer's row count must be the
+    // product of the first d axes for some d (ne0, ne0*ne1, ...).
+    int64_t lead = 1, k = 0;
+    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+        lead *= src->ne[d];
+        if (lead == dst->ne[0]) {
+            k = 1;
+            for (int j = d + 1; j < GGML_MAX_DIMS; j++) k *= src->ne[j];
+            break;
+        }
+        if (lead > dst->ne[0]) break;
+    }
+    if (lead != dst->ne[0]) {
+        error("ag_buffer_copy_from: tensor [%lld, %lld, %lld, %lld] does not split into "
+              "columns of the buffer's %lld rows (the rows must be the product of its "
+              "leading axes)",
+              (long long) src->ne[0], (long long) src->ne[1], (long long) src->ne[2],
+              (long long) src->ne[3], (long long) dst->ne[0]);
+    }
+    if (ISNAN(off_d) || off_d < 0 || off_d != (double)(int64_t) off_d ||
+        off_d + (double) k > (double) dst->ne[1]) {
+        error("ag_buffer_copy_from: columns %.0f..%.0f are outside the buffer (capacity %lld)",
+              off_d, off_d + (double) k - 1, (long long) dst->ne[1]);
+    }
+    if (src->buffer == NULL || src->data == NULL) {
+        error("ag_buffer_copy_from: tensor has no backend memory");
+    }
+    if (dst->buffer == NULL || dst->data == NULL) {
+        error("ag_buffer_copy_from: buffer has no device memory");
+    }
+    // A copy that would have to go through the host is not made here: the
+    // reason is returned and the R side errors or falls back (via_host).
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        return mkString("the tensor is in host memory");
+    }
+    ggml_backend_dev_t dev_src = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer));
+    ggml_backend_dev_t dev_dst = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer));
+    if (dev_src == NULL || dev_src != dev_dst) {
+        char msg[512];
+        snprintf(msg, sizeof msg, "the tensor is on device '%s', the buffer on '%s'",
+                 dev_src ? ggml_backend_dev_name(dev_src) : "?",
+                 dev_dst ? ggml_backend_dev_name(dev_dst) : "?");
+        return mkString(msg);
+    }
+    if (ggml_backend_get_device(backend_src) != dev_src) {
+        error("ag_buffer_copy_from: backend is not the one the tensor's memory belongs to");
+    }
+    if (k == 0) {
+        return R_NilValue;
+    }
+
+    // A view of the target columns, bound to the buffer's memory, in src's
+    // own shape (the copy wants equal layouts). Columns are contiguous in
+    // ne1 and src is contiguous, so the bytes line up.
+    struct ggml_init_params ip = { ggml_tensor_overhead() + 256, NULL, true };
+    struct ggml_context * ctx = ggml_init(ip);
+    if (ctx == NULL) {
+        error("ag_buffer_copy_from: could not create a context for the view");
+    }
+    const size_t offset = (size_t) off_d * dst->nb[1];
+    struct ggml_tensor * view = ggml_view_4d(ctx, dst, src->ne[0], src->ne[1], src->ne[2],
+                                             src->ne[3], src->nb[1], src->nb[2], src->nb[3],
+                                             offset);
+    if (ggml_backend_view_init(view) != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx);
+        error("ag_buffer_copy_from: failed to bind the view to the buffer");
+    }
+    ggml_backend_tensor_copy_async(backend_src, backend_dst, src, view);
+    ggml_backend_synchronize(backend_dst);
+    ggml_free(ctx);
     return R_NilValue;
 }
 
@@ -925,7 +1032,17 @@ static SEXP r_meta_make_tensor_info(const struct ggml_tensor * t) {
 // something unparseable: MIRRORED, n_segments = 1, ne is the original shape
 // repeated for every device.
 static struct ggml_backend_meta_split_state r_meta_default_split_state(const struct ggml_tensor * t, size_t n_devs) {
-    struct ggml_backend_meta_split_state ret = { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1 };
+    // Fields are set by name, not positionally: ggml 0.27 inserted nr[16]
+    // (per-segment repeat count) between ne[] and n_segments, which shifted a
+    // positional initializer's n_segments into nr[0]. ggml multiplies every
+    // ne by nr[s], so each segment must repeat at least once.
+    struct ggml_backend_meta_split_state ret;
+    memset(&ret, 0, sizeof(ret));
+    ret.axis       = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    ret.n_segments = 1;
+    for (size_t s = 0; s < sizeof(ret.nr) / sizeof(ret.nr[0]); s++) {
+        ret.nr[s] = 1;
+    }
     for (size_t d = 0; d < n_devs && d < (size_t) GGML_BACKEND_META_MAX_DEVICES; d++) {
         // For MIRRORED the per-device ne is just the tensor's own ne[axis],
         // but axis is meaningless for mirrored; ggml only inspects axis here.
@@ -994,7 +1111,10 @@ static struct ggml_backend_meta_split_state r_meta_split_state_trampoline(const 
         }
         if (n_segments_sxp != R_NilValue && (Rf_isInteger(n_segments_sxp) || Rf_isReal(n_segments_sxp))) {
             int ns = Rf_asInteger(n_segments_sxp);
-            if (ns >= 1) {
+            // nr[] has one slot per segment, so more segments than that would
+            // be read past its end.
+            const int ns_max = (int) (sizeof(ret.nr) / sizeof(ret.nr[0]));
+            if (ns >= 1 && ns <= ns_max) {
                 ret.n_segments = (uint32_t) ns;
             }
         }

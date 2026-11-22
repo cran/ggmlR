@@ -79,6 +79,7 @@ heavy <- c(
   "sc-umap",
   "diagnostics",
   "sc-seurat",
+  "sc-seurat-compat",
   "quantize-fns",
   "sc-sce",
   "loss-mask",
@@ -95,7 +96,24 @@ heavy <- c(
   "uncovered-exports",
   "ag-capture-step",
   "ag-clip-sched",
-  "trainer"
+  "trainer",
+  "vk-rel-pos",
+  "vk-pool2d-back",
+  "vk-gla-back",
+  "vk-wkv6-back",
+  "vk-wkv7-back",
+  "ops-027-vulkan",
+  "sched-graph-reuse",
+  "ag-flash-attn",
+  "callbacks-train-begin",
+  "nn-multi-output",
+  "backend-ops-diff",
+  "ag-flash-batch",
+  "ag-rnn",
+  "ag-adam-f16-master",
+  "adamw-momenta-backend",
+  "ag-graph-size",
+  "vk-027-grids"
 )
 
 # Under the valgrind memtest, running the full light suite (~67 files) blows

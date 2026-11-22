@@ -1035,7 +1035,7 @@ nn_topo_sort <- function(outputs) {
 #' the cost of undershooting is a crash with no R-level error to catch.
 #'
 #' @return A double, the graph size to allocate.
-#' @keywords internal
+#' @noRd
 nn_functional_graph_size <- function(model) {
   nodes <- nn_topo_sort(model$outputs)
 
@@ -1105,7 +1105,7 @@ nn_dense_fan_in <- function(node, psh) {
 #' Returns a double: a wide dense layer can exceed integer range on its own.
 #'
 #' @return A double, the number of float elements the node's weights occupy.
-#' @keywords internal
+#' @noRd
 nn_functional_weight_elements <- function(node, parent_shapes) {
   psh    <- if (length(parent_shapes) > 0) parent_shapes[[1]] else NULL
   fan_in <- if (is.null(psh)) 0 else prod(as.numeric(psh))
@@ -1155,7 +1155,7 @@ nn_functional_weight_elements <- function(node, parent_shapes) {
 
 #' Infer output shape of a functional node given its parent shapes
 #' @return An integer vector with the inferred output shape (excluding the batch dimension).
-#' @keywords internal
+#' @noRd
 nn_functional_output_shape <- function(node, parent_shapes) {
   switch(node$node_type,
     "input" = node$config$shape,
@@ -1338,7 +1338,7 @@ nn_functional_output_shape <- function(node, parent_shapes) {
 #'   (for shared layers -- second+ application of a named layer).  When not
 #'   NULL the function uses these tensors instead of allocating new ones.
 #' @return A \code{ggml_tensor} produced by building the given functional graph node.
-#' @keywords internal
+#' @noRd
 nn_build_functional_node <- function(node, built_tensors, built_shapes,
                                       ctx_weights, ctx_compute, batch_size,
                                       training = FALSE,
@@ -2057,7 +2057,7 @@ nn_build_functional_node <- function(node, built_tensors, built_shapes,
 #' @param training Logical; TRUE during fit (activates dropout scaling), FALSE
 #'   during evaluate/predict (dropout becomes identity).
 #' @return Named list with inputs, outputs, ctx_weights, ctx_compute, buffer, node_weights
-#' @keywords internal
+#' @noRd
 # logits_output: see the note on nn_build_graph() in nn_model.R.
 # ggml_cross_entropy_loss() applies log_softmax internally, so a model ending in
 # a softmax activation would have it applied twice during cross-entropy
@@ -2065,7 +2065,7 @@ nn_build_functional_node <- function(node, built_tensors, built_shapes,
 nn_build_functional_graph <- function(model, batch_size, training = FALSE,
                                       logits_output = FALSE) {
   backend      <- model$compilation$backend
-  saved_weights <- model$node_weights  # NULL before first fit, list after
+  saved_weights <- model[["node_weights"]]  # [[ ]]: $ would partially match node_weights_data; NULL before first fit, list after
   # R-vector weights from ggml_load_model (node_id -> named list of numeric)
   saved_weights_data <- model$node_weights_data
 
@@ -2712,7 +2712,8 @@ nn_fill_labels_idx <- function(y_ggml, ne_label, labels_tensors, offs, widths, s
 #'   \code{FALSE} for time series or exactly reproducible runs.
 #' @param callbacks List of callback objects, e.g.
 #'   \code{\link{ggml_callback_early_stopping}} or an LR scheduler.  Each is a
-#'   list with \code{on_epoch_begin(epoch, logs, state)} and/or
+#'   list with any of \code{on_train_begin(logs, state)} (once per fit, before
+#'   the first epoch), \code{on_epoch_begin(epoch, logs, state)} and/or
 #'   \code{on_epoch_end(epoch, logs, state)}; setting \code{state$stop <- TRUE}
 #'   stops training.  \code{logs} holds \code{train_loss},
 #'   \code{train_accuracy}, \code{val_loss} and \code{val_accuracy}, and for a
@@ -3076,6 +3077,7 @@ ggml_fit.ggml_functional_model <- function(model, x, y,
       cb_state$nepoch <- as.integer(epochs)
 
       epochs_run <- 0L
+      .ggml_cb_train_begin(callbacks, cb_state)
       for (ep in seq_len(epochs)) {
         logs <- list()
         for (cb in callbacks) {
@@ -3244,6 +3246,7 @@ ggml_fit.ggml_functional_model <- function(model, x, y,
     if (shuffle_all) perm <- sample(perm)
 
     epochs_run <- 0L
+    .ggml_cb_train_begin(callbacks, cb_state)
     for (ep in seq_len(epochs)) {
       logs <- list()
       for (cb in callbacks) {

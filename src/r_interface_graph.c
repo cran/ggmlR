@@ -2,6 +2,7 @@
 #include <Rinternals.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -221,6 +222,117 @@ SEXP R_ggml_build_forward_expand_grads(SEXP ctx_ptr, SEXP tensor_ptr, SEXP graph
     return R_MakeExternalPtr(graph, R_NilValue, R_NilValue);
 }
 
+// ---- graphs sized for their work ------------------------------------------
+//
+// ggml_new_graph() holds GGML_DEFAULT_GRAPH_SIZE = 8192 nodes, and an unrolled
+// loop (an LSTM over 128 steps with its backward) needs more; the overflow is
+// a GGML_ASSERT in ggml_visit_parents_graph. The ag_* graphs are therefore
+// built at the size of the work: the number of distinct tensors reachable from
+// the roots through src[] -- what ggml_build_forward_expand visits -- bounds
+// both the node and the leaf count, and the hash set (2x that) holds them.
+// Counted iteratively: ggml's own visit is recursive, and the count must not
+// be what overflows the stack first.
+
+typedef struct { const void ** keys; size_t cap; size_t n; } rg_pset;
+
+static size_t rg_hash(const void * p, size_t cap) {
+    uintptr_t x = (uintptr_t) p;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+    return (size_t) x & (cap - 1);
+}
+
+// 1 if p was new, 0 if seen, -1 when out of memory
+static int rg_pset_add(rg_pset * s, const void * p) {
+    if (2 * (s->n + 1) > s->cap) {
+        size_t nc = s->cap ? 2 * s->cap : 1024;
+        const void ** nk = (const void **) calloc(nc, sizeof(void *));
+        if (nk == NULL) return -1;
+        for (size_t i = 0; i < s->cap; i++) {
+            if (s->keys[i] == NULL) continue;
+            size_t h = rg_hash(s->keys[i], nc);
+            while (nk[h] != NULL) h = (h + 1) & (nc - 1);
+            nk[h] = s->keys[i];
+        }
+        free(s->keys);
+        s->keys = nk;
+        s->cap = nc;
+    }
+    size_t h = rg_hash(p, s->cap);
+    while (s->keys[h] != NULL) {
+        if (s->keys[h] == p) return 0;
+        h = (h + 1) & (s->cap - 1);
+    }
+    s->keys[h] = p;
+    s->n++;
+    return 1;
+}
+
+// Number of distinct tensors reachable from a list of tensor pointers.
+SEXP R_ggml_graph_count_reachable(SEXP roots) {
+    if (!isNewList(roots)) error("roots must be a list of tensor pointers");
+    R_xlen_t nr = XLENGTH(roots);
+    for (R_xlen_t i = 0; i < nr; i++) {
+        if (R_ExternalPtrAddr(VECTOR_ELT(roots, i)) == NULL)
+            error("root %d is a NULL tensor pointer", (int) i + 1);
+    }
+    rg_pset seen = { NULL, 0, 0 };
+    size_t st_cap = 1024, st_n = 0;
+    struct ggml_tensor ** st = (struct ggml_tensor **) malloc(st_cap * sizeof(*st));
+    if (st == NULL) error("out of memory counting graph nodes");
+    int oom = 0;
+    for (R_xlen_t i = 0; i < nr && !oom; i++) {
+        st_n = 0;
+        st[st_n++] = (struct ggml_tensor *) R_ExternalPtrAddr(VECTOR_ELT(roots, i));
+        while (st_n > 0 && !oom) {
+            struct ggml_tensor * t = st[--st_n];
+            int added = rg_pset_add(&seen, t);
+            if (added < 0) { oom = 1; break; }
+            if (added == 0) continue;
+            for (int k = 0; k < GGML_MAX_SRC; k++) {
+                if (t->src[k] == NULL) continue;
+                if (st_n == st_cap) {
+                    struct ggml_tensor ** ns =
+                        (struct ggml_tensor **) realloc(st, 2 * st_cap * sizeof(*st));
+                    if (ns == NULL) { oom = 1; break; }
+                    st = ns;
+                    st_cap *= 2;
+                }
+                st[st_n++] = t->src[k];
+            }
+        }
+    }
+    size_t n = seen.n;
+    free(st);
+    free(seen.keys);
+    if (oom) error("out of memory counting graph nodes");
+    return ScalarReal((double) n);
+}
+
+// Bytes a graph of `size` nodes takes in its context (no gradients).
+SEXP R_ggml_graph_overhead_custom(SEXP size_sexp, SEXP grads_sexp) {
+    double size = asReal(size_sexp);
+    if (!(size >= 1)) error("graph size must be >= 1");
+    return ScalarReal((double) ggml_graph_overhead_custom((size_t) size, asLogical(grads_sexp)));
+}
+
+// ggml_build_forward_expand into a graph of `size` nodes (no gradients); the
+// context must hold ggml_graph_overhead_custom(size, FALSE).
+SEXP R_ggml_build_forward_expand_sized(SEXP ctx_ptr, SEXP tensor_ptr, SEXP size_sexp) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * tensor = (struct ggml_tensor *) R_ExternalPtrAddr(tensor_ptr);
+    if (ctx == NULL || tensor == NULL) {
+        error("Invalid pointer (context or tensor is NULL)");
+    }
+    double size = asReal(size_sexp);
+    if (!(size >= 1)) error("graph size must be >= 1");
+    struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, (size_t) size, false);
+    if (graph == NULL) {
+        error("Failed to create computation graph");
+    }
+    ggml_build_forward_expand(graph, tensor);
+    return R_MakeExternalPtr(graph, R_NilValue, R_NilValue);
+}
+
 SEXP R_ggml_build_forward_expand(SEXP ctx_ptr, SEXP tensor_ptr) {
     struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
     struct ggml_tensor * tensor = (struct ggml_tensor *) R_ExternalPtrAddr(tensor_ptr);
@@ -259,6 +371,16 @@ SEXP R_ggml_graph_expand(SEXP graph_ptr, SEXP tensor_ptr) {
     struct ggml_tensor * tensor = (struct ggml_tensor *) r_ptr_required(tensor_ptr, "tensor");
 
     ggml_build_forward_expand(graph, tensor);
+    return R_NilValue;
+}
+
+// ggml 0.27: add the tensor and its parents in order, without marking them for
+// compute (the flag is set once a computing node reaches them).
+SEXP R_ggml_graph_order(SEXP graph_ptr, SEXP tensor_ptr) {
+    struct ggml_cgraph * graph = (struct ggml_cgraph *) r_ptr_required(graph_ptr, "graph");
+    struct ggml_tensor * tensor = (struct ggml_tensor *) r_ptr_required(tensor_ptr, "tensor");
+
+    ggml_build_forward_order(graph, tensor);
     return R_NilValue;
 }
 
@@ -1433,6 +1555,21 @@ SEXP R_ggml_scale_bias(SEXP ctx_ptr, SEXP a_ptr, SEXP s, SEXP b) {
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
 }
 
+// ggml_fill: a tensor of a's shape with every element c (a is only read for
+// its shape and type).
+SEXP R_ggml_fill(SEXP ctx_ptr, SEXP a_ptr, SEXP c) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+    if (ctx == NULL || a == NULL) {
+        error("Invalid pointer");
+    }
+    struct ggml_tensor * result = ggml_fill(ctx, a, (float) asReal(c));
+    if (result == NULL) {
+        error("Failed to create fill operation");
+    }
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
 SEXP R_ggml_clamp(SEXP ctx_ptr, SEXP a_ptr, SEXP min_val, SEXP max_val) {
     struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
     struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
@@ -1449,6 +1586,18 @@ SEXP R_ggml_clamp(SEXP ctx_ptr, SEXP a_ptr, SEXP min_val, SEXP max_val) {
         error("Failed to create clamp operation");
     }
 
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+SEXP R_ggml_clamp_inplace(SEXP ctx_ptr, SEXP a_ptr, SEXP min_val, SEXP max_val) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+
+    if (ctx == NULL || a == NULL) {
+        error("Invalid pointer");
+    }
+
+    struct ggml_tensor * result = ggml_clamp_inplace(ctx, a, (float) asReal(min_val), (float) asReal(max_val));
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
 }
 
@@ -1498,6 +1647,75 @@ SEXP R_ggml_round(SEXP ctx_ptr, SEXP a_ptr) {
 
     if (result == NULL) {
         error("Failed to create round operation");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+SEXP R_ggml_expm1(SEXP ctx_ptr, SEXP a_ptr) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+
+    if (ctx == NULL || a == NULL) {
+        error("Invalid pointer");
+    }
+
+    struct ggml_tensor * result = ggml_expm1(ctx, a);
+
+    if (result == NULL) {
+        error("Failed to create expm1 operation");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+SEXP R_ggml_round_even(SEXP ctx_ptr, SEXP a_ptr) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+
+    if (ctx == NULL || a == NULL) {
+        error("Invalid pointer");
+    }
+
+    struct ggml_tensor * result = ggml_round_even(ctx, a);
+
+    if (result == NULL) {
+        error("Failed to create round_even operation");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+SEXP R_ggml_trunc(SEXP ctx_ptr, SEXP a_ptr) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+
+    if (ctx == NULL || a == NULL) {
+        error("Invalid pointer");
+    }
+
+    struct ggml_tensor * result = ggml_trunc(ctx, a);
+
+    if (result == NULL) {
+        error("Failed to create trunc operation");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+SEXP R_ggml_xielu(SEXP ctx_ptr, SEXP a_ptr, SEXP alpha_n, SEXP alpha_p, SEXP beta, SEXP eps) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+
+    if (ctx == NULL || a == NULL) {
+        error("Invalid pointer");
+    }
+
+    struct ggml_tensor * result = ggml_xielu(ctx, a, (float) asReal(alpha_n), (float) asReal(alpha_p),
+                                             (float) asReal(beta), (float) asReal(eps));
+
+    if (result == NULL) {
+        error("Failed to create xielu operation");
     }
 
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
@@ -2174,6 +2392,33 @@ SEXP R_ggml_backend_tensor_set(SEXP tensor_ptr, SEXP data_sexp, SEXP offset_sexp
 
         ggml_backend_tensor_set(tensor, buffer, offset, size);
         free(buffer);
+    } else if (tensor->type == GGML_TYPE_F64 && TYPEOF(data_sexp) == REALSXP) {
+        int n = length(data_sexp);
+        ggml_backend_tensor_set(tensor, REAL(data_sexp), offset, n * sizeof(double));
+    } else if (tensor->type == GGML_TYPE_F64 || tensor->type == GGML_TYPE_I64) {
+        // F64 from integer/logical, and I64 from any numeric. Range and
+        // whole-number checks for I64 are done in R (nn_tensor_values);
+        // values here are exact integers within +-2^53.
+        int n = length(data_sexp);
+        const double * dx; const int * ix;
+        r_numeric_ptrs(data_sexp, &dx, &ix);
+        void * buffer = malloc(n * sizeof(int64_t));   // == sizeof(double)
+        if (buffer == NULL) {
+            error("Failed to allocate buffer");
+        }
+        if (tensor->type == GGML_TYPE_F64) {
+            double * b = (double *) buffer;
+            for (int i = 0; i < n; i++) {
+                b[i] = dx != NULL ? dx[i] : (ix[i] == NA_INTEGER ? R_NaN : (double) ix[i]);
+            }
+        } else {
+            int64_t * b = (int64_t *) buffer;
+            for (int i = 0; i < n; i++) {
+                b[i] = dx != NULL ? (int64_t) dx[i] : (int64_t) ix[i];
+            }
+        }
+        ggml_backend_tensor_set(tensor, buffer, offset, n * sizeof(int64_t));
+        free(buffer);
     } else if (TYPEOF(data_sexp) == RAWSXP) {
         // Raw bytes — pass through directly (for quantized types: Q4_K, Q8_0, etc.)
         size_t size = (size_t) length(data_sexp);
@@ -2269,6 +2514,34 @@ SEXP R_ggml_backend_tensor_get(SEXP tensor_ptr, SEXP offset_sexp, SEXP size_sexp
         }
 
         free(tmp);
+        UNPROTECT(1);
+        return result;
+    } else if (tensor->type == GGML_TYPE_F64) {
+        SEXP result = PROTECT(allocVector(REALSXP, n_elements));
+        ggml_backend_tensor_get(tensor, REAL(result), offset, n_elements * sizeof(double));
+        UNPROTECT(1);
+        return result;
+    } else if (tensor->type == GGML_TYPE_I64) {
+        // R has no int64: returned as double, exact for |v| <= 2^53
+        SEXP result = PROTECT(allocVector(REALSXP, n_elements));
+        double * r_data = REAL(result);
+        int64_t * buffer = (int64_t *) malloc(n_elements * sizeof(int64_t));
+        if (buffer == NULL) {
+            error("Failed to allocate buffer");
+        }
+        ggml_backend_tensor_get(tensor, buffer, offset, n_elements * sizeof(int64_t));
+
+        const int64_t exact = (int64_t) 1 << 53;
+        int64_t n_inexact = 0;
+        for (int64_t i = 0; i < n_elements; i++) {
+            if (buffer[i] > exact || buffer[i] < -exact) n_inexact++;
+            r_data[i] = (double) buffer[i];
+        }
+        free(buffer);
+        if (n_inexact > 0) {
+            warning("%lld I64 value(s) exceed 2^53 in magnitude and lose precision as double",
+                    (long long) n_inexact);
+        }
         UNPROTECT(1);
         return result;
     } else {
@@ -2645,6 +2918,50 @@ SEXP R_ggml_view_4d(SEXP ctx_ptr, SEXP a_ptr, SEXP ne0_sexp, SEXP ne1_sexp,
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
 }
 
+SEXP R_ggml_view_5d(SEXP ctx_ptr, SEXP a_ptr, SEXP ne0_sexp, SEXP ne1_sexp,
+                    SEXP ne2_sexp, SEXP ne3_sexp, SEXP ne4_sexp,
+                    SEXP nb1_sexp, SEXP nb2_sexp, SEXP nb3_sexp, SEXP nb4_sexp,
+                    SEXP offset_sexp) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+
+    if (ctx == NULL || a == NULL) {
+        error("Invalid pointer");
+    }
+
+    int64_t ne0 = (int64_t) asReal(ne0_sexp);
+    int64_t ne1 = (int64_t) asReal(ne1_sexp);
+    int64_t ne2 = (int64_t) asReal(ne2_sexp);
+    int64_t ne3 = (int64_t) asReal(ne3_sexp);
+    int64_t ne4 = (int64_t) asReal(ne4_sexp);
+    size_t nb1 = (size_t) asReal(nb1_sexp);
+    size_t nb2 = (size_t) asReal(nb2_sexp);
+    size_t nb3 = (size_t) asReal(nb3_sexp);
+    size_t nb4 = (size_t) asReal(nb4_sexp);
+    size_t offset = (size_t) asReal(offset_sexp);
+
+    if (ne0 < 1 || ne1 < 1 || ne2 < 1 || ne3 < 1 || ne4 < 1) {
+        error("view_5d: every ne must be >= 1");
+    }
+    // last byte the view touches must lie inside the source tensor
+    // (rows of a quantized type are whole blocks; ggml_row_size covers both)
+    const size_t last = offset + ggml_row_size(a->type, ne0) + (size_t)(ne1 - 1) * nb1 +
+                        (size_t)(ne2 - 1) * nb2 + (size_t)(ne3 - 1) * nb3 +
+                        (size_t)(ne4 - 1) * nb4;
+    if (last > ggml_nbytes(a)) {
+        error("view_5d: view spans %zu bytes, source tensor has %zu", last, ggml_nbytes(a));
+    }
+
+    struct ggml_tensor * result = ggml_view_5d(ctx, a, ne0, ne1, ne2, ne3, ne4,
+                                               nb1, nb2, nb3, nb4, offset);
+
+    if (result == NULL) {
+        error("Failed to create view_5d");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
 // ============================================================================
 // Copy Operation
 // ============================================================================
@@ -2794,6 +3111,38 @@ SEXP R_ggml_out_prod(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr) {
         error("Failed to create out_prod operation");
     }
 
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+// ggmlR extension: out_prod with the row sums of a as one more column.
+// The constructor's asserts are checked here first, so a bad call is an R
+// error rather than an abort.
+SEXP R_ggml_out_prod_rowsum(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+    struct ggml_tensor * b = (struct ggml_tensor *) R_ExternalPtrAddr(b_ptr);
+
+    if (ctx == NULL || a == NULL || b == NULL) {
+        error("Invalid pointer");
+    }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        error("ggml_out_prod_rowsum: a and b must be F32");
+    }
+    if (a->ne[1] != b->ne[1] || b->ne[2] % a->ne[2] != 0 || b->ne[3] % a->ne[3] != 0) {
+        error("ggml_out_prod_rowsum: a and b must share ne[1], and b's ne[2], ne[3] "
+              "must be multiples of a's");
+    }
+    if (a->ne[4] != 1 || b->ne[4] != 1) {
+        error("ggml_out_prod_rowsum: 4D at most (ne[4] must be 1)");
+    }
+    if (ggml_is_transposed(a)) {
+        error("ggml_out_prod_rowsum: a must not be transposed");
+    }
+
+    struct ggml_tensor * result = ggml_out_prod_rowsum(ctx, a, b);
+    if (result == NULL) {
+        error("Failed to create out_prod_rowsum operation");
+    }
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
 }
 
@@ -3421,6 +3770,11 @@ SEXP R_ggml_set_input(SEXP tensor_ptr) {
     if (tensor == NULL) {
         error("Invalid tensor pointer");
     }
+    // ggml_set_input asserts this (0.27); say it as an R error instead of aborting
+    if (tensor->op != GGML_OP_NONE) {
+        error("ggml_set_input: '%s' is the result of %s; only a leaf tensor (op NONE) can be an input",
+              tensor->name, ggml_op_name(tensor->op));
+    }
     ggml_set_input(tensor);
     return tensor_ptr;
 }
@@ -3444,6 +3798,21 @@ SEXP R_ggml_get_name(SEXP tensor_ptr) {
         return R_NilValue;
     }
     return mkString(name);
+}
+
+// Internal (not exported): name of tensor->src[j], 0-based j; NULL when the
+// slot is empty. Used by the scheduler tests to check that the scheduler
+// leaves the caller's graph with its original src pointers.
+SEXP R_ggml_tensor_src_name(SEXP tensor_ptr, SEXP j_sexp) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *) r_ptr_required(tensor_ptr, "tensor");
+    const int j = asInteger(j_sexp);
+    if (j < 0 || j >= GGML_MAX_SRC) {
+        Rf_error("src index %d out of range [0, %d)", j, GGML_MAX_SRC);
+    }
+    if (tensor->src[j] == NULL) {
+        return R_NilValue;
+    }
+    return mkString(tensor->src[j]->name);
 }
 
 // ============================================================================
@@ -3493,6 +3862,52 @@ SEXP R_ggml_backend_cpu_set_n_threads(SEXP backend_ptr, SEXP n_threads_sexp) {
     int n_threads = asInteger(n_threads_sexp);
     ggml_backend_cpu_set_n_threads(backend, n_threads);
 
+    return R_NilValue;
+}
+
+// Internal (not exported): make the CPU backend abort its graph after it has
+// computed `n_nodes` nodes (n_nodes <= 0 removes the hook). The callback only
+// returns a flag -- it never raises an R error across the C boundary. Used by
+// the scheduler tests to drive an error return out of a compute.
+//
+// n_nodes < 0: after |n_nodes| nodes call GGML_ABORT instead, which leaves
+// through Rf_error (a longjmp past every C++ destructor on the way). Only safe
+// with the backend at 1 thread: the callback runs on thread 0, and a longjmp
+// out of an OpenMP region would strand the other threads at the barrier.
+static int  r_cpu_abort_after_limit = 0;
+static int  r_cpu_abort_after_count = 0;
+static bool r_cpu_abort_after_fatal = false;
+
+static bool r_cpu_abort_after_cb(void * data) {
+    (void) data;
+    if (++r_cpu_abort_after_count < r_cpu_abort_after_limit) {
+        return false;
+    }
+    if (r_cpu_abort_after_fatal) {
+        r_cpu_abort_after_fatal = false;   // one-shot: the hook stays set after the longjmp
+        r_cpu_abort_after_limit = INT_MAX;
+        GGML_ABORT("ggmlR test: forced abort after %d nodes", r_cpu_abort_after_count);
+    }
+    return true;
+}
+
+SEXP R_ggml_backend_cpu_abort_after(SEXP backend_ptr, SEXP n_nodes_sexp) {
+    ggml_backend_t backend = (ggml_backend_t) R_ExternalPtrAddr(backend_ptr);
+    if (backend == NULL) {
+        error("Invalid backend pointer");
+    }
+    int n = asInteger(n_nodes_sexp);
+    if (n == NA_INTEGER) {
+        error("n_nodes must not be NA");
+    }
+    r_cpu_abort_after_fatal = n < 0;
+    r_cpu_abort_after_limit = n < 0 ? -n : n;
+    r_cpu_abort_after_count = 0;
+    if (r_cpu_abort_after_limit > 0) {
+        ggml_backend_cpu_set_abort_callback(backend, r_cpu_abort_after_cb, NULL);
+    } else {
+        ggml_backend_cpu_set_abort_callback(backend, NULL, NULL);
+    }
     return R_NilValue;
 }
 
@@ -3879,6 +4294,19 @@ SEXP R_ggml_pool_1d(SEXP ctx_ptr, SEXP a_ptr, SEXP op_sexp,
     int s0 = asInteger(s0_sexp);
     int p0 = asInteger(p0_sexp);
 
+    // The CPU kernel GGML_ASSERTs k0 == s0 and p0 == 0 (abort would take R
+    // down). The graph is built before its backend is known, so the CPU limits
+    // apply to every backend.
+    if (k0 == NA_INTEGER || k0 < 1) {
+        error("ggml_pool_1d: k0 must be a positive integer");
+    }
+    if (s0 != k0) {
+        error("ggml_pool_1d: only s0 == k0 is supported (got k0 = %d, s0 = %d)", k0, s0);
+    }
+    if (p0 != 0) {
+        error("ggml_pool_1d: padding is not supported (got p0 = %d)", p0);
+    }
+
     struct ggml_tensor * result = ggml_pool_1d(ctx, a, op, k0, s0, p0);
 
     if (result == NULL) {
@@ -3919,6 +4347,35 @@ SEXP R_ggml_pool_2d(SEXP ctx_ptr, SEXP a_ptr, SEXP op_sexp,
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
 }
 
+// ggmlR: gradient of ggml_pool_2d w.r.t. its input. a = grad of the pooled
+// output, af = forward input (result has its shape).
+SEXP R_ggml_pool_2d_back(SEXP ctx_ptr, SEXP a_ptr, SEXP af_ptr, SEXP op_sexp,
+                         SEXP k0_sexp, SEXP k1_sexp,
+                         SEXP s0_sexp, SEXP s1_sexp,
+                         SEXP p0_sexp, SEXP p1_sexp) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a  = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+    struct ggml_tensor * af = (struct ggml_tensor *) R_ExternalPtrAddr(af_ptr);
+
+    if (ctx == NULL || a == NULL || af == NULL) {
+        error("Invalid pointer");
+    }
+
+    int op_int = asInteger(op_sexp);
+    enum ggml_op_pool op = (op_int == 0) ? GGML_OP_POOL_MAX : GGML_OP_POOL_AVG;
+
+    struct ggml_tensor * result = ggml_pool_2d_back(ctx, a, af, op,
+        asInteger(k0_sexp), asInteger(k1_sexp),
+        asInteger(s0_sexp), asInteger(s1_sexp),
+        (float) asReal(p0_sexp), (float) asReal(p1_sexp));
+
+    if (result == NULL) {
+        error("Failed to create pool_2d_back operation");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
 // Image to Column (for efficient convolution)
 SEXP R_ggml_im2col(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr,
                    SEXP s0_sexp, SEXP s1_sexp,
@@ -3948,6 +4405,325 @@ SEXP R_ggml_im2col(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr,
         error("Failed to create im2col operation");
     }
 
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+// Backward of im2col: scatter-add the column gradient back onto the image.
+// a = gradient of the im2col output, b = the convolution kernel (only its KW,
+// KH are read), ne = the shape of the im2col input (4 values). This is the
+// order the kernels read (src0 = gradient, src1 = kernel; CPU
+// ggml_compute_forward_im2col_back_f32, Vulkan ggml_vk_im2col_back) and the
+// order ggml-graph.c's IM2COL rule calls it with (upstream's ggml.h comments
+// had them swapped; ours are corrected). F32 only: Vulkan's supports_op
+// requires both sources F32.
+SEXP R_ggml_im2col_back(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP ne_sexp,
+                        SEXP s0_sexp, SEXP s1_sexp,
+                        SEXP p0_sexp, SEXP p1_sexp,
+                        SEXP d0_sexp, SEXP d1_sexp,
+                        SEXP is_2D_sexp) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+    struct ggml_tensor * b = (struct ggml_tensor *) R_ExternalPtrAddr(b_ptr);
+
+    if (ctx == NULL || a == NULL || b == NULL) {
+        error("Invalid pointer");
+    }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+        error("ggml_im2col_back: kernel and gradient must be F32");
+    }
+    if (XLENGTH(ne_sexp) != 4) {
+        error("ggml_im2col_back: ne must have 4 values");
+    }
+
+    int64_t ne[4];
+    SEXP ne_real = PROTECT(coerceVector(ne_sexp, REALSXP));
+    for (int i = 0; i < 4; i++) {
+        double v = REAL(ne_real)[i];
+        if (!(v >= 1)) {
+            UNPROTECT(1);
+            error("ggml_im2col_back: ne values must be >= 1");
+        }
+        ne[i] = (int64_t) v;
+    }
+    UNPROTECT(1);
+
+    struct ggml_tensor * result = ggml_im2col_back(ctx, a, b, ne,
+        asInteger(s0_sexp), asInteger(s1_sexp),
+        asInteger(p0_sexp), asInteger(p1_sexp),
+        asInteger(d0_sexp), asInteger(d1_sexp),
+        asLogical(is_2D_sexp));
+
+    if (result == NULL) {
+        error("Failed to create im2col_back operation");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+// ggml 0.27: SwiGLU with clamped inputs. b = NULL splits a in halves.
+SEXP R_ggml_swiglu_clamp(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP limit_sexp) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+    struct ggml_tensor * b = Rf_isNull(b_ptr) ? NULL : (struct ggml_tensor *) R_ExternalPtrAddr(b_ptr);
+
+    if (ctx == NULL || a == NULL || (!Rf_isNull(b_ptr) && b == NULL)) {
+        error("Invalid pointer");
+    }
+
+    struct ggml_tensor * result = ggml_swiglu_clamp(ctx, a, b, (float) asReal(limit_sexp));
+
+    if (result == NULL) {
+        error("Failed to create SwiGLU clamp operation");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+// ggml 0.27: scatter-add GEMM columns back into a 1D signal.
+SEXP R_ggml_col2im_1d(SEXP ctx_ptr, SEXP a_ptr, SEXP s0_sexp, SEXP oc_sexp, SEXP p0_sexp) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+
+    if (ctx == NULL || a == NULL) {
+        error("Invalid pointer");
+    }
+
+    struct ggml_tensor * result = ggml_col2im_1d(ctx, a, asInteger(s0_sexp), asInteger(oc_sexp), asInteger(p0_sexp));
+
+    if (result == NULL) {
+        error("Failed to create col2im_1d operation");
+    }
+
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+// ggml 0.27: rotate only dims [n_offs, n_offs + n_dims) of an existing RoPE node.
+// Modifies the node in place and returns it.
+SEXP R_ggml_rope_set_offset(SEXP a_ptr, SEXP n_offs_sexp) {
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+
+    if (a == NULL) {
+        error("Invalid pointer");
+    }
+    if (a->op != GGML_OP_ROPE && a->op != GGML_OP_ROPE_BACK) {
+        error("ggml_rope_set_offset: tensor is not a RoPE node");
+    }
+    const int n_offs = asInteger(n_offs_sexp);
+    if (n_offs == NA_INTEGER || n_offs < 0 || n_offs % 2 != 0) {
+        error("ggml_rope_set_offset: n_offs must be a non-negative even integer");
+    }
+    if (ggml_get_op_params_i32(a, 2) == GGML_ROPE_TYPE_VISION) {
+        error("ggml_rope_set_offset: vision RoPE is not supported");
+    }
+    if (n_offs + ggml_get_op_params_i32(a, 1) > a->ne[0]) {
+        error("ggml_rope_set_offset: n_offs + n_dims exceeds ne[0]");
+    }
+
+    ggml_rope_set_offset(a, n_offs);
+    return a_ptr;
+}
+
+// ggml 0.27: tell the backend that src0 of a MUL_MAT node is a Hadamard
+// matrix (Vulkan then runs a fast Walsh-Hadamard transform instead).
+// Modifies the node in place and returns it.
+SEXP R_ggml_mul_mat_set_hint(SEXP a_ptr, SEXP hint_sexp) {
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+
+    if (a == NULL) {
+        error("Invalid pointer");
+    }
+    if (a->op != GGML_OP_MUL_MAT) {
+        error("ggml_mul_mat_set_hint: tensor is not a MUL_MAT node");
+    }
+    const int hint = asInteger(hint_sexp);
+    if (hint != GGML_HINT_NONE && hint != GGML_HINT_SRC0_IS_HADAMARD) {
+        error("ggml_mul_mat_set_hint: unknown hint %d", hint);
+    }
+    // The CPU fwht kernel GGML_ASSERTs these (abort would take R down).
+    if (hint == GGML_HINT_SRC0_IS_HADAMARD) {
+        const int64_t n = a->src[1]->ne[0];
+        if (a->src[1]->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32) {
+            error("ggml_mul_mat_set_hint: Hadamard hint needs F32 b and result");
+        }
+        if (n <= 0 || (n & (n - 1)) != 0) {
+            error("ggml_mul_mat_set_hint: Hadamard hint needs a power-of-two row length, got %lld",
+                  (long long) n);
+        }
+    }
+
+    ggml_mul_mat_set_hint(a, (enum ggml_op_hint) hint);
+    return a_ptr;
+}
+
+// ggml 0.27: treat the finite mask entries of a FLASH_ATTN_EXT node as a
+// sparse K/V set of at most n_kv_max positions per row (0 disables).
+// Modifies the node in place and returns it.
+SEXP R_ggml_flash_attn_ext_set_n_kv_max(SEXP a_ptr, SEXP n_kv_max_sexp) {
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+
+    if (a == NULL) {
+        error("Invalid pointer");
+    }
+    if (a->op != GGML_OP_FLASH_ATTN_EXT) {
+        error("ggml_flash_attn_ext_set_n_kv_max: tensor is not a FLASH_ATTN_EXT node");
+    }
+    const int n_kv_max = asInteger(n_kv_max_sexp);
+    if (n_kv_max == NA_INTEGER || n_kv_max < 0) {
+        error("ggml_flash_attn_ext_set_n_kv_max: n_kv_max must be a non-negative integer");
+    }
+
+    ggml_flash_attn_ext_set_n_kv_max(a, n_kv_max);
+    return a_ptr;
+}
+
+// 3D convolution, set_rows: the builders GGML_ASSERT their shape rules, which
+// would abort the R session -- check them here and raise R errors instead.
+
+static int64_t r_conv_out_size(int64_t ins, int64_t ks, int s, int p, int d) {
+    return (ins + 2 * (int64_t) p - (int64_t) d * (ks - 1) - 1) / s + 1;
+}
+
+static void r_conv3d_check_params(const int * s, const int * p, const int * d) {
+    for (int i = 0; i < 3; i++) {
+        if (s[i] <= 0 || d[i] <= 0 || p[i] < 0) {
+            error("stride and dilation must be positive, padding non-negative");
+        }
+    }
+}
+
+// a: kernel [KW, KH, KD, IC * OC], b: input [IW, IH, ID, IC * N]
+static void r_conv3d_check_shapes(const struct ggml_tensor * a, const struct ggml_tensor * b,
+                                  int64_t ic, int64_t oc, int64_t n,
+                                  const int * s, const int * p, const int * d) {
+    if (a->ne[3] != ic * oc) {
+        error("kernel ne[3] (%lld) must equal IC * OC (%lld)", (long long) a->ne[3], (long long) (ic * oc));
+    }
+    if (b->ne[3] != ic * n) {
+        error("input ne[3] (%lld) must equal IC * N (%lld)", (long long) b->ne[3], (long long) (ic * n));
+    }
+    for (int i = 0; i < 3; i++) {
+        if (r_conv_out_size(b->ne[i], a->ne[i], s[i], p[i], d[i]) <= 0) {
+            error("input is smaller than the dilated kernel along dim %d", i);
+        }
+    }
+}
+
+static int r_int_arg(SEXP x) {
+    const int v = asInteger(x);
+    if (v == NA_INTEGER) {
+        error("integer argument is NA");
+    }
+    return v;
+}
+
+SEXP R_ggml_im2col_3d(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP ic_sexp,
+                      SEXP s_sexp, SEXP p_sexp, SEXP d_sexp, SEXP dst_type_sexp) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+    struct ggml_tensor * b = (struct ggml_tensor *) R_ExternalPtrAddr(b_ptr);
+    if (ctx == NULL || a == NULL || b == NULL) {
+        error("Invalid pointer");
+    }
+    const int ic = r_int_arg(ic_sexp);
+    if (ic <= 0 || a->ne[3] % ic != 0 || b->ne[3] % ic != 0) {
+        error("IC must be positive and divide ne[3] of both the kernel and the input");
+    }
+    const int s[3] = { INTEGER(s_sexp)[0], INTEGER(s_sexp)[1], INTEGER(s_sexp)[2] };
+    const int p[3] = { INTEGER(p_sexp)[0], INTEGER(p_sexp)[1], INTEGER(p_sexp)[2] };
+    const int d[3] = { INTEGER(d_sexp)[0], INTEGER(d_sexp)[1], INTEGER(d_sexp)[2] };
+    r_conv3d_check_params(s, p, d);
+    r_conv3d_check_shapes(a, b, ic, a->ne[3] / ic, b->ne[3] / ic, s, p, d);
+    const enum ggml_type dst_type = (enum ggml_type) r_int_arg(dst_type_sexp);
+    if (dst_type != GGML_TYPE_F32 && dst_type != GGML_TYPE_F16) {
+        error("dst_type must be GGML_TYPE_F32 or GGML_TYPE_F16");
+    }
+
+    struct ggml_tensor * result = ggml_im2col_3d(ctx, a, b, ic, s[0], s[1], s[2],
+                                                 p[0], p[1], p[2], d[0], d[1], d[2], dst_type);
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+SEXP R_ggml_conv_3d(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP ic_sexp,
+                    SEXP s_sexp, SEXP p_sexp, SEXP d_sexp) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+    struct ggml_tensor * b = (struct ggml_tensor *) R_ExternalPtrAddr(b_ptr);
+    if (ctx == NULL || a == NULL || b == NULL) {
+        error("Invalid pointer");
+    }
+    const int ic = r_int_arg(ic_sexp);
+    if (ic <= 0 || a->ne[3] % ic != 0 || b->ne[3] % ic != 0) {
+        error("IC must be positive and divide ne[3] of both the kernel and the input");
+    }
+    const int s[3] = { INTEGER(s_sexp)[0], INTEGER(s_sexp)[1], INTEGER(s_sexp)[2] };
+    const int p[3] = { INTEGER(p_sexp)[0], INTEGER(p_sexp)[1], INTEGER(p_sexp)[2] };
+    const int d[3] = { INTEGER(d_sexp)[0], INTEGER(d_sexp)[1], INTEGER(d_sexp)[2] };
+    r_conv3d_check_params(s, p, d);
+    r_conv3d_check_shapes(a, b, ic, a->ne[3] / ic, b->ne[3] / ic, s, p, d);
+
+    struct ggml_tensor * result = ggml_conv_3d(ctx, a, b, ic, s[0], s[1], s[2],
+                                               p[0], p[1], p[2], d[0], d[1], d[2]);
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+SEXP R_ggml_conv_3d_direct(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr,
+                           SEXP s_sexp, SEXP p_sexp, SEXP d_sexp,
+                           SEXP ic_sexp, SEXP n_sexp, SEXP oc_sexp) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+    struct ggml_tensor * b = (struct ggml_tensor *) R_ExternalPtrAddr(b_ptr);
+    if (ctx == NULL || a == NULL || b == NULL) {
+        error("Invalid pointer");
+    }
+    const int ic = r_int_arg(ic_sexp);
+    const int n  = r_int_arg(n_sexp);
+    const int oc = r_int_arg(oc_sexp);
+    if (ic <= 0 || n <= 0 || oc <= 0) {
+        error("n_channels, n_batch and n_channels_out must be positive");
+    }
+    const int s[3] = { INTEGER(s_sexp)[0], INTEGER(s_sexp)[1], INTEGER(s_sexp)[2] };
+    const int p[3] = { INTEGER(p_sexp)[0], INTEGER(p_sexp)[1], INTEGER(p_sexp)[2] };
+    const int d[3] = { INTEGER(d_sexp)[0], INTEGER(d_sexp)[1], INTEGER(d_sexp)[2] };
+    r_conv3d_check_params(s, p, d);
+    r_conv3d_check_shapes(a, b, ic, oc, n, s, p, d);
+
+    struct ggml_tensor * result = ggml_conv_3d_direct(ctx, a, b, s[0], s[1], s[2],
+                                                      p[0], p[1], p[2], d[0], d[1], d[2],
+                                                      ic, n, oc);
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+SEXP R_ggml_set_rows(SEXP ctx_ptr, SEXP a_ptr, SEXP b_ptr, SEXP c_ptr) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor * a = (struct ggml_tensor *) R_ExternalPtrAddr(a_ptr);
+    struct ggml_tensor * b = (struct ggml_tensor *) R_ExternalPtrAddr(b_ptr);
+    struct ggml_tensor * c = (struct ggml_tensor *) R_ExternalPtrAddr(c_ptr);
+    if (ctx == NULL || a == NULL || b == NULL || c == NULL) {
+        error("Invalid pointer");
+    }
+    if (b->type != GGML_TYPE_F32 && b->type != GGML_TYPE_F16) {
+        error("ggml_set_rows: source b must be F32 or F16");
+    }
+    if (c->type != GGML_TYPE_I32 && c->type != GGML_TYPE_I64) {
+        error("ggml_set_rows: row indices c must be I32 or I64");
+    }
+    if (a->ne[0] != b->ne[0] || a->ne[2] != b->ne[2] || a->ne[3] != b->ne[3]) {
+        error("ggml_set_rows: a and b must agree in ne[0], ne[2] and ne[3]");
+    }
+    if (b->ne[1] != c->ne[0]) {
+        error("ggml_set_rows: c must hold one index per row of b (c ne[0] == b ne[1])");
+    }
+    if (c->ne[3] != 1 || b->ne[2] % c->ne[1] != 0 || b->ne[3] % c->ne[2] != 0) {
+        error("ggml_set_rows: c must broadcast over b (b ne[2] %% c ne[1] == 0, b ne[3] %% c ne[2] == 0, c ne[3] == 1)");
+    }
+    if (a->ne[4] != b->ne[4] || c->ne[4] != b->ne[4]) {
+        error("ggml_set_rows: a, b and c must agree in ne[4] (no broadcast over it)");
+    }
+    if (!ggml_is_contiguous_rows(a) || !ggml_is_contiguous_rows(b)) {
+        error("ggml_set_rows: a and b must have contiguous rows");
+    }
+
+    struct ggml_tensor * result = ggml_set_rows(ctx, a, b, c);
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
 }
 
@@ -4576,6 +5352,10 @@ SEXP R_ggml_cpu_has_sme(void) {
     return ScalarLogical(ggml_cpu_has_sme());
 }
 
+SEXP R_ggml_cpu_has_sme2(void) {
+    return ScalarLogical(ggml_cpu_has_sme2());
+}
+
 // Other architectures
 SEXP R_ggml_cpu_has_riscv_v(void) {
     return ScalarLogical(ggml_cpu_has_riscv_v());
@@ -4628,6 +5408,30 @@ SEXP R_ggml_is_contiguous_2(SEXP tensor_ptr) {
         error("Invalid tensor pointer");
     }
     return ScalarLogical(ggml_is_contiguous_2(tensor));
+}
+
+SEXP R_ggml_is_contiguous_to_1(SEXP tensor_ptr) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *) R_ExternalPtrAddr(tensor_ptr);
+    if (tensor == NULL) {
+        error("Invalid tensor pointer");
+    }
+    return ScalarLogical(ggml_is_contiguous_to_1(tensor));
+}
+
+SEXP R_ggml_is_contiguous_to_2(SEXP tensor_ptr) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *) R_ExternalPtrAddr(tensor_ptr);
+    if (tensor == NULL) {
+        error("Invalid tensor pointer");
+    }
+    return ScalarLogical(ggml_is_contiguous_to_2(tensor));
+}
+
+SEXP R_ggml_is_contiguous_to_3(SEXP tensor_ptr) {
+    struct ggml_tensor * tensor = (struct ggml_tensor *) R_ExternalPtrAddr(tensor_ptr);
+    if (tensor == NULL) {
+        error("Invalid tensor pointer");
+    }
+    return ScalarLogical(ggml_is_contiguous_to_3(tensor));
 }
 
 // Check if tensor is contiguously allocated (data pointer is valid)
@@ -4769,6 +5573,12 @@ SEXP R_ggml_graph_add_node(SEXP graph_ptr, SEXP tensor_ptr) {
     struct ggml_tensor * tensor = (struct ggml_tensor *) R_ExternalPtrAddr(tensor_ptr);
     if (graph == NULL || tensor == NULL) {
         error("Invalid pointer");
+    }
+    // ggmlR DIVERGENCE: mark the node for compute. Backends skip nodes without the
+    // flag, and ggml_graph_add_node (C, as upstream) leaves it to the caller --
+    // an R caller adding a node means it to run.
+    if (tensor->op != GGML_OP_NONE) {
+        tensor->flags |= GGML_TENSOR_FLAG_COMPUTE;
     }
     ggml_graph_add_node(graph, tensor);
     return R_NilValue;
@@ -5094,6 +5904,7 @@ static int r_abort_enabled = 0;
 /* Declared here rather than taken from r_ggml_compat.h: this file compiles
  * with -DR_GGML_IO_IMPL, which switches that header off entirely. */
 extern void (*r_ggml_abort_hook)(void);
+extern void (*r_ggml_unwind_hook)(void);
 
 // R-compatible abort callback
 static void r_ggml_abort_callback(const char * error_message) {
@@ -5101,6 +5912,7 @@ static void r_ggml_abort_callback(const char * error_message) {
      * Rf_error longjmps, so this is the last point at which any code runs;
      * ggml reaches here through its own abort callback and never touches
      * abort(), which is why the hook has to be called from both places. */
+    if (r_ggml_unwind_hook) r_ggml_unwind_hook();
     if (r_ggml_abort_hook) r_ggml_abort_hook();
     if (error_message != NULL) {
         Rf_error("GGML abort: %s", error_message);
@@ -5615,7 +6427,7 @@ SEXP R_ggml_ssm_conv_back(SEXP ctx_ptr, SEXP sx_ptr, SEXP c_ptr, SEXP grad_ptr) 
 // result: flat, ggml_nelements(x) + d_state*head_dim*n_head*n_seqs elements --
 // the outputs followed by the final states.
 SEXP R_ggml_ssm_scan(SEXP ctx_ptr, SEXP s_ptr, SEXP x_ptr, SEXP dt_ptr,
-                     SEXP A_ptr, SEXP B_ptr, SEXP C_ptr, SEXP ids_ptr) {
+                     SEXP A_ptr, SEXP B_ptr, SEXP C_ptr, SEXP ids_ptr, SEXP K_sexp) {
     struct ggml_context * ctx = (struct ggml_context *) r_ptr_required(ctx_ptr, "context");
     struct ggml_tensor * s   = (struct ggml_tensor *) r_ptr_required(s_ptr,   "s tensor");
     struct ggml_tensor * x   = (struct ggml_tensor *) r_ptr_required(x_ptr,   "x tensor");
@@ -5624,10 +6436,82 @@ SEXP R_ggml_ssm_scan(SEXP ctx_ptr, SEXP s_ptr, SEXP x_ptr, SEXP dt_ptr,
     struct ggml_tensor * B   = (struct ggml_tensor *) r_ptr_required(B_ptr,   "B tensor");
     struct ggml_tensor * C   = (struct ggml_tensor *) r_ptr_required(C_ptr,   "C tensor");
     struct ggml_tensor * ids = (struct ggml_tensor *) r_ptr_required(ids_ptr, "ids tensor");
+    const int K = asInteger(K_sexp);
+    if (K == NA_INTEGER || K < 1) {
+        error("K must be a positive integer");
+    }
+    // Mamba-1 (A has d_state rows) keeps the final state only
+    if (K > 1 && A->ne[0] != 1) {
+        error("K > 1 needs a Mamba-2 A ([1, n_head]); Mamba-1 keeps the final state only");
+    }
 
-    struct ggml_tensor * result = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids);
+    struct ggml_tensor * result = ggml_ssm_scan_ext(ctx, s, x, dt, A, B, C, ids, K);
     if (result == NULL) {
         error("Failed to create ssm_scan operation");
+    }
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+// Gated delta net (Qwen3-Next / Kimi linear attention).
+// q, k: [S_k, H_k, n_tokens, n_seqs], v: [S_v, H_v, n_tokens, n_seqs], S_k == S_v
+// g: [1 or S_v, H_v, n_tokens, n_seqs], beta: [1, H_v, n_tokens, n_seqs]
+// state: S_v*S_v*H_v*n_seqs elements (s0)
+// result: [S_v*H_v, n_tokens*n_seqs + K*S_v*n_seqs] -- outputs then K state snapshots.
+// The builder only GGML_ASSERTs, which would take R down, so the contract is
+// checked here first.
+SEXP R_ggml_gated_delta_net(SEXP ctx_ptr, SEXP q_ptr, SEXP k_ptr, SEXP v_ptr,
+                            SEXP g_ptr, SEXP beta_ptr, SEXP state_ptr, SEXP K_sexp) {
+    struct ggml_context * ctx = (struct ggml_context *) r_ptr_required(ctx_ptr, "context");
+    struct ggml_tensor * q     = (struct ggml_tensor *) r_ptr_required(q_ptr,     "q tensor");
+    struct ggml_tensor * k     = (struct ggml_tensor *) r_ptr_required(k_ptr,     "k tensor");
+    struct ggml_tensor * v     = (struct ggml_tensor *) r_ptr_required(v_ptr,     "v tensor");
+    struct ggml_tensor * g     = (struct ggml_tensor *) r_ptr_required(g_ptr,     "g tensor");
+    struct ggml_tensor * beta  = (struct ggml_tensor *) r_ptr_required(beta_ptr,  "beta tensor");
+    struct ggml_tensor * state = (struct ggml_tensor *) r_ptr_required(state_ptr, "state tensor");
+    const int K = asInteger(K_sexp);
+    if (K == NA_INTEGER || K < 1) {
+        error("K must be a positive integer");
+    }
+
+    struct ggml_tensor * all[6] = { q, k, v, g, beta, state };
+    const char * names[6] = { "q", "k", "v", "g", "beta", "state" };
+    for (int i = 0; i < 6; i++) {
+        if (all[i]->type != GGML_TYPE_F32) {
+            error("gated_delta_net: %s must be F32", names[i]);
+        }
+        if (all[i]->ne[4] != 1) {
+            error("gated_delta_net: %s must be at most 4D", names[i]);
+        }
+    }
+    if (!ggml_is_contiguous_rows(q) || !ggml_is_contiguous_rows(k) || !ggml_is_contiguous_rows(v)) {
+        error("gated_delta_net: q, k and v need contiguous rows");
+    }
+    if (!ggml_is_contiguous(g) || !ggml_is_contiguous(beta) || !ggml_is_contiguous(state)) {
+        error("gated_delta_net: g, beta and state must be contiguous");
+    }
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H_v = v->ne[1];
+    if (q->ne[0] != S_v || k->ne[0] != S_v) {
+        error("gated_delta_net: q and k need S_k == S_v (%lld)", (long long) S_v);
+    }
+    if (!ggml_are_same_shape(q, k) || q->ne[1] < 1 || H_v % q->ne[1] != 0 ||
+        q->ne[2] != v->ne[2] || q->ne[3] != v->ne[3]) {
+        error("gated_delta_net: q, k must be [S_v, H_k, n_tokens, n_seqs] with H_v %% H_k == 0");
+    }
+    if ((g->ne[0] != 1 && g->ne[0] != S_v) || g->ne[1] != H_v || g->ne[2] != v->ne[2] || g->ne[3] != v->ne[3]) {
+        error("gated_delta_net: g must be [1 or S_v, H_v, n_tokens, n_seqs]");
+    }
+    if (beta->ne[0] != 1 || beta->ne[1] != H_v || beta->ne[2] != v->ne[2] || beta->ne[3] != v->ne[3]) {
+        error("gated_delta_net: beta must be [1, H_v, n_tokens, n_seqs]");
+    }
+    if (ggml_nelements(state) != S_v * S_v * H_v * v->ne[3]) {
+        error("gated_delta_net: state must hold S_v * S_v * H_v * n_seqs elements");
+    }
+
+    struct ggml_tensor * result = ggml_gated_delta_net_ext(ctx, q, k, v, g, beta, state, K);
+    if (result == NULL) {
+        error("Failed to create gated_delta_net operation");
     }
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
 }
@@ -5690,5 +6574,196 @@ SEXP R_ggml_gated_linear_attn(SEXP ctx_ptr, SEXP k_ptr, SEXP v_ptr, SEXP q_ptr,
     if (result == NULL) {
         error("Failed to create gated_linear_attn operation");
     }
+    return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
+}
+
+// ggml 0.27 DeepSeek V4 hyper-connections and DSA lightning indexer. The
+// builders GGML_ASSERT their shape and type rules, which would abort the R
+// session -- they are checked here first and raised as R errors.
+
+static struct ggml_tensor * r_dsv4_tensor(SEXP p, const char * what) {
+    struct ggml_tensor * t = (struct ggml_tensor *) R_ExternalPtrAddr(p);
+    if (t == NULL) error("%s: invalid tensor pointer", what);
+    return t;
+}
+
+static void r_dsv4_check(int ok, const char * fn, const char * msg) {
+    if (!ok) error("%s: %s", fn, msg);
+}
+
+SEXP R_ggml_lightning_indexer(SEXP ctx_ptr, SEXP q_ptr, SEXP k_ptr, SEXP w_ptr, SEXP m_ptr) {
+    const char * fn = "ggml_lightning_indexer";
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    if (ctx == NULL) error("%s: invalid context pointer", fn);
+    struct ggml_tensor * q = r_dsv4_tensor(q_ptr, fn);
+    struct ggml_tensor * k = r_dsv4_tensor(k_ptr, fn);
+    struct ggml_tensor * w = r_dsv4_tensor(w_ptr, fn);
+    struct ggml_tensor * m = r_dsv4_tensor(m_ptr, fn);
+
+    r_dsv4_check(q->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32, fn, "q and weights must be F32");
+    r_dsv4_check(m->type == GGML_TYPE_F16, fn, "mask must be F16");
+    r_dsv4_check(q->ne[0] == k->ne[0], fn, "q and k must share ne[0] (n_embd_idx)");
+    r_dsv4_check(m->ne[0] == k->ne[2], fn, "mask ne[0] must equal k ne[2] (n_kv)");
+    r_dsv4_check(q->ne[1] == w->ne[0], fn, "weights ne[0] must equal q ne[1] (n_head_idx)");
+    r_dsv4_check(k->ne[1] == 1, fn, "k ne[1] must be 1");
+    r_dsv4_check(m->ne[1] == q->ne[2] && q->ne[2] == w->ne[1], fn, "mask ne[1] and weights ne[1] must equal q ne[2] (n_batch)");
+    r_dsv4_check(w->ne[2] == 1 && m->ne[2] == 1, fn, "weights and mask ne[2] must be 1");
+    r_dsv4_check(q->ne[3] == k->ne[3] && k->ne[3] == w->ne[3], fn, "q, k and weights must share ne[3]");
+    r_dsv4_check(m->ne[3] > 0 && w->ne[3] % m->ne[3] == 0, fn, "ne[3] must be a multiple of mask ne[3]");
+    r_dsv4_check(q->ne[4] == 1 && k->ne[4] == 1 && w->ne[4] == 1 && m->ne[4] == 1, fn, "tensors must be at most 4D");
+
+    return R_MakeExternalPtr(ggml_lightning_indexer(ctx, q, k, w, m), R_NilValue, R_NilValue);
+}
+
+SEXP R_ggml_dsv4_hc_comb(SEXP ctx_ptr, SEXP mixes_ptr, SEXP scale_ptr, SEXP base_ptr, SEXP eps_sexp, SEXP n_iter_sexp) {
+    const char * fn = "ggml_dsv4_hc_comb";
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    if (ctx == NULL) error("%s: invalid context pointer", fn);
+    struct ggml_tensor * mixes = r_dsv4_tensor(mixes_ptr, fn);
+    struct ggml_tensor * scale = r_dsv4_tensor(scale_ptr, fn);
+    struct ggml_tensor * base  = r_dsv4_tensor(base_ptr, fn);
+    const int n_iter = asInteger(n_iter_sexp);
+
+    r_dsv4_check(mixes->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32, fn, "all inputs must be F32");
+    r_dsv4_check(n_iter != NA_INTEGER && n_iter > 0, fn, "n_iter must be a positive integer");
+    r_dsv4_check(mixes->ne[0] == 24, fn, "mixes ne[0] must be (2 + hc) * hc with hc = 4, i.e. 24");
+    r_dsv4_check(ggml_nrows(mixes) == mixes->ne[1], fn, "mixes must be 2D [24, n_tokens]");
+    r_dsv4_check(scale->ne[0] >= 3 && ggml_nelements(scale) == scale->ne[0], fn, "scale must be a vector of length >= 3");
+    r_dsv4_check(base->ne[0] == 24 && ggml_nelements(base) == 24, fn, "base must be a vector of length 24");
+
+    return R_MakeExternalPtr(ggml_dsv4_hc_comb(ctx, mixes, scale, base, (float) asReal(eps_sexp), n_iter),
+                             R_NilValue, R_NilValue);
+}
+
+SEXP R_ggml_dsv4_hc_pre(SEXP ctx_ptr, SEXP x_ptr, SEXP w_ptr, SEXP scale_sexp, SEXP gated_sexp) {
+    const char * fn = "ggml_dsv4_hc_pre";
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    if (ctx == NULL) error("%s: invalid context pointer", fn);
+    struct ggml_tensor * x = r_dsv4_tensor(x_ptr, fn);
+    struct ggml_tensor * w = r_dsv4_tensor(w_ptr, fn);
+    const int gated = asLogical(gated_sexp) == TRUE;
+
+    r_dsv4_check(x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32, fn, "inputs must be F32");
+    r_dsv4_check(x->ne[1] > 0 && x->ne[3] == 1 && x->ne[4] == 1, fn, "x must be 3D [n_embd, hc, n_tokens]");
+    if (gated) {
+        r_dsv4_check(w->ne[0] == x->ne[0] && w->ne[1] == x->ne[1] && w->ne[2] == x->ne[2], fn, "gate must have the shape of x");
+    } else {
+        r_dsv4_check(w->ne[0] == x->ne[1] && w->ne[1] == x->ne[2] && w->ne[2] == 1, fn, "weights must be [hc, n_tokens]");
+    }
+    r_dsv4_check(w->ne[3] == 1 && w->ne[4] == 1, fn, "weights must be at most 3D");
+
+    struct ggml_tensor * r = gated ? ggml_dsv4_hc_pre_gated(ctx, x, w, (float) asReal(scale_sexp))
+                                   : ggml_dsv4_hc_pre(ctx, x, w);
+    return R_MakeExternalPtr(r, R_NilValue, R_NilValue);
+}
+
+SEXP R_ggml_dsv4_hc_post(SEXP ctx_ptr, SEXP x_ptr, SEXP res_ptr, SEXP post_ptr, SEXP comb_ptr) {
+    const char * fn = "ggml_dsv4_hc_post";
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    if (ctx == NULL) error("%s: invalid context pointer", fn);
+    struct ggml_tensor * x    = r_dsv4_tensor(x_ptr, fn);
+    struct ggml_tensor * res  = r_dsv4_tensor(res_ptr, fn);
+    struct ggml_tensor * post = r_dsv4_tensor(post_ptr, fn);
+    struct ggml_tensor * comb = comb_ptr == R_NilValue ? NULL : r_dsv4_tensor(comb_ptr, fn);
+
+    r_dsv4_check(x->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32 && post->type == GGML_TYPE_F32, fn, "inputs must be F32");
+    const int64_t n_embd = x->ne[0], n_tokens = x->ne[1], hc = res->ne[1];
+    r_dsv4_check(hc > 0 && x->ne[2] == 1 && x->ne[3] == 1 && x->ne[4] == 1, fn, "x must be 2D [n_embd, n_tokens]");
+    r_dsv4_check(res->ne[0] == n_embd && res->ne[2] == n_tokens && res->ne[3] == 1 && res->ne[4] == 1, fn, "residual must be [n_embd, hc, n_tokens]");
+    r_dsv4_check(post->ne[0] == hc && post->ne[1] == n_tokens && post->ne[2] == 1 && post->ne[3] == 1 && post->ne[4] == 1, fn, "post must be [hc, n_tokens]");
+    if (comb) {
+        r_dsv4_check(comb->type == GGML_TYPE_F32 && comb->ne[0] == hc && comb->ne[1] == hc && comb->ne[2] == n_tokens &&
+                     comb->ne[3] == 1 && comb->ne[4] == 1, fn, "comb must be F32 [hc, hc, n_tokens]");
+    }
+
+    return R_MakeExternalPtr(ggml_dsv4_hc_post(ctx, x, res, post, comb), R_NilValue, R_NilValue);
+}
+
+// ggmlR: the numbers of GGML_OP_RAND on the host, without a backend or a graph:
+// the CPU kernel's own loop (ggml-cpu/ops-elemwise.cpp). key: two numbers, taken
+// as f32 bit patterns like the key tensor of ggml_rand(); returns n doubles.
+void ggml_rand_fill_f32(float * out, int64_t i0, int64_t i1, uint32_t k0, uint32_t k1,
+                        int32_t dist, uint32_t stream);
+
+SEXP R_ggml_rand_host(SEXP key_sexp, SEXP dist_sexp, SEXP stream_sexp, SEXP n_sexp) {
+    if (!isReal(key_sexp) || LENGTH(key_sexp) < 2) {
+        error("ggml_rand: key must be two numbers");
+    }
+    const int dist   = asInteger(dist_sexp);
+    const int stream = asInteger(stream_sexp);
+    const double nd  = asReal(n_sexp);
+    if (dist < 0 || dist > 2) {
+        error("ggml_rand: unknown distribution");
+    }
+    if (stream == NA_INTEGER || stream < 0) {
+        error("ggml_rand: stream must be a non-negative integer");
+    }
+    // the counter is 32 bits of element index
+    if (!R_FINITE(nd) || nd < 1 || nd != floor(nd) || nd > 4294967295.0) {
+        error("ggml_rand: the number of elements must be a positive whole number below 2^32");
+    }
+    const R_xlen_t n = (R_xlen_t) nd;
+    const float kf[2] = { (float) REAL(key_sexp)[0], (float) REAL(key_sexp)[1] };
+    uint32_t k[2];
+    memcpy(k, kf, sizeof(k));
+
+    float * buf = (float *) R_alloc((size_t) n, sizeof(float));
+    ggml_rand_fill_f32(buf, 0, (int64_t) n, k[0], k[1], dist, (uint32_t) stream);
+    SEXP res = PROTECT(allocVector(REALSXP, n));
+    double * out = REAL(res);
+    for (R_xlen_t i = 0; i < n; i++) {
+        out[i] = (double) buf[i];
+    }
+    UNPROTECT(1);
+    return res;
+}
+
+// ggmlR: counter-based random numbers, see ggml_rand() in ggml.h.
+// key: F32 tensor with >= 2 elements; dist: 0 uniform, 1 Gumbel, 2 normal.
+SEXP R_ggml_rand(SEXP ctx_ptr, SEXP key_ptr, SEXP dist_sexp, SEXP stream_sexp, SEXP dims_sexp) {
+    struct ggml_context * ctx = (struct ggml_context *) R_ExternalPtrAddr(ctx_ptr);
+    struct ggml_tensor  * key = (struct ggml_tensor *) R_ExternalPtrAddr(key_ptr);
+    if (ctx == NULL || key == NULL) {
+        error("Invalid pointer");
+    }
+    if (key->type != GGML_TYPE_F32) {
+        error("ggml_rand: key must be an F32 tensor");
+    }
+    if (!ggml_is_contiguous(key) || ggml_nelements(key) < 2) {
+        error("ggml_rand: key must be contiguous with at least 2 elements");
+    }
+
+    const int dist   = asInteger(dist_sexp);
+    const int stream = asInteger(stream_sexp);
+    if (dist < 0 || dist > 2) {
+        error("ggml_rand: unknown distribution");
+    }
+    if (stream == NA_INTEGER || stream < 0) {
+        error("ggml_rand: stream must be a non-negative integer");
+    }
+
+    const int n_dims = LENGTH(dims_sexp);
+    if (n_dims < 1 || n_dims > 4) {
+        error("ggml_rand: dims must have 1 to 4 entries");
+    }
+    int64_t ne[4] = {1, 1, 1, 1};
+    double total = 1.0;
+    for (int i = 0; i < n_dims; i++) {
+        const double d = REAL(dims_sexp)[i];
+        if (!R_FINITE(d) || d < 1 || d != floor(d)) {
+            error("ggml_rand: dims must be positive whole numbers");
+        }
+        ne[i] = (int64_t) d;
+        total *= d;
+    }
+    if (total > 4294967295.0) {
+        error("ggml_rand: at most 2^32 - 1 elements");
+    }
+
+    struct ggml_tensor * result = ggml_rand(ctx, key, (enum ggml_rand_dist) dist, stream, n_dims, ne);
+    if (result == NULL) {
+        error("Failed to create rand operation");
+    }
+
     return R_MakeExternalPtr(result, R_NilValue, R_NilValue);
 }

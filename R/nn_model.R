@@ -749,7 +749,7 @@ nn_index_vocab <- function(model) {
 #' @param model Compiled model
 #' @param batch_size Batch size
 #' @return List with ctx_weights, ctx_compute, inputs, outputs, buffer
-#' @keywords internal
+#' @noRd
 # logits_output: drop a final softmax from the graph, leaving the last layer's
 # raw logits as the output. ggml_cross_entropy_loss() applies log_softmax to its
 # own input, so feeding it softmax probabilities would apply softmax twice --
@@ -2240,7 +2240,7 @@ summary.ggml_sequential_model <- function(object, ...) {
 #' Count parameters for a single layer
 #' @param layer A layer list
 #' @return Number of parameters
-#' @keywords internal
+#' @noRd
 nn_count_layer_params <- function(layer) {
   if (layer$type == "embedding") {
     return(as.numeric(layer$config$vocab_size) * layer$config$dim)
@@ -2457,13 +2457,24 @@ ggml_save_model.ggml_functional_model <- function(model, path) {
 
   # node_weights: list of node_id -> list of ggml tensors
   # Extract numeric data from each tensor
+  # [[ ]], not $: the model is a list, and with node_weights absent
+  # model$node_weights partially matches node_weights_data -- plain vectors that
+  # were then read as tensor pointers ("Invalid tensor pointer").
   nw_data <- NULL
-  if (!is.null(model$node_weights)) {
-    nw_data <- lapply(model$node_weights, function(wlist) {
+  if (!is.null(model[["node_weights"]])) {
+    nw_data <- lapply(model[["node_weights"]], function(wlist) {
       lapply(wlist, function(t) {
         if (is.null(t)) NULL else ggml_backend_tensor_get_data(t)
       })
     })
+  } else if (!is.null(model[["node_weights_data"]])) {
+    # Only ggml_fit() and ggml_trainer() put live tensors in node_weights. A
+    # model that has weights but was never fitted in this session -- straight
+    # from ggml_load_model(), or given node_weights_data by hand -- carries
+    # them here, as plain vectors, and they are saved as they are. Without this
+    # branch such a model was written WITHOUT weights, and the next load
+    # silently started from a fresh initialisation.
+    nw_data <- model[["node_weights_data"]]
   }
 
   saveRDS(list(

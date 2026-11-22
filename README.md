@@ -2,7 +2,7 @@
 
 [![CRAN](https://www.r-pkg.org/badges/version/ggmlR)](https://CRAN.R-project.org/package=ggmlR)
 [![downloads](https://cranlogs.r-pkg.org/badges/grand-total/ggmlR)](https://CRAN.R-project.org/package=ggmlR)
-[![R-hub check on the R Consortium cluster](https://github.com/r-hub2/separate-jaguar-ggmlR/actions/workflows/rhub-rc.yaml/badge.svg)](https://github.com/r-hub2/separate-jaguar-ggmlR/actions/workflows/rhub-rc.yaml)
+[![R-CMD-check](https://github.com/Zabis13/ggmlR/actions/workflows/rhub.yaml/badge.svg)](https://github.com/Zabis13/ggmlR/actions/workflows/rhub.yaml)
 
 [![ggmlR](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcranlogs.r-pkg.org%2Fdownloads%2Ftotal%2Flast-month%2FggmlR&query=%24%5B0%5D.downloads&label=ggmlR&color=blue)](https://CRAN.R-project.org/package=ggmlR)
 [![sd2R](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcranlogs.r-pkg.org%2Fdownloads%2Ftotal%2Flast-month%2Fsd2R&query=%24%5B0%5D.downloads&label=sd2R&color=blue)](https://CRAN.R-project.org/package=sd2R)
@@ -12,7 +12,7 @@
 [![cgvR](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcranlogs.r-pkg.org%2Fdownloads%2Ftotal%2Flast-month%2FcgvR&query=%24%5B0%5D.downloads&label=cgvR&color=blue)](https://CRAN.R-project.org/package=cgvR)
 [![AV1R](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcranlogs.r-pkg.org%2Fdownloads%2Ftotal%2Flast-month%2FAV1R&query=%24%5B0%5D.downloads&label=AV1R&color=blue)](https://CRAN.R-project.org/package=AV1R)
 
-A native R package for building, training, and deploying neural networks. Backed by the [ggml](https://github.com/ggml-org/ggml) C library, designed primarily for **Vulkan GPU acceleration** with full CPU fallback — no Python, no TensorFlow, everything runs inside your R session.
+A native R package for building, training, and deploying neural networks. Backed by the [ggml](https://github.com/ggml-org/ggml) C library (synced with ggml 0.27.0), designed primarily for **Vulkan GPU acceleration** with full CPU fallback — no Python, no TensorFlow, everything runs inside your R session.
 
 > **GPU-first design**: when a Vulkan-capable GPU is available (NVIDIA, AMD, Intel, ARM Mali, Qualcomm Adreno), all operations run on GPU automatically. On machines without a GPU the package falls back to CPU transparently — no code changes needed.
 
@@ -762,6 +762,11 @@ opt$step(grads)
 opt$zero_grad()
 ```
 
+A dense layer written as `ag_add(ag_matmul(W, x), b)` with a bias `[m, 1]`
+gets its weight and bias gradients from one node in the graph backward,
+`ggml_out_prod_rowsum()`: one pass over the output gradient instead of two.
+This is automatic when the matmul's result feeds nothing but that add.
+
 ### Transformer encoder block
 
 ```r
@@ -792,6 +797,32 @@ for (epoch in 1:50) {
   sch$step()
 }
 ```
+
+### Batched transformer block
+
+A batch of `n` sequences of `s` tokens is one `[d_model, n * s]` matrix, each
+sequence in adjacent columns. Linear layers are per-token as they are;
+`ag_flash_attention(batch = n)` keeps every sequence to itself in one fused
+call. With `ag_rms_norm()` and `ag_silu()` (the norm and activation of
+`ggml_layer_transformer_block()`) the whole block runs in the graph backward,
+so it can be recorded with `ag_capture_step()`.
+
+```r
+d <- 64L; n <- 512L; s <- 20L
+rms1 <- ag_rms_norm(d); rms2 <- ag_rms_norm(d)
+Wq <- ag_param(matrix(rnorm(d * d, sd = 0.1), d, d))   # likewise Wk, Wv, Wo, W1, W2
+
+block <- function(h) {                                  # h: [d, n * s]
+  a <- rms1$forward(h)
+  h <- ag_add(h, ag_matmul(Wo, ag_flash_attention(ag_matmul(Wq, a), ag_matmul(Wk, a),
+                                                  ag_matmul(Wv, a), n_heads = 4L,
+                                                  batch = n)))
+  ag_add(h, ag_matmul(W2, ag_silu(ag_matmul(W1, rms2$forward(h)))))
+}
+```
+
+On Vulkan devices with cooperative matrices the attention forward multiplies
+in f16 (about `3e-4`–`7e-4` off an f32 reference); its backward is f32.
 
 ### Data-parallel training
 
@@ -860,6 +891,19 @@ y <- ggml_pp_forward(list(mk(0L, W1), mk(1L, W2)), x = as.numeric(X), out_shape 
 
 See `inst/examples/tp_dp_hybrid.R` and `inst/examples/pp_pipeline.R` for complete runnable demos.
 
+**Graph-level tensor parallelism (meta backend, experimental)** — `ggml_vulkan_split_mul_mat()` splits one matrix and gathers right away. ggml's *meta backend* (upstream since ggml 0.27) splits a whole graph instead: it wraps several devices into one backend, lays each weight out across them by a rule, runs every op on all devices at once on its own share, and inserts the cross-device reduction only where a result must be combined — a column-split layer followed by a row-split one (the Megatron MLP pattern) exchanges nothing in between. Without a backend-specific all-reduce (Vulkan has none) the reduction goes through host staging, like the rest of this section.
+
+```r
+# w1 [n_in, n_hidden] split by output features, w2 [n_hidden, n_out] by input
+# features: one reduction per MLP, after w2. Name the tensors with ggml_set_name().
+meta  <- ggml_meta_backend(c(0L, 1L), split = list(w1 = "rows", w2 = "cols"))
+sched <- ggml_backend_sched_new(list(meta, ggml_backend_cpu_init()))
+# allocate weights with ggml_backend_alloc_ctx_tensors(ctx, meta), build the
+# graph, then ggml_backend_sched_alloc_graph() / ggml_backend_sched_graph_compute()
+```
+
+Rules are `"mirror"` (default), `"rows"` (ggml `ne[1]`), `"cols"` (`ne[0]`), `"axis2"`/`"axis3"`, or `list(axis =, weights =)` for uneven shares; `split` may also be a `function(name, ne)`. The same device may be listed twice, which is how the tests exercise it on one GPU or on the CPU. The raw callback API is `ggml_backend_meta_device()`. Status: forward graphs are checked against the plain CPU on 2×CPU and 2× the same Vulkan device (`tests/testthat/test-meta-backend-compute.R`); not yet measured on real multi-GPU hardware, and not wired into `ggml_fit()`, autograd or ONNX.
+
 #### Benchmark: which split strategy to use
 
 Measured with `llamaR` (which links `libggml.a` statically) driving Qwen2.5-1.5B-Instruct Q4_K_M (Vulkan, host-staging cross-device transport) on two 4-GPU hosts, decode throughput, median of 3 runs of 128 tokens:
@@ -871,10 +915,10 @@ Measured with `llamaR` (which links `libggml.a` statically) driving Qwen2.5-1.5B
 |---|---|---|---:|---:|---|
 | Baseline | 1 | none | **419.7** | **516.9** | model fits in one card — fastest |
 | Pipeline (PP) | 2 | layer | 150.4 | 221.5 | layers spread across 2 GPUs |
-| Tensor (TP) | 2 | row | 150.4 | 223.2 | rows split, all-reduce per layer |
+| "Tensor" (row)¹ | 2 | row → layer | 150.4 | 223.2 | same as PP: layer split |
 | Pipeline (PP) | 4 | layer | 133.3 | 176.3 | more hops → slower |
-| Tensor (TP) | 4 | row | 130.0 | 176.6 | more hops → slower |
-| **TP=2 × DP=2** | 4 | row + replicas | **306** | **446** | 2 replicas × TP=2, run concurrently |
+| "Tensor" (row)¹ | 4 | row → layer | 130.0 | 176.6 | same as PP: layer split |
+| **"TP"=2 × DP=2**¹ | 4 | row → layer + replicas | **306** | **446** | 2 replicas × 2-GPU layer split, run concurrently |
 | **DP=4** | 4 | replicas | **975** | **1300** | 4 single-GPU replicas, run concurrently |
 
 Same model on an **8× Tesla V100-32GB** host (2× Xeon E5-2698 v4, 256 GB RAM), showing how the pattern holds as GPU count doubles:
@@ -883,13 +927,15 @@ Same model on an **8× Tesla V100-32GB** host (2× Xeon E5-2698 v4, 256 GB RAM),
 |---|---|---|---:|---|
 | Baseline | 1 | none | **684.9** | model fits in one card — fastest |
 | Pipeline (PP) | 2 | layer | 229.7 | layers spread across 2 GPUs |
-| Tensor (TP) | 2 | row | 231.3 | rows split, all-reduce per layer |
+| "Tensor" (row)¹ | 2 | row → layer | 231.3 | same as PP: layer split |
 | Pipeline (PP) | 4 | layer | 187.5 | more hops → slower |
-| Tensor (TP) | 4 | row | 191.0 | more hops → slower |
+| "Tensor" (row)¹ | 4 | row → layer | 191.0 | same as PP: layer split |
 | Pipeline (PP) | 8 | layer | 142.8 | 8-way split — slowest single-context |
-| Tensor (TP) | 8 | row | 137.1 | per-layer all-reduce across 8 cards |
-| **TP=2 × DP=4** | 8 | row + replicas | **897** | 4 replicas × TP=2, run concurrently |
+| "Tensor" (row)¹ | 8 | row → layer | 137.1 | same as PP: layer split |
+| **"TP"=2 × DP=4**¹ | 8 | row → layer + replicas | **897** | 4 replicas × 2-GPU layer split, run concurrently |
 | **DP=8** | 8 | replicas | **2290** | 8 single-GPU replicas, run concurrently |
+
+¹ These rows were run with llamaR's `split_mode = "row"`, which on Vulkan is **not** tensor parallelism: llama.cpp asks the backend registry for a split buffer type, the Vulkan registry does not expose one, and the loader silently falls back to an ordinary layer split. That is why the "row" numbers match the PP rows (150.4 vs 150.4 t/s on P100). A true tensor-parallel LLM run on Vulkan — llamaR's `split_mode = "tensor"`, through the meta backend described above — has not been measured yet.
 
 **Takeaway:** when a model **fits in one GPU**, data parallelism (DP — independent replicas) wins by a wide margin: DP=4 delivers ~2.3× the single-card throughput and ~7.5× any split mode. Splitting such a model across cards (PP/TP) only adds cross-device overhead — the ~1 GB/s host-staging transport dominates. **PP and TP earn their keep only when the model does not fit in one card** (e.g. a 30B+ model on 16 GB cards): there a split is the *only* way to run it at all, and PP minimizes cross-device hops (one activation copy per pass) while TP maximizes per-token parallelism at the cost of a per-layer all-reduce. Reproduce with `llamaR`'s `inst/examples/bench_pp_tp_dp.sh`.
 
@@ -908,17 +954,20 @@ Same model on an **8× Tesla V100-32GB** host (2× Xeon E5-2698 v4, 256 GB RAM),
 
 | Category | Functions |
 |---|---|
-| Linear | `ag_matmul`, `ag_add`, `ag_sub`, `ag_mul`, `ag_scale` |
-| Activations | `ag_relu`, `ag_sigmoid`, `ag_tanh`, `ag_softmax` |
-| Reductions | `ag_sum`, `ag_mean` (with `dim`, `keepdim`) |
-| Math | `ag_log`, `ag_exp`, `ag_pow`, `ag_clamp` |
+| Linear | `ag_matmul`, `ag_add`, `ag_sub`, `ag_mul`, `ag_div`, `ag_scale` |
+| Activations | `ag_relu`, `ag_sigmoid`, `ag_tanh`, `ag_softmax`, `ag_softplus`, `ag_silu` |
+| Reductions | `ag_sum`, `ag_mean` (with `dim`, `keepdim`), `ag_logsumexp` |
+| Math | `ag_log`, `ag_exp`, `ag_pow`, `ag_clamp`, `ag_sqrt`, `ag_abs`, `ag_sin`, `ag_cos`, `ag_minimum`, `ag_maximum`, `ag_where`, `ag_detach` |
 | Shape | `ag_reshape`, `ag_transpose`, `ag_slice_rows`, `ag_concat_rows` |
-| Device buffers | `ag_buffer`, `ag_buffer_write`, `ag_buffer_read`, `ag_buffer_free`, `ag_get_rows` (see [Device buffers](#device-buffers)) |
+| Device buffers | `ag_buffer`, `ag_buffer_write`, `ag_buffer_read`, `ag_buffer_free`, `ag_get_rows`, `ag_buffer_copy_from` (see [Device buffers](#device-buffers)) |
+| Action selection | `ag_log_softmax`, `ag_argmax`, `ag_sample_categorical`, `ag_sample_normal`, `ag_gather`, `ag_rand` (see [Action selection on the device](#action-selection-on-the-device)) |
 | Attention | `ag_multihead_attention`, `ag_flash_attention` (all heads in one fused op) |
-| Loss | `ag_mse_loss`, `ag_cross_entropy_loss`, `ag_softmax_cross_entropy_loss` |
-| Layers | `ag_linear`, `ag_batch_norm`, `ag_layer_norm`, `ag_dropout`, `ag_embedding` |
+| Loss | `ag_mse_loss`, `ag_cross_entropy_loss`, `ag_softmax_cross_entropy_loss`, `ag_huber_loss`, `ag_smooth_l1_loss` |
+| Layers | `ag_linear`, `ag_conv2d_layer`, `ag_conv_transpose2d_layer`, `ag_lstm`, `ag_gru` (and `ag_lstm_cell`, `ag_gru_cell`), `ag_batch_norm`, `ag_layer_norm`, `ag_rms_norm`, `ag_dropout`, `ag_embedding` |
 | Containers | `ag_sequential` |
-| Optimizers | `optimizer_sgd`, `optimizer_adam` |
+| Convolution | `ag_conv2d`, `ag_conv_transpose2d` (see [Reinforcement learning building blocks](#reinforcement-learning-building-blocks)) |
+| Optimizers | `optimizer_sgd`, `optimizer_adam`, `optimizer_adamw`, `optimizer_rmsprop` |
+| Reinforcement learning | `ag_gae`, `ag_discounted_returns`, `ag_nstep_targets`, `ag_entropy`, `ag_normal_log_prob`, `ag_normal_entropy`, `ag_soft_update`, `ag_hard_update`, `ag_replay_buffer`, `ag_per_sampler` (see [Reinforcement learning building blocks](#reinforcement-learning-building-blocks)) |
 | Schedulers | `lr_scheduler_step`, `lr_scheduler_cosine` (SGDR via `T_mult`), `lr_scheduler_onecycle`, `lr_scheduler_cyclic`, `lr_scheduler_warmup_cosine` |
 | Memory | `ag_checkpoint` (recompute a segment instead of storing its activations) |
 | Utilities | `clip_grad_norm`, `clip_grad_value`, `check_grad_anomaly`, `ag_gradcheck`, `dp_train` |
@@ -1276,7 +1325,131 @@ ag_buffer_free(buf)                             # release now, not at gc()
 * Creation fails when the buffer needs more than 85% of the free device memory
   the driver reports. `ag_device("cpu")` moves buffers to the host first (about
   twice their device size, as R doubles); the next GPU use uploads them again.
+* `ag_buffer_copy_from(buf, tensor, backend, col_offset)` copies a ggml tensor
+  that is already on the device (an environment's observations, laid out
+  `[rows, k]`) into the buffer GPU to GPU, without the host. A copy that would
+  have to go through the host is an error unless `via_host = "allow"`.
 * On the CPU the same calls work on an R matrix.
+
+### Action selection on the device
+
+Picking an action from a policy head -- mask, softmax, argmax or a sample, and
+the log-probability of what was picked -- can stay on the device and be part of
+one `ag_capture()` recording. Only a two-number key goes up; the logits never
+come down.
+
+```r
+ag_device("gpu")
+act <- ag_capture(function(x, key) {
+  lp <- ag_log_softmax(ag_matmul(W, x))           # [n_actions, B]
+  a  <- ag_sample_categorical(lp, key = key)      # [1, B], on the device
+  list(a = a, logp = ag_gather(lp, a))
+}, params = list(W))
+r <- act(x = obs, key = matrix(runif(2), 2, 1))   # r$a: 0-based actions, r$logp
+```
+
+* `ag_rand(key, dist, dims, stream)` -- a `[n, batch]` tensor of `"uniform"`,
+  `"gumbel"` or `"normal"` numbers computed where the key lives
+  (`ggml_rand()`, Philox4x32-10, a counter-based generator). Element i depends
+  only on the key, the stream and i: the same key gives the same numbers, the
+  CPU and the GPU draw the same uniform bits (Gumbel and normal agree to the
+  last bits of `log` / `cos`), and keys from `runif()` make a run follow
+  `set.seed()`. Use different `stream`s for independent draws from one key.
+* `ag_sample_categorical(x, key = )` -- Gumbel-max with noise from `ag_rand()`;
+  returns a `[1, batch]` tensor of 0-based indices instead of an R vector.
+  Without `key` it behaves as before (host noise, integer vector).
+* `ag_argmax(x, as_tensor = TRUE)` -- the same for the greedy choice.
+* `ag_gather(x, index)` accepts such an index tensor and picks `x[index[j], j]`
+  on the device. With an index tensor it is not differentiable and the range is
+  not checked; for a loss pass the indices as an R vector, as before.
+* Indices travel as floats so that they share the recording's single download
+  with the other outputs: exact up to 2^24 classes in f32, 2048 in f16.
+* Mask illegal actions by adding a large finite negative number (`-1e4`) before
+  the softmax.
+
+### Reinforcement learning building blocks
+
+The pieces an on-policy (PPO) or off-policy (DQN, SAC, TD3) agent is built
+from, on top of the ops above. Layouts follow the rest of the engine
+(`[features, batch]`); rollouts are `[T, n_envs]`.
+
+```r
+# Returns: terminated and truncated are kept apart; a truncated step is
+# bootstrapped from the value of its final observation (next_values).
+g <- ag_gae(rewards, values, terminated, truncated, next_values = v_final,
+            last_value = v_last, gamma = 0.99, lambda = 0.95)
+g$advantages; g$returns
+
+# Off-policy: replay on the device, prioritized, and a Polyak target network
+rb <- ag_replay_buffer(obs_dim = 8, act_dim = 1, capacity = 100000, n_envs = 16,
+                       prioritized = TRUE)
+rb$add(obs, act, reward, terminated, truncated, next_obs)   # one step of 16 envs
+b <- rb$sample(256, beta = 0.4)                 # b$idx (0-based), b$weights
+x <- rb$gather(b$idx)                           # [rows, 256] on the device
+q_in <- rb$slice(x, c("obs", "act")); r <- rb$field(x, "reward")
+rb$update_priorities(b$idx, td_errors)
+ag_soft_update(q_target, q_net, tau = 0.005)    # target first
+
+# Pixels: Nature-CNN encoder, images as [C*H*W, B] columns (W fastest)
+conv1 <- ag_conv2d_layer(4, 32, kernel_size = 8, in_hw = c(84, 84), stride = 4)
+conv2 <- ag_conv2d_layer(32, 64, kernel_size = 4, in_hw = conv1$out_shape[2:3], stride = 2)
+h <- ag_relu(conv2$forward(ag_relu(conv1$forward(ag_scale(frames, 1 / 255)))))
+
+# Memory: an LSTM over a rollout, state reset where an episode starts
+lstm <- ag_lstm(input_size = 64, hidden_size = 128)
+r <- lstm$forward(xs, state = h0, starts = episode_starts)   # xs: list of T [64, B]
+
+# Model-based (DreamerV3): categorical latents, a pixel decoder, λ-returns
+probs <- ag_softmax(ag_reshape(logits, 32, 32 * B))          # 32 groups of 32 classes
+up  <- ag_conv_transpose2d_layer(64, 32, kernel_size = 4, in_hw = c(8, 8),
+                                 stride = 2, padding = 1)      # 8x8 -> 16x16
+img <- up$forward(ag_layer_norm(64 * 8 * 8)$forward(h))
+lr  <- ag_gae(rewards, values, continues = cont_prob,          # soft continue head
+              last_value = v_last, gamma = 0.997, lambda = 0.95)$returns
+```
+
+* **Losses**: `ag_huber_loss()` / `ag_smooth_l1_loss()` for TD errors,
+  `ag_entropy()` of a categorical policy from its logits,
+  `ag_normal_log_prob()` / `ag_normal_entropy()` for Gaussian policies.
+* **Optimizers**: `optimizer_adamw()` (decoupled weight decay) runs in the
+  fused device kernel and under `ag_capture_step()`; `optimizer_rmsprop()`
+  (as in A2C / the DQN paper, with `momentum` and `centered`).
+* **Prioritized replay** samples stratified, proportional to
+  \|δ\|^α; importance weights are normalised by the maximum over the whole
+  buffer, not the batch (as in the paper). `ag_per_sampler()` is the sampler
+  alone, for any storage.
+* **Recurrent layers** use PyTorch's weight layout and gate order (weights
+  copy one to one); `init = "rl"` (default) starts with orthogonal recurrent
+  weights and an LSTM forget bias of 1, `init = "torch"` reproduces PyTorch.
+  `layer$cell$forward(x, state)` runs single steps during a rollout with the
+  same weights.
+* **Convolution** weights are `[OC, C*KH*KW]` in PyTorch's order; a torch
+  kernel `w` (`[OC, C, KH, KW]`) becomes `matrix(aperm(w, c(1, 4, 3, 2)), OC)`.
+  On the GPU the forward is one graph and the backward a graph rule
+  (`im2col` is recomputed, not stored), so a convolutional policy trains under
+  `ag_capture_step()` with a fixed batch size. On the CPU the convolution is a
+  reference implementation in R, not a fast path. Scaling pixels (`/ 255`) is
+  the caller's.
+* **Transposed convolution** (`ag_conv_transpose2d()`, for decoders) takes the
+  weight `[C, OC*KH*KW]` of a torch `ConvTranspose2d` (`[C, OC, KH, KW]` →
+  `matrix(aperm(w, c(1, 4, 3, 2)), C)`) and supports stride, padding,
+  `output_padding` (< stride) and dilation; `groups` must be 1. It is the
+  input gradient of `ag_conv2d()`, so it needs no kernels of its own and its
+  backward runs in the graph, like the convolution's.
+* **World models**: `ag_reshape()` and `ag_layer_norm()` (on the GPU now) run
+  in the graph backward; `ag_gae(continues = )` takes the soft continuation
+  probabilities of imagined rollouts, and `returns` is then DreamerV3's
+  λ-return. Inside a recording, constants must not be uploaded: plain numbers
+  in `ag_add()` / `ag_sub()` are fine, RNN cells make their zero state on the
+  device, anything else comes in as an argument.
+* **Recorded RSSM**: `inst/examples/rssm_capture.R` trains a small DreamerV3-style
+  world model (GRU, 8 × 8 categorical latents, straight-through samples,
+  free-bits KL) over T = 16 steps. On a Radeon RX 9070 one training step takes
+  298 ms uncaptured and 14.3 ms under `ag_capture_step()` (×20.8, bit-identical
+  losses).
+* **Matmul precision**: convolutions follow `ag_matmul_precision()` like every
+  other matmul; on an fp16/coopmat Vulkan device the default keeps tiles in
+  f16 (~4e-4 relative).
 
 ### Budgeting a training run
 
@@ -1467,7 +1640,7 @@ Every accelerated step matches Seurat to float noise (normalize/scale max abs er
 top-gene agreement 1.0000). `scale` comes out ~1× — it is memory-bound with
 nothing to accelerate, so it defaults to the CPU even under Vulkan; PCA's
 covariance multiply is the biggest matrix-multiply win. See the
-`single-cell-seurat` vignette for the full breakdown.
+`single-cell-seurat` vignette for the full breakdown (temporarily disabled).
 
 (Numbers are hardware-dependent; reproduce the UMAP shaders separately with
 `inst/examples/umap_shaders_bench.R`.)
@@ -2106,6 +2279,20 @@ cost depends on the device and driver: on an RX 9070 under RADV the f32 tiles
 ran at about a seventh of the f16 ones for large multiplies
 (`inst/examples/benchmark_coopmat.R` measures it on yours). The CPU backend is
 exact either way.
+
+## Upstream ggml version
+
+ggmlR 0.8.9.1 is synced with **ggml 0.27.0** (`ggml_version()`). Upstream code is taken function by function; where ggmlR has its own behaviour, ours is kept: 5D tensors (`ne[4]`) in CPU and Vulkan kernels, the backward kernels upstream lacks (`ggml_flash_attn_back()`, norm/GELU backward), first-index tie-breaking in argsort / top-k / argmax, and the ONNX-specific ops.
+
+What came with 0.27:
+
+- **New ops** — DeepSeek V4 / DSA: `ggml_lightning_indexer()`, hyper-connections `ggml_dsv4_hc_pre()` / `_post()` / `_comb()`, and a sparse K/V bound for flash attention `ggml_flash_attn_ext_set_n_kv_max()`. Also `ggml_conv_3d()`, `ggml_conv_3d_direct()`, `ggml_im2col_3d()`, `ggml_col2im_1d()`, `ggml_set_rows()`, `ggml_swiglu_clamp()`, `ggml_xielu()`, `ggml_expm1()`, `ggml_trunc()`, `ggml_round_even()`.
+- **Graph hints** — `ggml_mul_mat_set_hint()` (e.g. `GGML_HINT_SRC0_IS_HADAMARD`), `ggml_rope_set_offset()` for partial RoPE, `ggml_graph_order()` to add a tensor to a graph without computing it.
+- **Quantization** — new Q2_0 type (`quantize_q2_0()`, `dequantize_row_q2_0()`), with CPU and Vulkan kernels.
+- **Vulkan** — all unary ops go through one strided kernel, so views with permuted axes are computed correctly (previously only contiguous tensors were); fused unary × mul (`gelu`/`sigmoid`/`silu`/`softplus`) and RMS norm × mul; `pool_2d` on inputs past the 65535-workgroup limit; matrix–vector kernels for Q2_0, TQ1_0, TQ2_0 and IQ4_XS; asynchronous 2D tensor transfers.
+- **CPU** — tiled K-quant / IQ-quant matmul (only with `--with-simd`; disable with `GGML_CPU_TILED_MM=0`), BF16 unary and GLU ops, fused RMS norm × mul (disable with `GGML_CPU_DISABLE_FUSION=1`), `ggml_cpu_has_sme2()`. Weight repacking is compiled but left off.
+- **GGUF and backend** — GGUF reader from 0.27 with `gguf_load_raw()` (load from memory) and `gguf_tensor_ne()`; backend scheduler and allocator from 0.27. ggmlR's scheduler additionally restores the graph it was given, so the same graph can be computed repeatedly.
+- **Behaviour change** — `ggml_clamp()` now returns a new tensor; `ggml_clamp_inplace()` keeps the former in-place behaviour.
 
 ## System Requirements
 

@@ -375,12 +375,20 @@ and that choice follows from why one GPU is not enough.</p>
 <td><code>ggml_vulkan_split_mul_mat()</code></td>
 </tr>
 <tr class="even">
+<td>Graph-level TP (meta backend, experimental)</td>
+<td>Every weight of a whole graph, by a rule per tensor</td>
+<td>As TP, but for a multi-layer model without a gather after each
+matrix</td>
+<td><code>ggml_tp_forward()</code>,
+<code>ggml_meta_backend()</code></td>
+</tr>
+<tr class="odd">
 <td>Pipeline parallelism (PP)</td>
 <td>Whole layers, by depth</td>
 <td>The <strong>model</strong> does not fit on one card</td>
 <td><code>ggml_pp_forward()</code></td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td>Data parallelism (DP)</td>
 <td>The batch</td>
 <td>The model fits, you want throughput</td>
@@ -414,15 +422,21 @@ serving:</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" tabindex="-1"></a><span class="co"># llamaR — whole-LLM inference; the split happens inside the model loader</span></span>
 <span id="cb2-2"><a href="#cb2-2" tabindex="-1"></a>model <span class="ot">&lt;-</span> <span class="fu">llama_load_model</span>(<span class="st">&quot;model.gguf&quot;</span>, <span class="at">n_gpu_layers =</span> <span class="sc">-</span><span class="dv">1</span><span class="dt">L</span>,</span>
 <span id="cb2-3"><a href="#cb2-3" tabindex="-1"></a>                          <span class="at">devices =</span> <span class="fu">c</span>(<span class="st">&quot;Vulkan0&quot;</span>, <span class="st">&quot;Vulkan1&quot;</span>),</span>
-<span id="cb2-4"><a href="#cb2-4" tabindex="-1"></a>                          <span class="at">split_mode =</span> <span class="st">&quot;row&quot;</span>)     <span class="co"># or &quot;layer&quot; for pipeline</span></span></code></pre></div>
-<p>The names coincide but the code does not:
-<code>split_mode = &quot;row&quot;</code> / <code>&quot;layer&quot;</code> is llamaR’s own
-weight distribution over a real transformer, not a call into the
-<code>ggml_vulkan_split_mul_mat()</code> /
-<code>ggml_pp_forward()</code> shown below. Reach for the ggmlR
-primitives when you are building a custom parallel computation — a model
-architecture of your own, a research prototype, a non-LLM workload —
-rather than serving an existing GGUF.</p>
+<span id="cb2-4"><a href="#cb2-4" tabindex="-1"></a>                          <span class="at">split_mode =</span> <span class="st">&quot;layer&quot;</span>)   <span class="co"># or &quot;tensor&quot;</span></span></code></pre></div>
+<p><code>split_mode = &quot;layer&quot;</code> is pipeline-style: whole layers per
+card. <code>split_mode = &quot;tensor&quot;</code> is real tensor parallelism
+through ggml’s meta backend (section 4) — every weight split across the
+cards, each layer run on all of them. <code>split_mode = &quot;row&quot;</code>
+asks the backend for a row-split buffer type; Vulkan does not offer one,
+so on Vulkan <code>&quot;row&quot;</code> silently behaves like
+<code>&quot;layer&quot;</code>.</p>
+<p>None of these calls into the <code>ggml_vulkan_split_mul_mat()</code>
+/ <code>ggml_pp_forward()</code> primitives shown below;
+<code>&quot;tensor&quot;</code> shares the meta backend with
+<code>ggml_tp_forward()</code>. Reach for the ggmlR primitives when you
+are building a custom parallel computation — a model architecture of
+your own, a research prototype, a non-LLM workload — rather than serving
+an existing GGUF.</p>
 <p><code>llamaR</code> ships a full PP/TP/DP sweep over a real model in
 <code>system.file(&quot;examples&quot;, &quot;bench_pp_tp_dp.sh&quot;, package = &quot;llamaR&quot;)</code>.</p>
 </div>
@@ -491,8 +505,99 @@ outside the ggml graph.</p>
 row-split as a ggml buffer type, for callers that allocate weights
 themselves.</p>
 </div>
+<div id="graph-level-tensor-parallelism-the-meta-backend" class="section level2">
+<h2>4. Graph-level tensor parallelism: the meta backend</h2>
+<p><code>ggml_vulkan_split_mul_mat()</code> splits one matrix and
+gathers the result right away, so a two-layer model built from it pays
+two gathers. ggml’s <strong>meta backend</strong> (upstream since ggml
+0.27; experimental here) splits a whole graph instead. It wraps several
+devices into one backend and:</p>
+<ul>
+<li>lays each weight out across the devices by a rule you give per
+tensor name;</li>
+<li>runs every op on all devices at once, each on its own share, and
+works out from the op how its result is laid out;</li>
+<li>inserts a cross-device reduction only where a result has to be
+combined.</li>
+</ul>
+<p>The classic case is the Megatron MLP: split the first weight by its
+output features and the second by its input features. The hidden
+activation then stays split between the two layers, and the only
+reduction is after the second one.</p>
+<p>Shapes follow ggml: an R array’s <code>dim()</code> is the tensor’s
+<code>ne</code>, fastest dimension first. A weight with
+<code>dim = c(n_in, n_out)</code> and an input with
+<code>dim = c(n_in, batch)</code> give
+<code>ggml_mul_mat(ctx, w, input)</code> of shape
+<code>c(n_out, batch)</code> — <code>t(W) %*% x</code> in R terms. The
+split rules name a ggml axis: <code>&quot;rows&quot;</code> is <code>ne[1]</code>
+(here: output features), <code>&quot;cols&quot;</code> is <code>ne[0]</code>
+(input features).</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a>n_in <span class="ot">&lt;-</span> <span class="dv">512</span><span class="dt">L</span>; n_hid <span class="ot">&lt;-</span> <span class="dv">2048</span><span class="dt">L</span>; n_out <span class="ot">&lt;-</span> <span class="dv">512</span><span class="dt">L</span>; batch <span class="ot">&lt;-</span> <span class="dv">16</span><span class="dt">L</span></span>
+<span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a>W1 <span class="ot">&lt;-</span> <span class="fu">array</span>(<span class="fu">rnorm</span>(n_in <span class="sc">*</span> n_hid),  <span class="fu">c</span>(n_in,  n_hid))</span>
+<span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a>W2 <span class="ot">&lt;-</span> <span class="fu">array</span>(<span class="fu">rnorm</span>(n_hid <span class="sc">*</span> n_out), <span class="fu">c</span>(n_hid, n_out))</span>
+<span id="cb6-4"><a href="#cb6-4" tabindex="-1"></a>X  <span class="ot">&lt;-</span> <span class="fu">array</span>(<span class="fu">rnorm</span>(n_in <span class="sc">*</span> batch),  <span class="fu">c</span>(n_in,  batch))</span>
+<span id="cb6-5"><a href="#cb6-5" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" tabindex="-1"></a>mlp <span class="ot">&lt;-</span> <span class="cf">function</span>(ctx, input, w)          <span class="co"># w: the weight tensors, by name</span></span>
+<span id="cb6-7"><a href="#cb6-7" tabindex="-1"></a>  <span class="fu">ggml_mul_mat</span>(ctx, w<span class="sc">$</span>w2, <span class="fu">ggml_relu</span>(ctx, <span class="fu">ggml_mul_mat</span>(ctx, w<span class="sc">$</span>w1, input)))</span>
+<span id="cb6-8"><a href="#cb6-8" tabindex="-1"></a></span>
+<span id="cb6-9"><a href="#cb6-9" tabindex="-1"></a>Y <span class="ot">&lt;-</span> <span class="fu">ggml_tp_forward</span>(</span>
+<span id="cb6-10"><a href="#cb6-10" tabindex="-1"></a>  <span class="at">weights =</span> <span class="fu">list</span>(<span class="at">w1 =</span> W1, <span class="at">w2 =</span> W2),            <span class="co"># names are what `split` refers to</span></span>
+<span id="cb6-11"><a href="#cb6-11" tabindex="-1"></a>  <span class="at">forward =</span> mlp,</span>
+<span id="cb6-12"><a href="#cb6-12" tabindex="-1"></a>  <span class="at">x       =</span> X,                                 <span class="co"># the input tensor is named &quot;input&quot;</span></span>
+<span id="cb6-13"><a href="#cb6-13" tabindex="-1"></a>  <span class="at">devices =</span> <span class="fu">c</span>(<span class="dv">0</span><span class="dt">L</span>, <span class="dv">1</span><span class="dt">L</span>),</span>
+<span id="cb6-14"><a href="#cb6-14" tabindex="-1"></a>  <span class="at">split   =</span> <span class="fu">list</span>(<span class="at">w1 =</span> <span class="st">&quot;rows&quot;</span>, <span class="at">w2 =</span> <span class="st">&quot;cols&quot;</span>))</span>
+<span id="cb6-15"><a href="#cb6-15" tabindex="-1"></a></span>
+<span id="cb6-16"><a href="#cb6-16" tabindex="-1"></a><span class="fu">max</span>(<span class="fu">abs</span>(Y <span class="sc">-</span> <span class="fu">t</span>(W2) <span class="sc">%*%</span> <span class="fu">pmax</span>(<span class="fu">t</span>(W1) <span class="sc">%*%</span> X, <span class="dv">0</span>)))</span></code></pre></div>
+<p>Rules are <code>&quot;mirror&quot;</code> (the default: a full copy on each
+device), <code>&quot;rows&quot;</code>, <code>&quot;cols&quot;</code>, <code>&quot;axis2&quot;</code>,
+<code>&quot;axis3&quot;</code>, or
+<code>list(axis = &quot;rows&quot;, weights = c(0.7, 0.3))</code> for uneven
+cards; <code>split</code> may also be a <code>function(name, ne)</code>.
+A rule that cannot apply — the axis is shorter than the number of
+devices — falls back to <code>&quot;mirror&quot;</code> for that tensor with a
+warning.</p>
+<p><code>devices</code> takes Vulkan ids, device names
+(<code>&quot;Vulkan0&quot;</code>, <code>&quot;CPU&quot;</code>) or device pointers, and may
+list the same device twice. That is how to try the API on one GPU, or
+with no GPU at all:</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a>Y <span class="ot">&lt;-</span> <span class="fu">ggml_tp_forward</span>(<span class="fu">list</span>(<span class="at">w1 =</span> W1, <span class="at">w2 =</span> W2), mlp, X,</span>
+<span id="cb7-2"><a href="#cb7-2" tabindex="-1"></a>                     <span class="at">devices =</span> <span class="fu">c</span>(<span class="st">&quot;CPU&quot;</span>, <span class="st">&quot;CPU&quot;</span>),</span>
+<span id="cb7-3"><a href="#cb7-3" tabindex="-1"></a>                     <span class="at">split =</span> <span class="fu">list</span>(<span class="at">w1 =</span> <span class="st">&quot;rows&quot;</span>, <span class="at">w2 =</span> <span class="st">&quot;cols&quot;</span>))</span></code></pre></div>
+<p>For a graph you drive yourself — a scheduler, repeated computes,
+several outputs — use the backend directly:</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" tabindex="-1"></a>meta  <span class="ot">&lt;-</span> <span class="fu">ggml_meta_backend</span>(<span class="fu">c</span>(<span class="dv">0</span><span class="dt">L</span>, <span class="dv">1</span><span class="dt">L</span>), <span class="at">split =</span> <span class="fu">list</span>(<span class="at">w1 =</span> <span class="st">&quot;rows&quot;</span>, <span class="at">w2 =</span> <span class="st">&quot;cols&quot;</span>))</span>
+<span id="cb8-2"><a href="#cb8-2" tabindex="-1"></a>sched <span class="ot">&lt;-</span> <span class="fu">ggml_backend_sched_new</span>(<span class="fu">list</span>(meta, <span class="fu">ggml_backend_cpu_init</span>()))</span>
+<span id="cb8-3"><a href="#cb8-3" tabindex="-1"></a><span class="co"># Weights (and inputs) in a context allocated on `meta`:</span></span>
+<span id="cb8-4"><a href="#cb8-4" tabindex="-1"></a><span class="co">#   buf &lt;- ggml_backend_alloc_ctx_tensors(ctx_w, meta)</span></span>
+<span id="cb8-5"><a href="#cb8-5" tabindex="-1"></a><span class="co"># The graph in a SEPARATE context, allocated through the scheduler:</span></span>
+<span id="cb8-6"><a href="#cb8-6" tabindex="-1"></a><span class="co">#   ggml_backend_sched_alloc_graph(sched, gf); ggml_backend_sched_graph_compute(sched, gf)</span></span></code></pre></div>
+<p>Keep the two contexts apart. The meta backend asks for a rule for
+every tensor in a buffer allocated on it; an intermediate result that
+ended up there would be laid out by its name rather than by the op that
+produced it. <code>ggml_backend_meta_device()</code> is the raw API
+underneath, with a callback that returns numeric axis codes
+(<code>GGML_SPLIT_AXIS_*</code>).</p>
+<p>One more rule for a graph you drive yourself: a matrix product whose
+inputs are both split along the reduced axis (<code>&quot;cols&quot;</code> on the
+weight and on its input) leaves per-device partial sums. The meta
+backend reduces them before their first consumer, but never after the
+graph’s last node, and cannot read them back — so do not read such a
+tensor, and do not end a graph with one. <code>ggml_tp_forward()</code>
+appends a trivial consumer for you.</p>
+<p><strong>What it costs.</strong> Vulkan has no device-to-device
+all-reduce, so the meta backend’s reductions copy through host RAM — the
+same host-staging transport as the rest of this vignette (section 2).
+Graph-level TP moves less data than
+<code>ggml_vulkan_split_mul_mat()</code> layer by layer, but it still
+pays off only when the model does not fit on one card.</p>
+<p><strong>Status.</strong> Forward graphs only:
+<code>ggml_fit()</code>, the autograd engine and ONNX models do not run
+on it. Not yet measured on real multi-GPU hardware. llamaR reaches the
+same backend through <code>split_mode = &quot;tensor&quot;</code>.</p>
+</div>
 <div id="pipeline-parallelism" class="section level2">
-<h2>4. Pipeline parallelism</h2>
+<h2>5. Pipeline parallelism</h2>
 <p>PP assigns <em>layers</em> to devices: GPU 0 runs stages 1–16, GPU 1
 runs 17–32, and exactly one activation tensor crosses between them. Each
 stage is described by a list with its <code>device</code>, its
@@ -501,51 +606,51 @@ the sub-graph and returns a <code>set_weights</code> closure.</p>
 <p>The one non-obvious rule: <strong>weights are set after
 allocation</strong>, which is why <code>build</code> returns
 <code>set_weights</code> instead of filling tensors immediately.</p>
-<div class="sourceCode" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" tabindex="-1"></a>K <span class="ot">&lt;-</span> <span class="dv">64</span><span class="dt">L</span>; M <span class="ot">&lt;-</span> <span class="dv">8</span><span class="dt">L</span></span>
-<span id="cb6-2"><a href="#cb6-2" tabindex="-1"></a>W1 <span class="ot">&lt;-</span> <span class="fu">matrix</span>(<span class="fu">rnorm</span>(K <span class="sc">*</span> K), <span class="at">nrow =</span> K)</span>
-<span id="cb6-3"><a href="#cb6-3" tabindex="-1"></a>W2 <span class="ot">&lt;-</span> <span class="fu">matrix</span>(<span class="fu">rnorm</span>(K <span class="sc">*</span> K), <span class="at">nrow =</span> K)</span>
-<span id="cb6-4"><a href="#cb6-4" tabindex="-1"></a>X  <span class="ot">&lt;-</span> <span class="fu">matrix</span>(<span class="fu">rnorm</span>(K <span class="sc">*</span> M), <span class="at">nrow =</span> K)     <span class="co"># ggml ne = c(K, M): column m is sample m</span></span>
-<span id="cb6-5"><a href="#cb6-5" tabindex="-1"></a></span>
-<span id="cb6-6"><a href="#cb6-6" tabindex="-1"></a>make_stage <span class="ot">&lt;-</span> <span class="cf">function</span>(dev, Wt, relu) {</span>
-<span id="cb6-7"><a href="#cb6-7" tabindex="-1"></a>  <span class="fu">list</span>(</span>
-<span id="cb6-8"><a href="#cb6-8" tabindex="-1"></a>    <span class="at">device   =</span> dev,</span>
-<span id="cb6-9"><a href="#cb6-9" tabindex="-1"></a>    <span class="at">in_shape =</span> <span class="fu">c</span>(K, M),</span>
-<span id="cb6-10"><a href="#cb6-10" tabindex="-1"></a>    <span class="at">build =</span> <span class="cf">function</span>(ctx, input) {</span>
-<span id="cb6-11"><a href="#cb6-11" tabindex="-1"></a>      w <span class="ot">&lt;-</span> <span class="fu">ggml_new_tensor_2d</span>(ctx, GGML_TYPE_F32, K, K)</span>
-<span id="cb6-12"><a href="#cb6-12" tabindex="-1"></a>      z <span class="ot">&lt;-</span> <span class="fu">ggml_mul_mat</span>(ctx, w, input)     <span class="co"># == t(Wt) %*% input in R terms</span></span>
-<span id="cb6-13"><a href="#cb6-13" tabindex="-1"></a>      <span class="fu">list</span>(</span>
-<span id="cb6-14"><a href="#cb6-14" tabindex="-1"></a>        <span class="at">output      =</span> <span class="cf">if</span> (relu) <span class="fu">ggml_relu</span>(ctx, z) <span class="cf">else</span> z,</span>
-<span id="cb6-15"><a href="#cb6-15" tabindex="-1"></a>        <span class="at">set_weights =</span> <span class="cf">function</span>() <span class="fu">ggml_backend_tensor_set_data</span>(w, <span class="fu">as.numeric</span>(Wt))</span>
-<span id="cb6-16"><a href="#cb6-16" tabindex="-1"></a>      )</span>
-<span id="cb6-17"><a href="#cb6-17" tabindex="-1"></a>    })</span>
-<span id="cb6-18"><a href="#cb6-18" tabindex="-1"></a>}</span>
-<span id="cb6-19"><a href="#cb6-19" tabindex="-1"></a></span>
-<span id="cb6-20"><a href="#cb6-20" tabindex="-1"></a>stages <span class="ot">&lt;-</span> <span class="fu">list</span>(<span class="fu">make_stage</span>(<span class="dv">0</span><span class="dt">L</span>, W1, <span class="at">relu =</span> <span class="cn">TRUE</span>),</span>
-<span id="cb6-21"><a href="#cb6-21" tabindex="-1"></a>               <span class="fu">make_stage</span>(<span class="dv">1</span><span class="dt">L</span>, W2, <span class="at">relu =</span> <span class="cn">FALSE</span>))</span>
-<span id="cb6-22"><a href="#cb6-22" tabindex="-1"></a></span>
-<span id="cb6-23"><a href="#cb6-23" tabindex="-1"></a>y <span class="ot">&lt;-</span> <span class="fu">ggml_pp_forward</span>(stages, <span class="at">x =</span> <span class="fu">as.numeric</span>(X), <span class="at">out_shape =</span> <span class="fu">c</span>(K, M))</span>
-<span id="cb6-24"><a href="#cb6-24" tabindex="-1"></a>Y <span class="ot">&lt;-</span> <span class="fu">matrix</span>(y, <span class="at">nrow =</span> K, <span class="at">ncol =</span> M)</span>
-<span id="cb6-25"><a href="#cb6-25" tabindex="-1"></a></span>
-<span id="cb6-26"><a href="#cb6-26" tabindex="-1"></a><span class="fu">max</span>(<span class="fu">abs</span>(Y <span class="sc">-</span> <span class="fu">t</span>(W2) <span class="sc">%*%</span> <span class="fu">pmax</span>(<span class="fu">t</span>(W1) <span class="sc">%*%</span> X, <span class="dv">0</span>)))   <span class="co"># ~1.8e-5</span></span></code></pre></div>
+<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a>K <span class="ot">&lt;-</span> <span class="dv">64</span><span class="dt">L</span>; M <span class="ot">&lt;-</span> <span class="dv">8</span><span class="dt">L</span></span>
+<span id="cb9-2"><a href="#cb9-2" tabindex="-1"></a>W1 <span class="ot">&lt;-</span> <span class="fu">matrix</span>(<span class="fu">rnorm</span>(K <span class="sc">*</span> K), <span class="at">nrow =</span> K)</span>
+<span id="cb9-3"><a href="#cb9-3" tabindex="-1"></a>W2 <span class="ot">&lt;-</span> <span class="fu">matrix</span>(<span class="fu">rnorm</span>(K <span class="sc">*</span> K), <span class="at">nrow =</span> K)</span>
+<span id="cb9-4"><a href="#cb9-4" tabindex="-1"></a>X  <span class="ot">&lt;-</span> <span class="fu">matrix</span>(<span class="fu">rnorm</span>(K <span class="sc">*</span> M), <span class="at">nrow =</span> K)     <span class="co"># ggml ne = c(K, M): column m is sample m</span></span>
+<span id="cb9-5"><a href="#cb9-5" tabindex="-1"></a></span>
+<span id="cb9-6"><a href="#cb9-6" tabindex="-1"></a>make_stage <span class="ot">&lt;-</span> <span class="cf">function</span>(dev, Wt, relu) {</span>
+<span id="cb9-7"><a href="#cb9-7" tabindex="-1"></a>  <span class="fu">list</span>(</span>
+<span id="cb9-8"><a href="#cb9-8" tabindex="-1"></a>    <span class="at">device   =</span> dev,</span>
+<span id="cb9-9"><a href="#cb9-9" tabindex="-1"></a>    <span class="at">in_shape =</span> <span class="fu">c</span>(K, M),</span>
+<span id="cb9-10"><a href="#cb9-10" tabindex="-1"></a>    <span class="at">build =</span> <span class="cf">function</span>(ctx, input) {</span>
+<span id="cb9-11"><a href="#cb9-11" tabindex="-1"></a>      w <span class="ot">&lt;-</span> <span class="fu">ggml_new_tensor_2d</span>(ctx, GGML_TYPE_F32, K, K)</span>
+<span id="cb9-12"><a href="#cb9-12" tabindex="-1"></a>      z <span class="ot">&lt;-</span> <span class="fu">ggml_mul_mat</span>(ctx, w, input)     <span class="co"># == t(Wt) %*% input in R terms</span></span>
+<span id="cb9-13"><a href="#cb9-13" tabindex="-1"></a>      <span class="fu">list</span>(</span>
+<span id="cb9-14"><a href="#cb9-14" tabindex="-1"></a>        <span class="at">output      =</span> <span class="cf">if</span> (relu) <span class="fu">ggml_relu</span>(ctx, z) <span class="cf">else</span> z,</span>
+<span id="cb9-15"><a href="#cb9-15" tabindex="-1"></a>        <span class="at">set_weights =</span> <span class="cf">function</span>() <span class="fu">ggml_backend_tensor_set_data</span>(w, <span class="fu">as.numeric</span>(Wt))</span>
+<span id="cb9-16"><a href="#cb9-16" tabindex="-1"></a>      )</span>
+<span id="cb9-17"><a href="#cb9-17" tabindex="-1"></a>    })</span>
+<span id="cb9-18"><a href="#cb9-18" tabindex="-1"></a>}</span>
+<span id="cb9-19"><a href="#cb9-19" tabindex="-1"></a></span>
+<span id="cb9-20"><a href="#cb9-20" tabindex="-1"></a>stages <span class="ot">&lt;-</span> <span class="fu">list</span>(<span class="fu">make_stage</span>(<span class="dv">0</span><span class="dt">L</span>, W1, <span class="at">relu =</span> <span class="cn">TRUE</span>),</span>
+<span id="cb9-21"><a href="#cb9-21" tabindex="-1"></a>               <span class="fu">make_stage</span>(<span class="dv">1</span><span class="dt">L</span>, W2, <span class="at">relu =</span> <span class="cn">FALSE</span>))</span>
+<span id="cb9-22"><a href="#cb9-22" tabindex="-1"></a></span>
+<span id="cb9-23"><a href="#cb9-23" tabindex="-1"></a>y <span class="ot">&lt;-</span> <span class="fu">ggml_pp_forward</span>(stages, <span class="at">x =</span> <span class="fu">as.numeric</span>(X), <span class="at">out_shape =</span> <span class="fu">c</span>(K, M))</span>
+<span id="cb9-24"><a href="#cb9-24" tabindex="-1"></a>Y <span class="ot">&lt;-</span> <span class="fu">matrix</span>(y, <span class="at">nrow =</span> K, <span class="at">ncol =</span> M)</span>
+<span id="cb9-25"><a href="#cb9-25" tabindex="-1"></a></span>
+<span id="cb9-26"><a href="#cb9-26" tabindex="-1"></a><span class="fu">max</span>(<span class="fu">abs</span>(Y <span class="sc">-</span> <span class="fu">t</span>(W2) <span class="sc">%*%</span> <span class="fu">pmax</span>(<span class="fu">t</span>(W1) <span class="sc">%*%</span> X, <span class="dv">0</span>)))   <span class="co"># ~1.8e-5</span></span></code></pre></div>
 </div>
 <div id="hybrid-dp-over-tp-or-pp" class="section level2">
-<h2>5. Hybrid: DP over TP or PP</h2>
+<h2>6. Hybrid: DP over TP or PP</h2>
 <p>With four GPUs, two replicas of TP=2 usually beat one TP=4 group: DP
 adds no cross-device traffic, so the hybrid <em>hides</em> the weakness
 of host-staging.</p>
-<div class="sourceCode" id="cb7"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb7-1"><a href="#cb7-1" tabindex="-1"></a><span class="co"># Replica A = {GPU0, GPU1}, replica B = {GPU2, GPU3}.</span></span>
-<span id="cb7-2"><a href="#cb7-2" tabindex="-1"></a><span class="co"># Each replica takes half the batch; no traffic crosses between replicas.</span></span>
-<span id="cb7-3"><a href="#cb7-3" tabindex="-1"></a>Y <span class="ot">&lt;-</span> <span class="fu">ggml_tp_dp_forward</span>(W, X, <span class="at">replicas =</span> <span class="fu">list</span>(<span class="fu">c</span>(<span class="dv">0</span><span class="dt">L</span>, <span class="dv">1</span><span class="dt">L</span>), <span class="fu">c</span>(<span class="dv">2</span><span class="dt">L</span>, <span class="dv">3</span><span class="dt">L</span>)))</span>
-<span id="cb7-4"><a href="#cb7-4" tabindex="-1"></a></span>
-<span id="cb7-5"><a href="#cb7-5" tabindex="-1"></a><span class="co"># The PP equivalent takes a factory: make_stages(devices, m_shard) -&gt; stage list</span></span>
-<span id="cb7-6"><a href="#cb7-6" tabindex="-1"></a>Y <span class="ot">&lt;-</span> <span class="fu">ggml_pp_dp_forward</span>(make_stages, x, <span class="at">replicas =</span> <span class="fu">list</span>(<span class="fu">c</span>(<span class="dv">0</span><span class="dt">L</span>, <span class="dv">1</span><span class="dt">L</span>), <span class="fu">c</span>(<span class="dv">2</span><span class="dt">L</span>, <span class="dv">3</span><span class="dt">L</span>)),</span>
-<span id="cb7-7"><a href="#cb7-7" tabindex="-1"></a>                        <span class="at">out_ncol =</span> M)</span></code></pre></div>
+<div class="sourceCode" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a><span class="co"># Replica A = {GPU0, GPU1}, replica B = {GPU2, GPU3}.</span></span>
+<span id="cb10-2"><a href="#cb10-2" tabindex="-1"></a><span class="co"># Each replica takes half the batch; no traffic crosses between replicas.</span></span>
+<span id="cb10-3"><a href="#cb10-3" tabindex="-1"></a>Y <span class="ot">&lt;-</span> <span class="fu">ggml_tp_dp_forward</span>(W, X, <span class="at">replicas =</span> <span class="fu">list</span>(<span class="fu">c</span>(<span class="dv">0</span><span class="dt">L</span>, <span class="dv">1</span><span class="dt">L</span>), <span class="fu">c</span>(<span class="dv">2</span><span class="dt">L</span>, <span class="dv">3</span><span class="dt">L</span>)))</span>
+<span id="cb10-4"><a href="#cb10-4" tabindex="-1"></a></span>
+<span id="cb10-5"><a href="#cb10-5" tabindex="-1"></a><span class="co"># The PP equivalent takes a factory: make_stages(devices, m_shard) -&gt; stage list</span></span>
+<span id="cb10-6"><a href="#cb10-6" tabindex="-1"></a>Y <span class="ot">&lt;-</span> <span class="fu">ggml_pp_dp_forward</span>(make_stages, x, <span class="at">replicas =</span> <span class="fu">list</span>(<span class="fu">c</span>(<span class="dv">0</span><span class="dt">L</span>, <span class="dv">1</span><span class="dt">L</span>), <span class="fu">c</span>(<span class="dv">2</span><span class="dt">L</span>, <span class="dv">3</span><span class="dt">L</span>)),</span>
+<span id="cb10-7"><a href="#cb10-7" tabindex="-1"></a>                        <span class="at">out_ncol =</span> M)</span></code></pre></div>
 <p>For multi-GPU <em>training</em> rather than inference, use
 <code>dp_train()</code> — see
 <code>vignette(&quot;data-parallel-training&quot;)</code>.</p>
 </div>
 <div id="clean-shutdown-and-the---enable-hard-exit-flag" class="section level2">
-<h2>6. Clean shutdown (and the <code>--enable-hard-exit</code>
+<h2>7. Clean shutdown (and the <code>--enable-hard-exit</code>
 flag)</h2>
 <p>A multi-GPU script can segfault <strong>after</strong> it has printed
 its results. The cause is a race at process exit: the Vulkan loader and
@@ -557,25 +662,25 @@ it turns a successful run into a non-zero exit code.</p>
 <em>while the loader is still mapped</em>. It is idempotent, safe
 mid-session, and Vulkan transparently re-initializes on the next
 operation:</p>
-<div class="sourceCode" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" tabindex="-1"></a><span class="fu">ggml_vulkan_shutdown</span>()     <span class="co"># safe anywhere; releases devices</span></span></code></pre></div>
+<div class="sourceCode" id="cb11"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" tabindex="-1"></a><span class="fu">ggml_vulkan_shutdown</span>()     <span class="co"># safe anywhere; releases devices</span></span></code></pre></div>
 <p>That narrows the race but does not close it: no R exit hook runs
 before R unmaps the loader. For a guaranteed-clean exit, make
 <code>hard = TRUE</code> the <strong>last</strong> statement of a
 standalone script — after teardown it calls <code>_exit(status)</code>,
 terminating immediately without running exit handlers or unmapping
 libraries, so there is no teardown phase left to crash.</p>
-<div class="sourceCode" id="cb9"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb9-1"><a href="#cb9-1" tabindex="-1"></a><span class="fu">ggml_vulkan_shutdown</span>(<span class="at">hard =</span> <span class="cn">TRUE</span>, <span class="at">status =</span> <span class="dv">0</span><span class="dt">L</span>)   <span class="co"># never returns</span></span></code></pre></div>
+<div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" tabindex="-1"></a><span class="fu">ggml_vulkan_shutdown</span>(<span class="at">hard =</span> <span class="cn">TRUE</span>, <span class="at">status =</span> <span class="dv">0</span><span class="dt">L</span>)   <span class="co"># never returns</span></span></code></pre></div>
 <p><strong>This path is compiled out by default.</strong> CRAN
 Repository Policy forbids a package from terminating the user’s R
 session, so the released package must not link <code>_exit()</code>. In
 a default build, <code>hard = TRUE</code> performs the normal teardown
 and emits a <code>warning()</code> — it is never silently ignored.
 Compile it in with:</p>
-<div class="sourceCode" id="cb10"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" tabindex="-1"></a><span class="ex">R</span> CMD INSTALL . <span class="at">--configure-args</span><span class="op">=</span><span class="st">&quot;--enable-hard-exit&quot;</span></span></code></pre></div>
+<div class="sourceCode" id="cb13"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" tabindex="-1"></a><span class="ex">R</span> CMD INSTALL . <span class="at">--configure-args</span><span class="op">=</span><span class="st">&quot;--enable-hard-exit&quot;</span></span></code></pre></div>
 <p>On Windows R ignores <code>configure.args</code>; set
 <code>Sys.setenv(GGML_VK_HARD_EXIT = &quot;1&quot;)</code> before installing from
 source. Check what the current build has:</p>
-<div class="sourceCode" id="cb11"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb11-1"><a href="#cb11-1" tabindex="-1"></a><span class="fu">ggml_vulkan_hard_exit_available</span>()</span></code></pre></div>
+<div class="sourceCode" id="cb14"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" tabindex="-1"></a><span class="fu">ggml_vulkan_hard_exit_available</span>()</span></code></pre></div>
 <p>Two caveats. <code>hard = TRUE</code> bypasses R’s shutdown entirely:
 no <code>.RData</code>, no <code>on.exit()</code> handlers, no flushed
 connections beyond what ggmlR flushes itself. Use it only as the final
@@ -586,11 +691,11 @@ specific to multiple GPUs; single-GPU runs simply have not been seen to
 trip it.</p>
 </div>
 <div id="where-to-look-next" class="section level2">
-<h2>7. Where to look next</h2>
+<h2>8. Where to look next</h2>
 <p>Runnable demos ship with the package, under
 <code>system.file(&quot;examples&quot;, package = &quot;ggmlR&quot;)</code>:</p>
-<div class="sourceCode" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" tabindex="-1"></a><span class="fu">list.files</span>(<span class="fu">system.file</span>(<span class="st">&quot;examples&quot;</span>, <span class="at">package =</span> <span class="st">&quot;ggmlR&quot;</span>),</span>
-<span id="cb12-2"><a href="#cb12-2" tabindex="-1"></a>           <span class="at">pattern =</span> <span class="st">&quot;^(tp_|pp_|multi_gpu|dp_)&quot;</span>)</span></code></pre></div>
+<div class="sourceCode" id="cb15"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb15-1"><a href="#cb15-1" tabindex="-1"></a><span class="fu">list.files</span>(<span class="fu">system.file</span>(<span class="st">&quot;examples&quot;</span>, <span class="at">package =</span> <span class="st">&quot;ggmlR&quot;</span>),</span>
+<span id="cb15-2"><a href="#cb15-2" tabindex="-1"></a>           <span class="at">pattern =</span> <span class="st">&quot;^(tp_|pp_|multi_gpu|dp_)&quot;</span>)</span></code></pre></div>
 <ul>
 <li><code>multi_gpu_example.R</code> — device discovery and per-device
 work</li>
@@ -607,13 +712,16 @@ when fewer than two GPUs are present:</p>
 <li><code>tests/testthat/test-vulkan-tensor-parallel.R</code> — split
 math, <code>split_mul_mat</code>, buffer-type factory, TP×DP and PP
 forwards</li>
+<li><code>tests/testthat/test-meta-backend-compute.R</code> — meta
+backend: compute against the plain CPU on 2×CPU and 2× the same GPU,
+<code>ggml_meta_backend()</code>, <code>ggml_tp_forward()</code></li>
 <li><code>tests/testthat/test-vulkan.R</code>,
 <code>test-vulkan-caps.R</code> — backend and capabilities</li>
 </ul>
 </div>
 <div id="summary" class="section level2">
-<h2>8. Summary</h2>
-<div class="sourceCode" id="cb13"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb13-1"><a href="#cb13-1" tabindex="-1"></a><span class="fu">ggml_vulkan_status</span>()</span></code></pre></div>
+<h2>9. Summary</h2>
+<div class="sourceCode" id="cb16"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" tabindex="-1"></a><span class="fu">ggml_vulkan_status</span>()</span></code></pre></div>
 <p>Choose PP when the model does not fit, TP when a layer does not fit
 or latency matters, DP for throughput — and remember that on current
 NVIDIA hardware every cross-device byte goes through host RAM, so the

@@ -191,7 +191,7 @@
 #'   with \code{\link{ggml_freeze_bn_stats}}. Creating a trainer for a model
 #'   with unfixed batch-norm layers warns once.
 #' @export
-#' @family optimization
+#' @seealso \link{ggmlR-optimization}
 #' @seealso \code{\link{ggml_fit_opt_gen}} for a generator-driven epoch loop,
 #'   \code{\link{ggml_fit}} for the ordinary in-memory path.
 #' @examples
@@ -553,7 +553,7 @@ print.ggml_trainer <- function(x, ...) {
     stats::setNames(lapply(m$layers, function(l) l$weights),
                     sprintf("%04d", seq_along(m$layers)))
   } else {
-    m$node_weights
+    m[["node_weights"]]   # [[ ]]: $ would partially match node_weights_data
   }
   out  <- list()
   seen <- list()
@@ -602,7 +602,7 @@ print.ggml_trainer <- function(x, ...) {
 #' @param model A snapshot from \code{$snapshot()}
 #' @return \code{NULL}, invisibly.
 #' @export
-#' @family optimization
+#' @seealso \link{ggmlR-optimization}
 #' @seealso \code{\link{ggml_trainer}}
 ggml_snapshot_free <- function(model) {
   if (is.null(model$snapshot_state)) {

@@ -241,7 +241,7 @@
 #' @return A history data frame, one row per epoch, as
 #'   \code{\link{ggml_fit_opt}} returns.
 #' @export
-#' @family optimization
+#' @seealso \link{ggmlR-optimization}
 #' @seealso \code{\link{ggml_fit_opt}} for the in-memory dataset path.
 ggml_fit_opt_gen <- function(sched, ctx_compute, inputs, outputs, generator,
                              steps_per_epoch = NULL,
@@ -320,6 +320,7 @@ ggml_fit_opt_gen <- function(sched, ctx_compute, inputs, outputs, generator,
 
   hist <- vector("list", epochs)
 
+  .ggml_cb_train_begin(callbacks, state)
   for (k in seq_len(epochs)) {
     # Callbacks and LR schedules see the shifted number; the history rows carry
     # it too, so resuming a run continues the curve rather than restarting it.

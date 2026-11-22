@@ -77,14 +77,12 @@ check_out_prod <- function(ne00, ne01, ne02, ne03, ne10, ne12, ne13,
 }
 
 test_that("out_prod matches between CPU and GPU, contiguous", {
-  skip_on_cran()
   skip_no_gpu_op()
   check_out_prod(ne00 = 8L, ne01 = 5L, ne02 = 1L, ne03 = 1L,
                  ne10 = 4L, ne12 = 1L, ne13 = 1L)
 })
 
 test_that("out_prod matches on a larger contiguous case", {
-  skip_on_cran()
   skip_no_gpu_op()
   check_out_prod(ne00 = 64L, ne01 = 33L, ne02 = 1L, ne03 = 1L,
                  ne10 = 17L, ne12 = 1L, ne13 = 1L, seed = 7)
@@ -92,14 +90,12 @@ test_that("out_prod matches on a larger contiguous case", {
 
 test_that("out_prod matches with a transposed src1", {
   # The layout the second mul_mat gradient produces -- ggml_transpose(grad).
-  skip_on_cran()
   skip_no_gpu_op()
   check_out_prod(ne00 = 8L, ne01 = 5L, ne02 = 1L, ne03 = 1L,
                  ne10 = 4L, ne12 = 1L, ne13 = 1L, transpose_b = TRUE)
 })
 
 test_that("out_prod matches across dims 2 and 3", {
-  skip_on_cran()
   skip_no_gpu_op()
   check_out_prod(ne00 = 6L, ne01 = 4L, ne02 = 3L, ne03 = 2L,
                  ne10 = 5L, ne12 = 3L, ne13 = 2L, seed = 11)
@@ -107,7 +103,6 @@ test_that("out_prod matches across dims 2 and 3", {
 
 test_that("out_prod matches when dims 2/3 broadcast", {
   # Grouped-query attention: several dst slices share one src0 slice.
-  skip_on_cran()
   skip_no_gpu_op()
   check_out_prod(ne00 = 6L, ne01 = 4L, ne02 = 1L, ne03 = 1L,
                  ne10 = 5L, ne12 = 2L, ne13 = 2L, seed = 13)
@@ -127,7 +122,6 @@ for (cs in list(
   list(nm = "multi-tile with dims 2/3 broadcast", d = c(40L, 50L, 1L, 1L, 36L, 2L, 2L))))
   for (tb in c(FALSE, TRUE)) {
     test_that(sprintf("tiled out_prod: %s%s", cs$nm, if (tb) ", src1 transposed" else ""), {
-      skip_on_cran()
       skip_no_gpu_op()
       d <- cs$d
       check_out_prod(ne00 = d[1], ne01 = d[2], ne02 = d[3], ne03 = d[4],
@@ -136,12 +130,41 @@ for (cs in list(
     })
   }
 
+# The ne1 == 1 variant (one dst column: the bias gradient out_prod(g, ones),
+# matrix-vector): 32 rows per workgroup, K split over 8 lanes added in a fixed
+# order. Rows under, on and across a workgroup; K under, on and not a multiple
+# of the lane count; long K; dims 2/3 and broadcast; both src1 layouts.
+for (cs in list(
+  list(nm = "bias gradient 64 x 1, k = 256",   d = c(64L, 256L, 1L, 1L, 1L, 1L, 1L)),
+  list(nm = "rows under one group, k < lanes", d = c(5L, 3L, 1L, 1L, 1L, 1L, 1L)),
+  list(nm = "rows across groups, k ragged",    d = c(33L, 77L, 1L, 1L, 1L, 1L, 1L)),
+  list(nm = "long k = 4096",                   d = c(64L, 4096L, 1L, 1L, 1L, 1L, 1L)),
+  list(nm = "dims 2 and 3",                    d = c(40L, 50L, 3L, 2L, 1L, 3L, 2L)),
+  list(nm = "dims 2/3 broadcast",              d = c(40L, 50L, 1L, 1L, 1L, 2L, 2L))))
+  for (tb in c(FALSE, TRUE)) {
+    test_that(sprintf("out_prod ne1 == 1: %s%s", cs$nm, if (tb) ", src1 transposed" else ""), {
+      skip_no_gpu_op()
+      d <- cs$d
+      check_out_prod(ne00 = d[1], ne01 = d[2], ne02 = d[3], ne03 = d[4],
+                     ne10 = d[5], ne12 = d[6], ne13 = d[7], transpose_b = tb,
+                     tol = 1e-4 * sqrt(d[2]) * 10, seed = 19)
+    })
+  }
+
+test_that("out_prod ne1 == 1 is deterministic run to run", {
+  skip_no_gpu_op()
+  set.seed(23)
+  a <- rnorm(64 * 1000); b <- rnorm(1000)
+  r1 <- run_out_prod(TRUE, a, b, 64L, 1000L, 1L, 1L, 1L, 1L, 1L)
+  r2 <- run_out_prod(TRUE, a, b, 64L, 1000L, 1L, 1L, 1L, 1L, 1L)
+  expect_identical(r1, r2)
+})
+
 test_that("a dense layer trains identically on CPU and GPU", {
   # The end-to-end reason this shader exists: mul_mat's gradients go through
   # out_prod, so a plain dense model exercises it on every step. If the shader
   # were wrong, the two backends would diverge here even though each looks
   # self-consistent.
-  skip_on_cran()
   skip_no_gpu_op()
 
   set.seed(5)
@@ -230,7 +253,6 @@ check_ce_back <- function(nc, nr, seed = 42, tol = 1e-4) {
 }
 
 test_that("cross_entropy_loss_back matches CPU and the closed form", {
-  skip_on_cran()
   skip_no_gpu_op()
   check_ce_back(nc = 10L, nr = 8L)
 })
@@ -238,7 +260,6 @@ test_that("cross_entropy_loss_back matches CPU and the closed form", {
 test_that("cross_entropy_loss_back handles a row longer than the block", {
   # BLOCK_SIZE is 32, so this forces the strided loop and the shared-memory
   # reduction to run more than one pass over a row.
-  skip_on_cran()
   skip_no_gpu_op()
   check_ce_back(nc = 200L, nr = 5L, seed = 3)
 })
@@ -246,7 +267,6 @@ test_that("cross_entropy_loss_back handles a row longer than the block", {
 test_that("cross_entropy_loss_back survives large logits", {
   # exp() would overflow without subtracting the row max; this is the case an
   # untrained model produces.
-  skip_on_cran()
   skip_no_gpu_op()
   set.seed(9)
   nc <- 16L; nr <- 4L
@@ -265,7 +285,6 @@ test_that("cross_entropy_loss_back survives large logits", {
 test_that("a classifier trains identically on CPU and GPU", {
   # End to end: cross-entropy training drives this op every step, so a wrong
   # shader shows up as the two backends diverging.
-  skip_on_cran()
   skip_no_gpu_op()
 
   set.seed(5)
